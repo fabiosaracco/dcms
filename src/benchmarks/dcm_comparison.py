@@ -23,6 +23,7 @@ from typing import Callable, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
+import torch
 
 from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
@@ -52,7 +53,7 @@ def _is_feasible(k_out: np.ndarray, k_in: np.ndarray) -> bool:
 
 
 def _make_solvers(
-    model: DCMModel, theta0, tol: float
+    model: DCMModel, theta0: torch.Tensor, tol: float
 ) -> list[tuple[str, Callable[[], SolverResult]]]:
     """Return the list of (name, callable) solver pairs for *model*."""
     return [

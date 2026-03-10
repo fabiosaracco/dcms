@@ -249,3 +249,99 @@ class TestZeroDegreeBehavior:
         )
         err = model.constraint_error(result.theta)
         assert err < 1e-5, f"Newton error with zero-degree nodes: {err:.3e}"
+
+
+class TestSaturatedNodeBehavior:
+    """Tests for the exact handling of nodes with k_out=N-1 or k_in=N-1."""
+
+    def _make_saturated_model(self) -> DCMModel:
+        """Build a 6-node model where node 0 has k_out=5=N-1 and node 5 has k_in=5=N-1.
+
+        The degree sequences are balanced (Σ k_out = Σ k_in = 11.0).
+
+        Feasibility requires:
+        - k_out[i] ≥ 1 for i ≠ 5 (node 5's in-saturation forces p_i5 ≈ 1).
+        - k_in[j] ≥ 1 for j ≠ 0 (node 0's out-saturation forces p_0j ≈ 1).
+        Both constraints are satisfied by the chosen sequences.
+        """
+        # N=6, so N-1=5.  Node 0 is out-saturated; node 5 is in-saturated.
+        k_out = np.array([5.0, 2.0, 1.0, 1.0, 1.0, 1.0])
+        k_in  = np.array([1.0, 1.0, 1.5, 1.5, 1.0, 5.0])
+        return DCMModel(k_out, k_in)
+
+    def test_initial_theta_saturated_out_nodes_negative(self) -> None:
+        """initial_theta('degrees') must set θ_out = -_THETA_MAX for k_out = N-1."""
+        from src.models.dcm import _THETA_MAX
+        model = self._make_saturated_model()
+        theta0 = model.initial_theta("degrees")
+        assert theta0[0].item() == -_THETA_MAX, (
+            f"θ_out[0] should be -{_THETA_MAX}, got {theta0[0].item()}"
+        )
+
+    def test_initial_theta_saturated_in_nodes_negative(self) -> None:
+        """initial_theta('degrees') must set θ_in = -_THETA_MAX for k_in = N-1."""
+        from src.models.dcm import _THETA_MAX
+        model = self._make_saturated_model()
+        N = model.N
+        theta0 = model.initial_theta("degrees")
+        assert theta0[N + N - 1].item() == -_THETA_MAX, (
+            f"θ_in[N-1] should be -{_THETA_MAX}, got {theta0[N + N - 1].item()}"
+        )
+
+    def test_initial_theta_random_saturated_nodes_negative(self) -> None:
+        """initial_theta('random') must also set θ = -_THETA_MAX for saturated nodes."""
+        from src.models.dcm import _THETA_MAX
+        model = self._make_saturated_model()
+        N = model.N
+        theta0 = model.initial_theta("random")
+        assert theta0[0].item() == -_THETA_MAX
+        assert theta0[N + N - 1].item() == -_THETA_MAX
+
+    def test_pij_row_near_one_for_saturated_out(self) -> None:
+        """p_0j ≈ 1 for all j≠0 when k_out[0] = N-1 (connects to every other node)."""
+        model = self._make_saturated_model()
+        theta0 = model.initial_theta("degrees")
+        P = model.pij_matrix(theta0)
+        # Off-diagonal entries in row 0 should be close to 1.0
+        off_diag = torch.cat([P[0, :0], P[0, 1:]])  # skip diagonal (index 0)
+        assert (off_diag > 0.99).all(), (
+            f"Row 0 off-diagonal entries should be > 0.99; got min={off_diag.min():.4f}"
+        )
+
+    def test_pij_col_near_one_for_saturated_in(self) -> None:
+        """p_i5 ≈ 1 for all i≠5 when k_in[5] = N-1 (receives from every other node)."""
+        model = self._make_saturated_model()
+        N = model.N
+        theta0 = model.initial_theta("degrees")
+        P = model.pij_matrix(theta0)
+        # Off-diagonal entries in column N-1 should be close to 1.0
+        off_diag = torch.cat([P[:N - 1, N - 1], P[N:, N - 1]])  # skip diagonal (index N-1)
+        assert (off_diag > 0.99).all(), (
+            f"Column N-1 off-diagonal entries should be > 0.99; got min={off_diag.min():.4f}"
+        )
+
+    def test_residual_near_zero_for_saturated_nodes(self) -> None:
+        """Residual components for saturated nodes must be near 0 at initial_theta."""
+        model = self._make_saturated_model()
+        N = model.N
+        theta0 = model.initial_theta("degrees")
+        F = model.residual(theta0)
+        # F[0] corresponds to k_out[0] = N-1 = 5
+        assert F[0].abs().item() < 1e-6, (
+            f"Residual for saturated k_out[0]: {F[0].item():.3e}"
+        )
+        # F[N + N-1] corresponds to k_in[N-1] = N-1 = 5
+        assert F[N + N - 1].abs().item() < 1e-6, (
+            f"Residual for saturated k_in[N-1]: {F[N + N - 1].item():.3e}"
+        )
+
+    def test_solver_converges_with_saturated_nodes(self) -> None:
+        """Saturated nodes must not prevent solver convergence."""
+        from src.solvers.newton import solve_newton
+        model = self._make_saturated_model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_newton(
+            model.residual, model.jacobian, theta0, tol=1e-10, max_iter=200,
+        )
+        err = model.constraint_error(result.theta)
+        assert err < 1e-5, f"Newton error with saturated nodes: {err:.3e}"

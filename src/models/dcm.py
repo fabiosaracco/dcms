@@ -37,6 +37,13 @@ _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
 # θ is clamped to this bound; exp(-50) ≈ 2e-22, essentially zero probability.
 _THETA_MAX: float = 50.0
 
+# For N > this threshold, residual() and neg_log_likelihood() automatically
+# use chunked computation to avoid materialising the full N×N matrix.
+_LARGE_N_THRESHOLD: int = 5_000
+
+# Number of rows processed per chunk when using memory-efficient mode.
+_DEFAULT_CHUNK: int = 512
+
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
     """Convert *x* to a float64 CPU torch.Tensor (no-copy if already correct)."""
@@ -109,18 +116,73 @@ class DCMModel:
     def residual(self, theta: _ArrayLike) -> torch.Tensor:
         """Return F(θ) = [k_out_expected − k_out_obs | k_in_expected − k_in_obs].
 
+        For N > ``_LARGE_N_THRESHOLD`` the computation is automatically
+        done in row chunks to avoid materialising the full N×N matrix.
+
         Args:
             theta: Parameter vector [θ_out | θ_in], shape (2N,).
 
         Returns:
             Residual vector F(θ), shape (2N,).
         """
+        if self.N > _LARGE_N_THRESHOLD:
+            return self._residual_chunked(theta)
         P = self.pij_matrix(theta)
         k_out_hat = P.sum(dim=1)   # row sums = expected out-degrees
         k_in_hat = P.sum(dim=0)    # col sums = expected in-degrees
         F = torch.empty(2 * self.N, dtype=torch.float64)
         F[: self.N] = k_out_hat - self.k_out
         F[self.N :] = k_in_hat - self.k_in
+        return F
+
+    def _residual_chunked(
+        self, theta: _ArrayLike, chunk_size: int = _DEFAULT_CHUNK
+    ) -> torch.Tensor:
+        """Compute F(θ) without materialising the full N×N matrix.
+
+        Processes ``chunk_size`` rows at a time, requiring only
+        O(chunk_size × N) RAM instead of O(N²).  Produces results
+        identical to :meth:`residual` for small N.
+
+        Args:
+            theta:      Parameter vector [θ_out | θ_in], shape (2N,).
+            chunk_size: Number of rows per processing chunk.
+
+        Returns:
+            Residual vector F(θ), shape (2N,).
+        """
+        theta = _to_tensor(theta)
+        N = self.N
+        theta_out = theta[:N]
+        theta_in = theta[N:]
+
+        k_out_hat = torch.zeros(N, dtype=torch.float64)
+        k_in_hat = torch.zeros(N, dtype=torch.float64)
+
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            chunk_len = i_end - i_start
+            # log(x_i * y_j) = -θ_out_i - θ_in_j  for rows i in [i_start, i_end)
+            log_xy = -theta_out[i_start:i_end, None] - theta_in[None, :]  # (chunk, N)
+            P_chunk = torch.sigmoid(log_xy)  # (chunk, N)
+
+            # Zero out diagonal entries p_ii = 0
+            local_idx = torch.arange(chunk_len, dtype=torch.long)
+            global_idx = torch.arange(i_start, i_end, dtype=torch.long)
+            P_chunk[local_idx, global_idx] = 0.0
+
+            # Apply zero-degree masks
+            if self.zero_out[i_start:i_end].any():
+                P_chunk[self.zero_out[i_start:i_end]] = 0.0
+            if self.zero_in.any():
+                P_chunk[:, self.zero_in] = 0.0
+
+            k_out_hat[i_start:i_end] = P_chunk.sum(dim=1)
+            k_in_hat += P_chunk.sum(dim=0)
+
+        F = torch.empty(2 * N, dtype=torch.float64)
+        F[:N] = k_out_hat - self.k_out
+        F[N:] = k_in_hat - self.k_in
         return F
 
     # ------------------------------------------------------------------
@@ -274,12 +336,17 @@ class DCMModel:
 
         which is convex (L is concave) and has its minimum at the solution.
 
+        For N > ``_LARGE_N_THRESHOLD`` the sum is computed in row chunks to
+        avoid materialising the full N×N matrix.
+
         Args:
             theta: Parameter vector [θ_out | θ_in], shape (2N,).
 
         Returns:
             Scalar −L(θ) (convex, to be minimised).
         """
+        if self.N > _LARGE_N_THRESHOLD:
+            return self._neg_log_likelihood_chunked(theta)
         theta = _to_tensor(theta)
         N = self.N
         theta_out = theta[:N]
@@ -288,6 +355,43 @@ class DCMModel:
         log1p = torch.logaddexp(torch.zeros_like(log_xy), log_xy)
         log1p.fill_diagonal_(0.0)  # exclude self-loops
         return (theta_out @ self.k_out + theta_in @ self.k_in + log1p.sum()).item()
+
+    def _neg_log_likelihood_chunked(
+        self, theta: _ArrayLike, chunk_size: int = _DEFAULT_CHUNK
+    ) -> float:
+        """Compute −L(θ) without materialising the full N×N matrix.
+
+        Uses O(chunk_size × N) RAM instead of O(N²).  Identical result to
+        :meth:`neg_log_likelihood` for any N.
+
+        Args:
+            theta:      Parameter vector [θ_out | θ_in], shape (2N,).
+            chunk_size: Number of rows per processing chunk.
+
+        Returns:
+            Scalar −L(θ).
+        """
+        theta = _to_tensor(theta)
+        N = self.N
+        theta_out = theta[:N]
+        theta_in = theta[N:]
+
+        dot_term = (theta_out @ self.k_out + theta_in @ self.k_in).item()
+        log1p_total = 0.0
+        zeros_chunk = torch.zeros(1, dtype=torch.float64)
+
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            chunk_len = i_end - i_start
+            log_xy = -theta_out[i_start:i_end, None] - theta_in[None, :]  # (chunk, N)
+            log1p = torch.logaddexp(zeros_chunk.expand_as(log_xy), log_xy)
+            # Zero out diagonal entries (no self-loops)
+            local_idx = torch.arange(chunk_len, dtype=torch.long)
+            global_idx = torch.arange(i_start, i_end, dtype=torch.long)
+            log1p[local_idx, global_idx] = 0.0
+            log1p_total += log1p.sum().item()
+
+        return dot_term + log1p_total
 
     # ------------------------------------------------------------------
     # Evaluation of constraint satisfaction

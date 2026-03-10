@@ -28,7 +28,23 @@ I modelli da implementare sono tre, in ordine crescente di complessità:
 - Dimensione: 2N equazioni
 - Con strength reduction: il numero di incognite scende al numero di valori distinti di (s_out, s_in)
 
-### Modello 3: DECM (Directed Enhanced Configuration Model) — binario + pesato
+### Modello 3: DaECM (Directed approximated Enhanced Configuration Model) — binario + pesato
+- Vincoli: sequenza di gradi E strengths (k_out_i, k_in_i, s_out_i, s_in_i)
+- Incognite: 4N moltiplicatori (x_i, y_i, β_out_i, β_in_i)
+- Equazioni:
+  ```
+  k_out_i = Σ_{j≠i} (x_i * y_j) / (1 + x_i * y_j)
+  k_in_i  = Σ_{j≠i} (x_j * y_i) / (1 + x_j * y_i) [come nel DCM]
+  s_out_i = Σ_{j≠i} (x_j * y_i) / (1 + x_j * y_i)/ (1 - β_out_j * β_in_i)
+ [valore atteso del peso condizionato alla topologia]
+  s_in_i  = analoga
+  ```
+- Dimensione: 4N equazioni in 4N incognite
+- In pratica, prima si risolve il DCM (quindi tutte le routine per il DCM possono essere richiamate e riusate), poi si risolve un DWCM condizionato alla topologia del DCM.
+- È una versione approssimata del modello successivo e con più ampie possibilità di convergenza. 
+
+
+### Modello 4: DECM (Directed Enhanced Configuration Model) — binario + pesato
 - Vincoli: sequenza di gradi E strengths (k_out_i, k_in_i, s_out_i, s_in_i)
 - Incognite: 4N moltiplicatori (x_i, y_i, β_out_i, β_in_i)
 - Equazioni:

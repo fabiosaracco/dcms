@@ -29,7 +29,7 @@ from src.solvers.levenberg_marquardt import solve_lm
 from src.utils.wng import k_s_generator_pl
 
 
-def run_comparison(N: int = 50, seed: int = 42, tol: float = 1e-8) -> None:
+def run_comparison(N: int = 50, seed: Optional[int] = None, tol: float = 1e-8) -> None:
     """Run all DCM solvers on a random network and print a comparison table.
 
     Args:

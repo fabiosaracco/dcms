@@ -138,7 +138,7 @@ def run_comparison(N: int = 50, seed: Optional[int] = None, tol: float = 1e-8) -
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DCM solver comparison")
     parser.add_argument("--n", type=int, default=50, help="Number of nodes")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--tol", type=float, default=1e-8, help="Solver tolerance")
     args = parser.parse_args()
     run_comparison(N=args.n, seed=args.seed, tol=args.tol)

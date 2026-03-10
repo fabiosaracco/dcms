@@ -215,13 +215,19 @@ def run_scaling_benchmark(
 ) -> list[dict]:
     """Run all applicable solvers on a single network of size N.
 
+    .. note::
+        The ``timeout`` parameter is *retrospective*: a solver is marked
+        ``TIMEOUT`` only after it completes and its elapsed time is found to
+        exceed the limit.  It does **not** interrupt a running solver.  For
+        a hard interrupt, run each solver in a separate process.
+
     Args:
         N:       Number of nodes.
         rho:     Target edge density for the Chung-Lu generator.
         seed:    Random seed (first seed to try; incremented if infeasible).
         tol:     Convergence tolerance for all solvers.
         timeout: Per-solver wall-clock time limit in seconds.  Solvers that
-                 exceed this limit are reported as ``TIMEOUT``.
+                 finish but exceed this limit are reported as ``TIMEOUT``.
         verbose: If True, print the comparison table.
 
     Returns:
@@ -285,6 +291,19 @@ def run_scaling_benchmark(
             max_err = float("nan")
             iters = 0
             ram_mb = float("nan")
+        except RuntimeError as exc:
+            elapsed = time.perf_counter() - t_start
+            exc_str = str(exc)
+            # PyTorch raises RuntimeError for GPU/CPU allocation failures
+            if "out of memory" in exc_str.lower() or "alloc" in exc_str.lower():
+                status = "OOM"
+            else:
+                status = "ERR"
+            max_err = float("nan")
+            iters = 0
+            ram_mb = float("nan")
+            if verbose and status == "ERR":
+                print(f"  [{name}] RuntimeError: {exc}")
         except Exception as exc:
             elapsed = time.perf_counter() - t_start
             status = "ERR"

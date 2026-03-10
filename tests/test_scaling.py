@@ -4,7 +4,9 @@ Covers:
 - Correctness: chunked residual and neg_log_likelihood match dense versions.
 - Correctness: chunked fixed-point step matches dense step.
 - Convergence: fixed-point (Gauss-Seidel) and L-BFGS converge for N=1000.
-- Scaling: benchmark runs without error for N=1000 (validation scale).
+- Auto-switch: residual() calls _residual_chunked when N > _LARGE_N_THRESHOLD
+  (verified via monkeypatching the threshold).
+- Scaling: benchmark smoke tests run without error for N=50 and N=200.
 
 All tests are designed to complete in < 30 seconds on a typical CI runner.
 Larger-scale benchmarks (N > 1000) are in ``src/benchmarks/dcm_scaling.py``
@@ -118,8 +120,16 @@ class TestChunkedResidualCorrectness:
             f"Max chunked residual at true solution: {F.abs().max().item():.3e}"
         )
 
-    def test_auto_switch_for_large_n(self) -> None:
-        """residual() must produce the same result whether using dense or chunked path."""
+    @pytest.mark.parametrize("bad_chunk", [0, -1, -10])
+    def test_invalid_chunk_size_raises(self, bad_chunk: int) -> None:
+        """_residual_chunked must raise ValueError for chunk_size < 1."""
+        model, theta_true = _make_known_model(N=10, seed=0)
+        theta = torch.tensor(theta_true, dtype=torch.float64)
+        with pytest.raises(ValueError, match="chunk_size"):
+            model._residual_chunked(theta, chunk_size=bad_chunk)
+
+    def test_dense_and_chunked_agree(self) -> None:
+        """Dense residual() and explicit chunked path must agree element-wise."""
         model, theta_true = _make_known_model(N=20, seed=7)
         theta = torch.tensor(theta_true, dtype=torch.float64)
         # For N < _LARGE_N_THRESHOLD, residual() uses the dense path.
@@ -129,6 +139,30 @@ class TestChunkedResidualCorrectness:
         assert torch.allclose(F_auto, F_chunked, atol=1e-12), (
             f"Dense and chunked paths disagree: max diff "
             f"{(F_auto - F_chunked).abs().max():.3e}"
+        )
+
+    def test_auto_switch_for_large_n(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """residual() must call _residual_chunked when N > _LARGE_N_THRESHOLD."""
+        import src.models.dcm as dcm_module
+
+        model, theta_true = _make_known_model(N=20, seed=7)
+        theta = torch.tensor(theta_true, dtype=torch.float64)
+
+        called: list[bool] = []
+
+        original_chunked = model._residual_chunked
+
+        def _spy_chunked(th: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            called.append(True)
+            return original_chunked(th, **kwargs)
+
+        # Lower the threshold so N=20 triggers the auto-switch
+        monkeypatch.setattr(dcm_module, "_LARGE_N_THRESHOLD", 10)
+        model._residual_chunked = _spy_chunked  # type: ignore[method-assign]
+
+        model.residual(theta)
+        assert called, (
+            "residual() did not call _residual_chunked when N > _LARGE_N_THRESHOLD"
         )
 
 
@@ -158,6 +192,14 @@ class TestChunkedNegLogLikelihood:
         assert abs(nll_ref - nll_chunk) < 1e-9, (
             f"chunk={chunk_size}: ref={nll_ref:.6f}  got={nll_chunk:.6f}"
         )
+
+    @pytest.mark.parametrize("bad_chunk", [0, -1, -5])
+    def test_invalid_chunk_size_raises(self, bad_chunk: int) -> None:
+        """_neg_log_likelihood_chunked must raise ValueError for chunk_size < 1."""
+        model, theta_true = _make_known_model(N=10, seed=0)
+        theta = torch.tensor(theta_true, dtype=torch.float64)
+        with pytest.raises(ValueError, match="chunk_size"):
+            model._neg_log_likelihood_chunked(theta, chunk_size=bad_chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +280,32 @@ class TestChunkedConvergenceSmall:
             if m is not None:
                 return m
         return None
+
+    def test_fixed_point_invalid_chunk_size_raises(self, model_100: DCMModel | None) -> None:
+        """solve_fixed_point must raise ValueError for negative chunk_size."""
+        if model_100 is None:
+            pytest.skip("No feasible N=100 network found")
+        theta0 = model_100.initial_theta("degrees")
+        with pytest.raises(ValueError, match="chunk_size"):
+            solve_fixed_point(
+                model_100.residual, theta0, model_100.k_out, model_100.k_in,
+                chunk_size=-1,
+            )
+
+    def test_fixed_point_chunk_size_zero_accepted(self, model_100: DCMModel | None) -> None:
+        """solve_fixed_point must accept chunk_size=0 (auto-select) and converge."""
+        if model_100 is None:
+            pytest.skip("No feasible N=100 network found")
+        theta0 = model_100.initial_theta("degrees")
+        result = solve_fixed_point(
+            model_100.residual, theta0, model_100.k_out, model_100.k_in,
+            tol=1e-7, max_iter=5_000, damping=1.0, variant="gauss-seidel",
+            chunk_size=0,  # 0 means auto-select
+        )
+        err = model_100.constraint_error(result.theta)
+        assert err < CONV_TOL, (
+            f"Fixed-point GS (chunk_size=0) N=100: err={err:.3e}"
+        )
 
     def test_fixed_point_gs_chunked_convergence(self, model_100: DCMModel | None) -> None:
         """Fixed-point GS must converge for N=100 even with chunk_size=16."""

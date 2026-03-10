@@ -30,15 +30,10 @@ from typing import Callable
 import torch
 
 from .base import SolverResult
+from src.models.dcm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
 
 # Clamp θ to avoid exp overflow/underflow
 _THETA_CLAMP = 50.0
-
-# Threshold above which chunked computation is used automatically
-_LARGE_N_THRESHOLD: int = 5_000
-
-# Default chunk size for memory-efficient computation
-_DEFAULT_CHUNK: int = 512
 
 
 def solve_fixed_point(
@@ -75,6 +70,8 @@ def solve_fixed_point(
         raise ValueError(f"Unknown variant {variant!r}. Choose 'jacobi' or 'gauss-seidel'.")
     if not (0.0 < damping <= 1.0):
         raise ValueError(f"damping must be in (0, 1], got {damping}")
+    if chunk_size < 0:
+        raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
 
     if not isinstance(k_out, torch.Tensor):
         k_out = torch.tensor(k_out, dtype=torch.float64)

@@ -146,11 +146,16 @@ class DCMModel:
 
         Args:
             theta:      Parameter vector [θ_out | θ_in], shape (2N,).
-            chunk_size: Number of rows per processing chunk.
+            chunk_size: Number of rows per processing chunk (must be ≥ 1).
 
         Returns:
             Residual vector F(θ), shape (2N,).
+
+        Raises:
+            ValueError: If ``chunk_size < 1``.
         """
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be ≥ 1, got {chunk_size}")
         theta = _to_tensor(theta)
         N = self.N
         theta_out = theta[:N]
@@ -162,23 +167,24 @@ class DCMModel:
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
             chunk_len = i_end - i_start
-            # log(x_i * y_j) = -θ_out_i - θ_in_j  for rows i in [i_start, i_end)
-            log_xy = -theta_out[i_start:i_end, None] - theta_in[None, :]  # (chunk, N)
-            P_chunk = torch.sigmoid(log_xy)  # (chunk, N)
+            # p_chunk[i, j] = sigmoid(-θ_out_i - θ_in_j) = x_i*y_j/(1+x_i*y_j)
+            # Apply sigmoid in-place to avoid allocating a second (chunk, N) buffer.
+            p_chunk = -theta_out[i_start:i_end, None] - theta_in[None, :]  # (chunk, N)
+            p_chunk.sigmoid_()
 
             # Zero out diagonal entries p_ii = 0
             local_idx = torch.arange(chunk_len, dtype=torch.long)
             global_idx = torch.arange(i_start, i_end, dtype=torch.long)
-            P_chunk[local_idx, global_idx] = 0.0
+            p_chunk[local_idx, global_idx] = 0.0
 
             # Apply zero-degree masks
             if self.zero_out[i_start:i_end].any():
-                P_chunk[self.zero_out[i_start:i_end]] = 0.0
+                p_chunk[self.zero_out[i_start:i_end]] = 0.0
             if self.zero_in.any():
-                P_chunk[:, self.zero_in] = 0.0
+                p_chunk[:, self.zero_in] = 0.0
 
-            k_out_hat[i_start:i_end] = P_chunk.sum(dim=1)
-            k_in_hat += P_chunk.sum(dim=0)
+            k_out_hat[i_start:i_end] = p_chunk.sum(dim=1)
+            k_in_hat += p_chunk.sum(dim=0)
 
         F = torch.empty(2 * N, dtype=torch.float64)
         F[:N] = k_out_hat - self.k_out
@@ -366,11 +372,16 @@ class DCMModel:
 
         Args:
             theta:      Parameter vector [θ_out | θ_in], shape (2N,).
-            chunk_size: Number of rows per processing chunk.
+            chunk_size: Number of rows per processing chunk (must be ≥ 1).
 
         Returns:
             Scalar −L(θ).
+
+        Raises:
+            ValueError: If ``chunk_size < 1``.
         """
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be ≥ 1, got {chunk_size}")
         theta = _to_tensor(theta)
         N = self.N
         theta_out = theta[:N]

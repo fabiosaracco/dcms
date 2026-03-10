@@ -39,13 +39,13 @@ def k_s_generator_pl(N, rho=1e-3, seed=None, alpha_pareto = 2.5):
     for i in range(N):
         # First, topology...
         row_i=np.random.random(size=N)<=x_out[i]*x_in
-        # adjusting the diagonal
-        row_i[i]=0
         # adjusting Chung-Lu weird entries
         where_g1=np.where(x_out[i]*x_in>1)[0]
         if len(where_g1)>0:
             for j in where_g1:
                 row_i[j]=1
+        # adjusting the diagonal
+        row_i[i]=0
         
         k[i]=row_i.sum()
         k[N:]+=row_i

@@ -20,11 +20,12 @@ Reference:
 """
 from __future__ import annotations
 
+import math
 import time
 import tracemalloc
-from typing import Callable, Optional
+from typing import Callable
 
-import numpy as np
+import torch
 
 from .base import SolverResult
 
@@ -32,9 +33,9 @@ _THETA_CLAMP = 50.0
 
 
 def solve_lm(
-    residual_fn: Callable[[np.ndarray], np.ndarray],
-    jacobian_fn: Callable[[np.ndarray], np.ndarray],
-    theta0: np.ndarray,
+    residual_fn: Callable[[torch.Tensor], torch.Tensor],
+    jacobian_fn: Callable[[torch.Tensor], torch.Tensor],
+    theta0: "ArrayLike",  # type: ignore[name-defined]
     tol: float = 1e-8,
     max_iter: int = 500,
     lam0: float = 1e-3,
@@ -46,8 +47,8 @@ def solve_lm(
     """Levenberg-Marquardt with adaptive damping.
 
     Args:
-        residual_fn:   F(θ) → residual vector, shape (2N,).
-        jacobian_fn:   J(θ) → Jacobian matrix, shape (2N, 2N).
+        residual_fn:   F(θ) → residual tensor, shape (2N,).
+        jacobian_fn:   J(θ) → Jacobian tensor, shape (2N, 2N).
         theta0:        Initial parameter vector, shape (2N,).
         tol:           Convergence tolerance (ℓ∞ residual).
         max_iter:      Maximum iterations.
@@ -64,70 +65,77 @@ def solve_lm(
     tracemalloc.start()
     t0 = time.perf_counter()
 
-    theta = np.array(theta0, dtype=np.float64)
+    if not isinstance(theta0, torch.Tensor):
+        theta = torch.tensor(theta0, dtype=torch.float64)
+    else:
+        theta = theta0.clone().to(dtype=torch.float64)
+
     F = residual_fn(theta)
-    cost = float(F @ F)
-    residuals: list[float] = [float(np.max(np.abs(F)))]
+    cost = F.dot(F).item()
+    n2 = theta.shape[0]
     lam = lam0
+
+    n_iter = 0
+    residuals: list[float] = []
     converged = False
     message = "Maximum iterations reached without convergence."
-    n2 = len(theta)
 
-    for iteration in range(max_iter):
-        res_norm = float(np.max(np.abs(F)))
-        if res_norm < tol:
-            converged = True
-            message = f"Converged in {iteration} iteration(s)."
-            break
+    try:
+        for _ in range(max_iter):
+            res_norm = F.abs().max().item()
+            if res_norm < tol:
+                converged = True
+                message = f"Converged in {n_iter} iteration(s)."
+                break
 
-        if not np.isfinite(res_norm):
-            message = f"NaN/Inf detected at iteration {iteration}."
-            break
+            if not math.isfinite(res_norm):
+                message = f"NaN/Inf detected at iteration {n_iter}."
+                break
 
-        J = jacobian_fn(theta)  # (2N, 2N), negative semi-definite Hess(L)
-        # LM normal equations: (JᵀJ + λI) δ = Jᵀ(−F) = −JᵀF
-        # δ solves the linearised least-squares min ½‖Jδ+F‖² + ½λ‖δ‖²
-        JtF = J.T @ F           # (2N,)
+            J = jacobian_fn(theta)  # (2N, 2N), negative semi-definite
+            # LM normal equations: (JᵀJ + λI) δ = −Jᵀ F
+            JtF = J.T @ F  # (2N,)
 
-        if diagonal_only:
-            JtJ_diag = np.sum(J ** 2, axis=0)
-            delta = -JtF / (JtJ_diag + lam)
-        else:
-            JtJ = J.T @ J       # (2N, 2N)
-            A = JtJ + lam * np.eye(n2)
-            try:
-                delta = np.linalg.solve(A, -JtF)
-            except np.linalg.LinAlgError:
-                lam *= lam_up
-                continue
+            if diagonal_only:
+                JtJ_diag = (J ** 2).sum(dim=0)
+                delta = -JtF / (JtJ_diag + lam)
+            else:
+                JtJ = J.T @ J  # (2N, 2N)
+                A = JtJ + lam * torch.eye(n2, dtype=torch.float64)
+                try:
+                    delta = torch.linalg.solve(A, -JtF)
+                except RuntimeError:
+                    lam *= lam_up
+                    continue
 
-        theta_new = np.clip(theta + delta, -_THETA_CLAMP, _THETA_CLAMP)
-        F_new = residual_fn(theta_new)
-        cost_new = float(F_new @ F_new)
+            theta_new = torch.clamp(theta + delta, -_THETA_CLAMP, _THETA_CLAMP)
+            F_new = residual_fn(theta_new)
+            cost_new = F_new.dot(F_new).item()
 
-        if cost_new < cost:
-            # Accept step, reduce damping
-            theta = theta_new
-            F = F_new
-            cost = cost_new
-            lam = max(lam * lam_down, 1e-14)
-            residuals.append(float(np.max(np.abs(F))))
-        else:
-            # Reject step, increase damping (no new residual entry)
-            lam = lam * lam_up
+            if cost_new < cost:
+                # Accept step, reduce damping
+                theta = theta_new
+                F = F_new
+                cost = cost_new
+                lam = max(lam * lam_down, 1e-14)
+                n_iter += 1
+                residuals.append(F.abs().max().item())
+            else:
+                # Reject step, increase damping (no new residual entry)
+                lam = lam * lam_up
 
-        if lam > lam_max:
-            message = f"Damping λ={lam:.2e} exceeded maximum. Stopping."
-            break
-
-    elapsed = time.perf_counter() - t0
-    _, peak_ram = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+            if lam > lam_max:
+                message = f"Damping λ={lam:.2e} exceeded maximum. Stopping."
+                break
+    finally:
+        elapsed = time.perf_counter() - t0
+        _, peak_ram = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
 
     return SolverResult(
-        theta=theta,
+        theta=theta.detach().numpy(),
         converged=converged,
-        iterations=len(residuals),
+        iterations=n_iter,
         residuals=residuals,
         elapsed_time=elapsed,
         peak_ram_bytes=peak_ram,

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
@@ -14,8 +14,8 @@ class SolverResult:
     Attributes:
         theta: Final parameter vector θ (log-space), shape (2N,) for DCM.
         converged: True if the solver reached the requested tolerance.
-        iterations: Number of iterations performed.
-        residuals: History of the ℓ∞ residual norm at each iteration.
+        iterations: Number of update steps performed.
+        residuals: History of the ℓ∞ residual norm, one entry per accepted step.
         elapsed_time: Wall-clock time in seconds.
         peak_ram_bytes: Peak RAM usage in bytes (measured via tracemalloc).
         message: Human-readable convergence message.

@@ -12,21 +12,18 @@ rule in physical space (x = exp(−θ)) is:
 
     x_i^new = k_out_i / Σ_{j≠i} y_j / (1 + x_i * y_j)
 
-followed by a damped step:
-
-    x_i^(t+1) = (x_i^new)^α · (x_i^(t))^(1−α)
-
-or equivalently, in θ-space:
+followed by a damped step in θ-space:
 
     θ_i^(t+1) = α · θ_i^new + (1−α) · θ_i^(t)
 """
 from __future__ import annotations
 
+import math
 import time
 import tracemalloc
-from typing import Callable, Optional
+from typing import Callable
 
-import numpy as np
+import torch
 
 from .base import SolverResult
 
@@ -35,10 +32,10 @@ _THETA_CLAMP = 50.0
 
 
 def solve_fixed_point(
-    residual_fn: Callable[[np.ndarray], np.ndarray],
-    theta0: np.ndarray,
-    k_out: np.ndarray,
-    k_in: np.ndarray,
+    residual_fn: Callable[[torch.Tensor], torch.Tensor],
+    theta0: "ArrayLike",  # type: ignore[name-defined]
+    k_out: "ArrayLike",  # type: ignore[name-defined]
+    k_in: "ArrayLike",  # type: ignore[name-defined]
     tol: float = 1e-8,
     max_iter: int = 10_000,
     damping: float = 1.0,
@@ -47,7 +44,7 @@ def solve_fixed_point(
     """Fixed-point iteration for the DCM.
 
     Args:
-        residual_fn: Function F(θ) → residual vector (used only for logging).
+        residual_fn: Function F(θ) → residual tensor (used for convergence check).
         theta0: Initial parameter vector [θ_out | θ_in], shape (2N,).
         k_out:  Observed out-degree sequence, shape (N,).
         k_in:   Observed in-degree sequence, shape (N,).
@@ -64,91 +61,87 @@ def solve_fixed_point(
     if not (0.0 < damping <= 1.0):
         raise ValueError(f"damping must be in (0, 1], got {damping}")
 
-    k_out = np.asarray(k_out, dtype=np.float64)
-    k_in = np.asarray(k_in, dtype=np.float64)
-    N = len(k_out)
+    if not isinstance(k_out, torch.Tensor):
+        k_out = torch.tensor(k_out, dtype=torch.float64)
+    else:
+        k_out = k_out.to(dtype=torch.float64)
+    if not isinstance(k_in, torch.Tensor):
+        k_in = torch.tensor(k_in, dtype=torch.float64)
+    else:
+        k_in = k_in.to(dtype=torch.float64)
+
+    N = k_out.shape[0]
+
+    if not isinstance(theta0, torch.Tensor):
+        theta = torch.tensor(theta0, dtype=torch.float64)
+    else:
+        theta = theta0.clone().to(dtype=torch.float64)
 
     tracemalloc.start()
     t0 = time.perf_counter()
 
-    theta = np.array(theta0, dtype=np.float64)
+    n_iter = 0
     residuals: list[float] = []
     converged = False
     message = "Maximum iterations reached without convergence."
 
-    for iteration in range(max_iter):
-        x = np.exp(-theta[:N])
-        y = np.exp(-theta[N:])
+    try:
+        for _ in range(max_iter):
+            x = torch.exp(-theta[:N])
+            y = torch.exp(-theta[N:])
 
-        # ---------------------------------------------------------------
-        # Compute the denominator sums D_out_i = Σ_{j≠i} y_j/(1+x_i*y_j)
-        # and D_in_i = Σ_{j≠i} x_j/(1+x_j*y_i)
-        # ---------------------------------------------------------------
-        # xy[i, j] = x_i * y_j, shape (N, N)
-        xy = x[:, None] * y[None, :]
-        xy_diag_zero = xy.copy()
-        np.fill_diagonal(xy_diag_zero, 0.0)
+            # xy[i, j] = x_i * y_j, shape (N, N)
+            xy = x[:, None] * y[None, :]
 
-        # Denominators for the out-degree update
-        # D_out[i] = Σ_{j≠i} y_j / (1 + x_i * y_j)
-        D_out = (y[None, :] / (1.0 + xy)).sum(axis=1)
-        diag_correction_out = y / (1.0 + np.diag(xy))
-        D_out -= diag_correction_out  # remove self-loop term
+            # D_out[i] = Σ_{j≠i} y_j / (1 + x_i * y_j)
+            D_out = (y[None, :] / (1.0 + xy)).sum(dim=1) - y / (1.0 + xy.diagonal())
 
-        # New x values
-        x_new = np.where(D_out > 0, k_out / D_out, x)
+            x_new = torch.where(D_out > 0, k_out / D_out, x)
 
-        if variant == "gauss-seidel":
-            # Use updated x values immediately
-            x_upd = x_new
-        else:
-            x_upd = x  # Jacobi: keep old values
+            if variant == "gauss-seidel":
+                x_upd = x_new   # use updated x immediately
+            else:
+                x_upd = x       # Jacobi: keep old values
 
-        # Denominators for the in-degree update using (possibly updated) x
-        xy2 = x_upd[:, None] * y[None, :]
-        D_in = (x_upd[None, :] / (1.0 + xy2.T)).sum(axis=1)
-        diag_correction_in = x_upd / (1.0 + np.diag(xy2))
-        D_in -= diag_correction_in
+            # D_in[i] = Σ_{j≠i} x_j / (1 + x_j * y_i)
+            xy2 = x_upd[:, None] * y[None, :]
+            D_in = (x_upd[None, :] / (1.0 + xy2.T)).sum(dim=1) - x_upd / (1.0 + xy2.diagonal())
 
-        y_new = np.where(D_in > 0, k_in / D_in, y)
+            y_new = torch.where(D_in > 0, k_in / D_in, y)
 
-        # ---------------------------------------------------------------
-        # Damped update in θ-space
-        # ---------------------------------------------------------------
-        theta_out_new = -np.log(np.clip(x_new, 1e-300, None))
-        theta_in_new = -np.log(np.clip(y_new, 1e-300, None))
+            # Damped update in θ-space
+            theta_out_new = -torch.log(x_new.clamp(min=1e-300))
+            theta_in_new = -torch.log(y_new.clamp(min=1e-300))
+            theta_out_new = theta_out_new.clamp(-_THETA_CLAMP, _THETA_CLAMP)
+            theta_in_new = theta_in_new.clamp(-_THETA_CLAMP, _THETA_CLAMP)
 
-        theta_out_new = np.clip(theta_out_new, -_THETA_CLAMP, _THETA_CLAMP)
-        theta_in_new = np.clip(theta_in_new, -_THETA_CLAMP, _THETA_CLAMP)
+            theta_new = torch.cat([theta_out_new, theta_in_new])
+            theta = damping * theta_new + (1.0 - damping) * theta
 
-        theta_new = np.concatenate([theta_out_new, theta_in_new])
-        theta = damping * theta_new + (1.0 - damping) * theta
+            # Convergence check (ℓ∞ norm of residual)
+            res = residual_fn(theta)
+            res_norm = res.abs().max().item()
 
-        # ---------------------------------------------------------------
-        # Convergence check (ℓ∞ norm of residual)
-        # ---------------------------------------------------------------
-        res = residual_fn(theta)
-        res_norm = float(np.max(np.abs(res)))
+            if not math.isfinite(res_norm):
+                message = f"NaN/Inf detected at iteration {n_iter}."
+                break
 
-        if not np.isfinite(res_norm):
-            message = f"NaN/Inf detected at iteration {iteration}."
-            break
+            n_iter += 1
+            residuals.append(res_norm)
 
-        residuals.append(res_norm)
-
-        if res_norm < tol:
-            converged = True
-            message = f"Converged in {iteration + 1} iteration(s)."
-            break
-
-    elapsed = time.perf_counter() - t0
-    _, peak_ram = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+            if res_norm < tol:
+                converged = True
+                message = f"Converged in {n_iter} iteration(s)."
+                break
+    finally:
+        elapsed = time.perf_counter() - t0
+        _, peak_ram = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
 
     return SolverResult(
-        theta=theta,
+        theta=theta.detach().numpy(),
         converged=converged,
-        iterations=len(residuals),
+        iterations=n_iter,
         residuals=residuals,
         elapsed_time=elapsed,
         peak_ram_bytes=peak_ram,

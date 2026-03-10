@@ -133,13 +133,20 @@ Implementa TUTTI i seguenti metodi. L'ordine riflette una priorità ragionevole:
 3. Implementare i metodi che hanno funzionato per il DCM
 4. Testare e confrontare come nelle Fasi 2-3
 
-### Fase 5: DECM
+### Fase 5: DaECM
+1. Implementare le equazioni del DaECM
+2. usare il DCM per la parte topologica
+3. ATTENZIONE al vincolo β_out_i * β_in_j < 1 — clampare i parametri ad ogni iterazione
+4. Implementare i metodi che hanno funzionato per il DCM
+5. Testare e confrontare come nelle Fasi 2-3
+
+### Fase 6: DECM
 1. Implementare le equazioni del DECM (4N incognite — il sistema più grande)
 2. Le equazioni sono accoppiate tra parte topologica e parte pesata — convergenza più difficile
 3. Strategia: usare la soluzione DCM come guess iniziale per la parte topologica
 4. Implementare i metodi, testare, confrontare
 
-### Fase 6: Report finale
+### Fase 7: Report finale
 1. Tabella comparativa finale per tutti i modelli e tutti i metodi
 2. Per ogni combinazione (modello, metodo, dimensione): convergenza, iterazioni, tempo, RAM
 3. Raccomandazione: quale metodo usare per quale modello a quale scala

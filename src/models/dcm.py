@@ -215,8 +215,11 @@ class DCMModel:
         """Return a sensible starting point θ₀ for the solvers.
 
         Zero-degree nodes (k_out_i = 0 or k_in_i = 0) correspond to
-        x_i = 0 or y_i = 0 exactly, so their θ is set to ``_THETA_MAX``
-        (≈ +∞ in practice) regardless of the chosen initialisation method.
+        x_i = 0 or y_i = 0 exactly, so their θ is set to ``+_THETA_MAX``
+        (≈ +∞ in practice).  Saturated nodes (k_out_i = N-1 or k_in_i = N-1)
+        correspond to x_i → ∞ or y_i → ∞, so their θ is set to ``-_THETA_MAX``
+        (≈ −∞ in practice).  Both assignments are applied regardless of the
+        chosen initialisation method.
 
         Args:
             method: ``"degrees"`` — use k/(N-1) as initial probability;
@@ -240,9 +243,14 @@ class DCMModel:
             theta_in = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
         else:
             raise ValueError(f"Unknown initial-guess method: {method!r}")
-        # Zero-degree nodes: x = 0 exactly ↔ θ → +∞ (clamped to _THETA_MAX).
+        # Zero-degree nodes: x = 0 exactly ↔ θ → +∞ (clamped to +_THETA_MAX).
         theta_out = torch.where(self.zero_out, torch.full_like(theta_out, _THETA_MAX), theta_out)
         theta_in = torch.where(self.zero_in, torch.full_like(theta_in, _THETA_MAX), theta_in)
+        # Saturated nodes: k = N-1 → x (or y) → +∞ ↔ θ → -∞ (clamped to -_THETA_MAX).
+        sat_out = self.k_out >= (N - 1)
+        sat_in = self.k_in >= (N - 1)
+        theta_out = torch.where(sat_out, torch.full_like(theta_out, -_THETA_MAX), theta_out)
+        theta_in = torch.where(sat_in, torch.full_like(theta_in, -_THETA_MAX), theta_in)
         return torch.cat([theta_out, theta_in])
 
     # ------------------------------------------------------------------

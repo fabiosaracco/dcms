@@ -22,6 +22,7 @@ from src.solvers.quasi_newton import solve_lbfgs
 from src.solvers.newton import solve_newton
 from src.solvers.broyden import solve_broyden
 from src.solvers.levenberg_marquardt import solve_lm
+from src.utils.wng import k_s_generator_pl
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +343,95 @@ class TestRAMUsage:
             )
             assert r.peak_ram_bytes > 0, f"{name} must report non-zero RAM"
         print("\n".join(rows))
+
+
+# ---------------------------------------------------------------------------
+# Multi-seed convergence tests (using k_s_generator_pl)
+# ---------------------------------------------------------------------------
+
+# Pre-computed list of valid seeds (N=30, rho=0.3): seeds that produce
+# feasible degree sequences (max degree < N).  Hard-coded for determinism
+# and to avoid any overhead at test-collection time.
+_MULTI_SEED_N = 30
+_MULTI_SEED_RHO = 0.3
+# Seeds 0-10 with N=30, rho=0.3 (seed 2 excluded — max k_in ≥ N).
+_VALID_SEEDS: list[int] = [0, 1, 3, 4, 5, 6, 7, 8, 9, 10]
+
+
+def _make_pl_model(seed: int) -> DCMModel:
+    """Build a DCMModel from a power-law network generated with *seed*."""
+    N = _MULTI_SEED_N
+    k, _ = k_s_generator_pl(N, rho=_MULTI_SEED_RHO, seed=seed)
+    k_out = k[:N].numpy().astype(float)
+    k_in = k[N:].numpy().astype(float)
+    return DCMModel(k_out, k_in)
+
+
+class TestMultiSeedConvergence:
+    """Verify that all solvers converge on 10 independent power-law networks.
+
+    Networks are generated with ``k_s_generator_pl`` (N=30) using
+    different random seeds.  The seed list is pre-computed and hard-coded:
+    seed 2 is excluded because it produces a k_in > N-1 (infeasible).
+
+    Each test asserts that the target solver converges on *every* valid
+    realisation, using the ``initial_theta("degrees")`` starting point
+    (which correctly handles saturated nodes with k = N-1).
+    """
+
+    @pytest.mark.parametrize("seed", _VALID_SEEDS)
+    def test_newton_converges(self, seed: int) -> None:
+        model = _make_pl_model(seed)
+        theta0 = model.initial_theta("degrees")
+        result = solve_newton(model.residual, model.jacobian, theta0,
+                              tol=1e-8, max_iter=200)
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, (
+            f"Newton failed on seed={seed}: err={err:.3e} conv={result.converged}"
+        )
+
+    @pytest.mark.parametrize("seed", _VALID_SEEDS)
+    def test_lm_converges(self, seed: int) -> None:
+        model = _make_pl_model(seed)
+        theta0 = model.initial_theta("degrees")
+        result = solve_lm(model.residual, model.jacobian, theta0,
+                          tol=1e-8, max_iter=500)
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, (
+            f"LM failed on seed={seed}: err={err:.3e} conv={result.converged}"
+        )
+
+    @pytest.mark.parametrize("seed", _VALID_SEEDS)
+    def test_lbfgs_converges(self, seed: int) -> None:
+        model = _make_pl_model(seed)
+        theta0 = model.initial_theta("degrees")
+        result = solve_lbfgs(model.residual, theta0, tol=1e-8, max_iter=2000,
+                             neg_loglik_fn=model.neg_log_likelihood)
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, (
+            f"L-BFGS failed on seed={seed}: err={err:.3e} conv={result.converged}"
+        )
+
+    @pytest.mark.parametrize("seed", _VALID_SEEDS)
+    def test_fixed_point_gs_converges(self, seed: int) -> None:
+        model = _make_pl_model(seed)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point(
+            model.residual, theta0, model.k_out, model.k_in,
+            tol=1e-8, max_iter=10_000, damping=1.0, variant="gauss-seidel",
+        )
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, (
+            f"Fixed-point GS failed on seed={seed}: err={err:.3e} conv={result.converged}"
+        )
+
+    @pytest.mark.parametrize("seed", _VALID_SEEDS)
+    def test_broyden_converges(self, seed: int) -> None:
+        model = _make_pl_model(seed)
+        theta0 = model.initial_theta("degrees")
+        result = solve_broyden(model.residual, model.jacobian, theta0,
+                               tol=1e-8, max_iter=500)
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, (
+            f"Broyden failed on seed={seed}: err={err:.3e} conv={result.converged}"
+        )

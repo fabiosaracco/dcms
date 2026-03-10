@@ -15,6 +15,12 @@ The system of equations to solve is F(θ) = 0, where
 
 (residual = expected − observed)
 
+**Zero-degree nodes**: if k_out_i = 0 then x_i = 0 exactly (θ_out_i → +∞),
+so p_ij = 0 for all j and the constraint is trivially satisfied.  Analogously,
+if k_in_i = 0 then y_i = 0 (θ_in_i → +∞) and p_ji = 0 for all j.  These
+nodes are identified in ``__init__`` and handled explicitly so that the
+residual is *exactly* zero and the Jacobian columns/rows are zero.
+
 Reference:
     Squartini & Garlaschelli, New J. Phys. 13 (2011) 083001.
 """
@@ -27,6 +33,9 @@ import torch
 
 # Type alias for inputs: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
+
+# θ is clamped to this bound; exp(-50) ≈ 2e-22, essentially zero probability.
+_THETA_MAX: float = 50.0
 
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
@@ -53,6 +62,10 @@ class DCMModel:
         self.N: int = int(self.k_out.shape[0])
         if self.k_in.shape[0] != self.N:
             raise ValueError("k_out and k_in must have the same length.")
+        # Nodes with degree 0: the Lagrange multiplier x (or y) is exactly 0,
+        # i.e., θ → +∞.  Track them so pij_matrix can return exact zeros.
+        self.zero_out: torch.Tensor = (self.k_out == 0)  # shape (N,)
+        self.zero_in: torch.Tensor = (self.k_in == 0)    # shape (N,)
 
     # ------------------------------------------------------------------
     # Core probability matrix
@@ -80,6 +93,13 @@ class DCMModel:
         # p_ij = sigmoid(log_xy) — numerically stable for all magnitudes
         P = torch.sigmoid(log_xy)
         P.fill_diagonal_(0.0)
+        # Zero-degree nodes contribute exactly zero probability:
+        # if k_out_i=0 then x_i=0, so p_ij=0 for all j (zero the row).
+        # if k_in_j=0 then y_j=0, so p_ij=0 for all i (zero the column).
+        if self.zero_out.any():
+            P[self.zero_out] = 0.0
+        if self.zero_in.any():
+            P[:, self.zero_in] = 0.0
         return P
 
     # ------------------------------------------------------------------
@@ -194,6 +214,10 @@ class DCMModel:
     def initial_theta(self, method: str = "degrees") -> torch.Tensor:
         """Return a sensible starting point θ₀ for the solvers.
 
+        Zero-degree nodes (k_out_i = 0 or k_in_i = 0) correspond to
+        x_i = 0 or y_i = 0 exactly, so their θ is set to ``_THETA_MAX``
+        (≈ +∞ in practice) regardless of the chosen initialisation method.
+
         Args:
             method: ``"degrees"`` — use k/(N-1) as initial probability;
                     ``"random"``  — uniform random values in [0.1, 2.0].
@@ -216,6 +240,9 @@ class DCMModel:
             theta_in = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
         else:
             raise ValueError(f"Unknown initial-guess method: {method!r}")
+        # Zero-degree nodes: x = 0 exactly ↔ θ → +∞ (clamped to _THETA_MAX).
+        theta_out = torch.where(self.zero_out, torch.full_like(theta_out, _THETA_MAX), theta_out)
+        theta_in = torch.where(self.zero_in, torch.full_like(theta_in, _THETA_MAX), theta_in)
         return torch.cat([theta_out, theta_in])
 
     # ------------------------------------------------------------------

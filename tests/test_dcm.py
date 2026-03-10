@@ -169,3 +169,83 @@ class TestConstraintError:
         model, theta_true = make_simple_model(N=6, seed=5)
         err = model.constraint_error(theta_true + 0.5)
         assert err > 0.0
+
+
+class TestZeroDegreeBehavior:
+    """Tests for the exact handling of nodes with k_out=0 or k_in=0."""
+
+    def _make_zero_degree_model(self) -> DCMModel:
+        """Build a 6-node model where node 0 has k_out=0 and node 5 has k_in=0.
+
+        The degree sequences are balanced (Σ k_out = Σ k_in = 6.0) so the
+        system is feasible for any solver.
+        """
+        k_out = np.array([0.0, 2.0, 1.0, 1.5, 1.0, 0.5])
+        k_in  = np.array([1.5, 1.0, 1.0, 1.0, 1.5, 0.0])
+        return DCMModel(k_out, k_in)
+
+    def test_zero_out_mask(self) -> None:
+        model = self._make_zero_degree_model()
+        assert model.zero_out[0].item()
+        assert not model.zero_out[1:].any().item()
+
+    def test_zero_in_mask(self) -> None:
+        model = self._make_zero_degree_model()
+        N = model.N
+        assert model.zero_in[N - 1].item()
+        assert not model.zero_in[: N - 1].any().item()
+
+    def test_pij_row_zero_for_zero_out(self) -> None:
+        """p_0j = 0 for all j when k_out[0] = 0."""
+        model = self._make_zero_degree_model()
+        theta0 = model.initial_theta("degrees")
+        P = model.pij_matrix(theta0)
+        assert P[0].abs().max().item() == 0.0, "Row 0 must be exactly zero"
+
+    def test_pij_col_zero_for_zero_in(self) -> None:
+        """p_i5 = 0 for all i when k_in[5] = 0."""
+        model = self._make_zero_degree_model()
+        N = model.N
+        theta0 = model.initial_theta("degrees")
+        P = model.pij_matrix(theta0)
+        assert P[:, N - 1].abs().max().item() == 0.0, "Last column must be exactly zero"
+
+    def test_residual_exact_zero_for_zero_degree(self) -> None:
+        """Residual components for zero-degree nodes must be exactly 0."""
+        model = self._make_zero_degree_model()
+        N = model.N
+        theta0 = model.initial_theta("degrees")
+        F = model.residual(theta0)
+        # F[0] corresponds to k_out[0] = 0
+        assert F[0].abs().item() == 0.0
+        # F[N + N-1] corresponds to k_in[N-1] = 0
+        assert F[N + N - 1].abs().item() == 0.0
+
+    def test_initial_theta_zero_degree_nodes_large(self) -> None:
+        """initial_theta must set θ = _THETA_MAX for zero-degree nodes."""
+        from src.models.dcm import _THETA_MAX
+        model = self._make_zero_degree_model()
+        N = model.N
+        theta0 = model.initial_theta("degrees")
+        assert theta0[0].item() == _THETA_MAX, "θ_out[0] must equal _THETA_MAX"
+        assert theta0[N + N - 1].item() == _THETA_MAX, "θ_in[N-1] must equal _THETA_MAX"
+
+    def test_initial_theta_random_zero_degree_nodes_large(self) -> None:
+        """initial_theta('random') must also set θ = _THETA_MAX for zero-degree nodes."""
+        from src.models.dcm import _THETA_MAX
+        model = self._make_zero_degree_model()
+        N = model.N
+        theta0 = model.initial_theta("random")
+        assert theta0[0].item() == _THETA_MAX
+        assert theta0[N + N - 1].item() == _THETA_MAX
+
+    def test_solver_converges_with_zero_degree_nodes(self) -> None:
+        """Zero-degree nodes must not prevent solver convergence."""
+        from src.solvers.newton import solve_newton
+        model = self._make_zero_degree_model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_newton(
+            model.residual, model.jacobian, theta0, tol=1e-10, max_iter=100,
+        )
+        err = model.constraint_error(result.theta)
+        assert err < 1e-5, f"Newton error with zero-degree nodes: {err:.3e}"

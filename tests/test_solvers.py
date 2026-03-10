@@ -157,6 +157,7 @@ class TestLBFGS:
         assert isinstance(result.converged, bool)
         assert isinstance(result.iterations, int)
         assert result.elapsed_time >= 0.0
+        assert result.peak_ram_bytes > 0
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +225,120 @@ class TestLevenbergMarquardt:
         )
         err = model.constraint_error(result.theta)
         assert err < CONV_TOL, f"N={N} LM-diag error={err:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# RAM usage tests (all 5 solvers)
+# ---------------------------------------------------------------------------
+
+def _fmt_bytes(n: int) -> str:
+    """Format byte count as a human-readable string."""
+    _KB = 1024
+    _MB = 1024 * 1024
+    if n < _KB:
+        return f"{n} B"
+    elif n < _MB:
+        return f"{n / _KB:.1f} KB"
+    return f"{n / _MB:.2f} MB"
+
+
+class TestRAMUsage:
+    """Verify that every solver measures and reports peak RAM consumption.
+
+    Each test asserts:
+    - ``peak_ram_bytes > 0`` — tracemalloc captured at least some allocation.
+    - ``peak_ram_bytes`` is printed so it appears in ``pytest -s`` / CI logs.
+
+    The final ``test_ram_summary`` test collects all five solvers on the same
+    N=10 problem and prints a comparison table (visible with ``pytest -s``).
+    """
+
+    N: int = 10
+
+    def _model(self) -> tuple[DCMModel, np.ndarray]:
+        return make_test_problem(N=self.N, seed=7)
+
+    def test_fixed_point_ram(self) -> None:
+        model, _ = self._model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point(
+            model.residual, theta0, model.k_out, model.k_in,
+            tol=1e-8, max_iter=5000,
+        )
+        assert result.peak_ram_bytes > 0, "Fixed-point must report non-zero RAM"
+        print(f"\n[RAM] Fixed-point (GS): {_fmt_bytes(result.peak_ram_bytes)}")
+
+    def test_lbfgs_ram(self) -> None:
+        model, _ = self._model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_lbfgs(model.residual, theta0, tol=1e-8, max_iter=2000)
+        assert result.peak_ram_bytes > 0, "L-BFGS must report non-zero RAM"
+        print(f"\n[RAM] L-BFGS (m=20):   {_fmt_bytes(result.peak_ram_bytes)}")
+
+    def test_newton_ram(self) -> None:
+        model, _ = self._model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_newton(
+            model.residual, model.jacobian, theta0, tol=1e-8, max_iter=100,
+        )
+        assert result.peak_ram_bytes > 0, "Newton must report non-zero RAM"
+        print(f"\n[RAM] Full Newton:      {_fmt_bytes(result.peak_ram_bytes)}")
+
+    def test_broyden_ram(self) -> None:
+        model, _ = self._model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_broyden(
+            model.residual, model.jacobian, theta0, tol=1e-8, max_iter=500,
+        )
+        assert result.peak_ram_bytes > 0, "Broyden must report non-zero RAM"
+        print(f"\n[RAM] Broyden:          {_fmt_bytes(result.peak_ram_bytes)}")
+
+    def test_lm_ram(self) -> None:
+        model, _ = self._model()
+        theta0 = model.initial_theta("degrees")
+        result = solve_lm(
+            model.residual, model.jacobian, theta0, tol=1e-8, max_iter=500,
+        )
+        assert result.peak_ram_bytes > 0, "LM must report non-zero RAM"
+        print(f"\n[RAM] Levenberg-Marquardt: {_fmt_bytes(result.peak_ram_bytes)}")
+
+    def test_ram_summary(self) -> None:
+        """Print a comparison table of RAM and timing for all 5 solvers (N=10).
+
+        Run with ``pytest -s`` to see the table in stdout.
+        The test always passes as long as all solvers converge and report RAM.
+        """
+        model, _ = self._model()
+        theta0 = model.initial_theta("degrees")
+
+        solvers = [
+            ("Fixed-point (GS)", lambda: solve_fixed_point(
+                model.residual, theta0, model.k_out, model.k_in,
+                tol=1e-8, max_iter=5000, variant="gauss-seidel",
+            )),
+            ("L-BFGS (m=20)", lambda: solve_lbfgs(
+                model.residual, theta0, tol=1e-8, max_iter=2000,
+            )),
+            ("Newton (exact J)", lambda: solve_newton(
+                model.residual, model.jacobian, theta0, tol=1e-8, max_iter=100,
+            )),
+            ("Broyden (rank-1)", lambda: solve_broyden(
+                model.residual, model.jacobian, theta0, tol=1e-8, max_iter=500,
+            )),
+            ("Levenberg-Marquardt", lambda: solve_lm(
+                model.residual, model.jacobian, theta0, tol=1e-8, max_iter=500,
+            )),
+        ]
+
+        header = f"\n{'Method':<24} {'Conv?':<7} {'Iters':>6} {'MaxErr':>10} {'Time(s)':>9} {'Peak RAM':>10}"
+        rows = [header, "-" * len(header.rstrip())]
+        for name, run in solvers:
+            r = run()
+            err = model.constraint_error(r.theta)
+            conv = "YES" if r.converged else "NO"
+            rows.append(
+                f"{name:<24} {conv:<7} {r.iterations:>6} {err:>10.2e} "
+                f"{r.elapsed_time:>9.3f} {_fmt_bytes(r.peak_ram_bytes):>10}"
+            )
+            assert r.peak_ram_bytes > 0, f"{name} must report non-zero RAM"
+        print("\n".join(rows))

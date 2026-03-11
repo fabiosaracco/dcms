@@ -44,6 +44,54 @@ from .base import SolverResult
 from src.models.dwcm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 
 
+def _anderson_mixing(
+    fp_outputs: list[torch.Tensor],
+    residuals_hist: list[torch.Tensor],
+) -> torch.Tensor:
+    """Anderson mixing: compute the next iterate from history.
+
+    Solves the constrained least-squares problem:
+
+        min  ‖Σ_i c_i r_i‖²    s.t.  Σ_i c_i = 1
+
+    where r_i = g(θ_i) − θ_i are the FP residuals.  The solution is obtained
+    via the normal equations of the m×m system (R^T R) c ∝ 1 and then
+    normalised so that Σ c_i = 1.
+
+    Args:
+        fp_outputs:     List of g(θ_k) values (FP outputs), each shape (2N,).
+        residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (2N,).
+
+    Returns:
+        Anderson-mixed next iterate θ_{k+1}, shape (2N,).
+    """
+    m = len(fp_outputs)
+    if m == 1:
+        return fp_outputs[0]
+
+    R = torch.stack(residuals_hist, dim=1)  # (2N, m)
+    G = torch.stack(fp_outputs, dim=1)      # (2N, m)
+
+    # Normal equations: (R^T R) c ∝ ones — solve for c
+    RtR = R.T @ R  # (m, m)
+    # Regularise to avoid singularity when recent steps are nearly collinear.
+    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
+    ones = torch.ones(m, dtype=RtR.dtype)
+    try:
+        c = torch.linalg.solve(RtR, ones)  # (m,): c ∝ (R^T R)^{-1} 1
+        c_sum = c.sum().item()
+        if abs(c_sum) < 1e-14 or not math.isfinite(c_sum):
+            raise RuntimeError("Degenerate Anderson weights.")
+        c = c / c_sum  # normalise: Σ c_i = 1
+        # Clamp to prevent wild extrapolation
+        c = c.clamp(-10.0, 10.0)
+        c = c / c.sum()
+    except RuntimeError:
+        c = ones / m  # fallback: simple uniform mixing
+
+    return G @ c
+
+
 def solve_fixed_point_dwcm(
     residual_fn: Callable[[torch.Tensor], torch.Tensor],
     theta0: "ArrayLike",  # type: ignore[name-defined]
@@ -54,6 +102,7 @@ def solve_fixed_point_dwcm(
     damping: float = 1.0,
     variant: str = "gauss-seidel",
     chunk_size: int = 0,
+    anderson_depth: int = 0,
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -71,6 +120,11 @@ def solve_fixed_point_dwcm(
             to avoid materialising the full matrix (useful for large N).
             If 0, auto-select: dense for N ≤ ``_LARGE_N_THRESHOLD``, chunked
             (with ``_DEFAULT_CHUNK``) otherwise.
+        anderson_depth: Depth of Anderson acceleration history.  0 disables
+            Anderson mixing (plain fixed-point).  Values of 5–10 typically
+            give the best convergence acceleration.  Uses the m most recent
+            FP outputs to compute the next iterate via constrained
+            least-squares mixing (Walker & Ni 2011).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -114,6 +168,10 @@ def solve_fixed_point_dwcm(
     residuals: list[float] = []
     converged = False
     message = "Maximum iterations reached without convergence."
+
+    # Anderson acceleration history (in θ-space)
+    _and_g: list[torch.Tensor] = []  # g(θ_k) — damped FP outputs
+    _and_r: list[torch.Tensor] = []  # r_k = g(θ_k) − θ_k
 
     try:
         for _ in range(max_iter):
@@ -159,11 +217,30 @@ def solve_fixed_point_dwcm(
             # Convert to θ-space and apply damping
             theta_out_new = (-torch.log(beta_out_new)).clamp(_ETA_MIN, _ETA_MAX)
             theta_in_new = (-torch.log(beta_in_new)).clamp(_ETA_MIN, _ETA_MAX)
+            fp_raw = torch.cat([theta_out_new, theta_in_new])
 
-            theta_new = torch.cat([theta_out_new, theta_in_new])
-            theta = damping * theta_new + (1.0 - damping) * theta
-            # Re-clamp after damped blend to maintain feasibility
-            theta = theta.clamp(_ETA_MIN, _ETA_MAX)
+            # Damped FP output: g(θ) = α * FP_raw(θ) + (1−α) * θ
+            theta_fp = (damping * fp_raw + (1.0 - damping) * theta).clamp(_ETA_MIN, _ETA_MAX)
+
+            if anderson_depth > 1:
+                # Anderson acceleration: keep history and mix
+                r_k = theta_fp - theta
+                _and_g.append(theta_fp.clone())
+                _and_r.append(r_k.clone())
+
+                if len(_and_g) > anderson_depth:
+                    _and_g.pop(0)
+                    _and_r.pop(0)
+
+                if len(_and_g) >= 2:
+                    theta_next = _anderson_mixing(_and_g, _and_r)
+                    theta_next = theta_next.clamp(_ETA_MIN, _ETA_MAX)
+                else:
+                    theta_next = theta_fp
+            else:
+                theta_next = theta_fp
+
+            theta = theta_next
 
             # Convergence check (ℓ∞ norm of residual)
             res = residual_fn(theta)

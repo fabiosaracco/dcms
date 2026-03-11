@@ -31,6 +31,7 @@ Memory thresholds
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import math
 import time
@@ -52,6 +53,42 @@ from src.solvers.levenberg_marquardt import solve_lm
 from src.utils.wng import k_s_generator_pl
 
 
+class _TimeoutError(Exception):
+    """Raised by the SIGALRM handler when a solver exceeds its wall-clock budget."""
+
+
+def _call_with_timeout(fn: Callable, timeout_s: float):
+    """Call *fn()* and raise _TimeoutError if it does not finish in *timeout_s* seconds.
+
+    Uses POSIX SIGALRM (Linux/macOS only).  On platforms where SIGALRM is
+    unavailable the function falls back to running without a timeout.
+
+    Args:
+        fn:        Zero-argument callable to invoke.
+        timeout_s: Maximum allowed wall-clock seconds (rounded to nearest int).
+
+    Returns:
+        Whatever *fn()* returns.
+
+    Raises:
+        _TimeoutError: If *fn()* exceeds *timeout_s* seconds.
+    """
+    if not hasattr(signal, "SIGALRM"):  # Windows fallback
+        return fn()
+
+    def _handler(signum: int, frame: object) -> None:
+        raise _TimeoutError(f"Solver exceeded {timeout_s:.0f}s timeout.")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(max(1, int(timeout_s)))
+    try:
+        result = fn()
+        signal.alarm(0)  # cancel alarm on success
+        return result
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 # ---------------------------------------------------------------------------
 # Scaling thresholds
 # ---------------------------------------------------------------------------
@@ -70,8 +107,11 @@ DIAG_LM_N_MAX: int = 200_000
 # Default network sizes to benchmark
 DEFAULT_SIZES: list[int] = [1_000, 5_000, 10_000, 50_000]
 
-# Connection density (rho) for the Chung-Lu generator
-DEFAULT_RHO: float = 0.05
+# Connection density (rho) for the Chung-Lu generator.
+# Using the wng default (0.001) produces networks with moderate degree heterogeneity
+# that are numerically tractable for DWCM. Denser networks (rho > 0.02) can push
+# β values close to 1, making all solver methods numerically challenging.
+DEFAULT_RHO: float = 0.001
 
 # Convergence tolerance used by all solvers in this benchmark
 DEFAULT_TOL: float = 1e-6
@@ -244,6 +284,74 @@ def _check_strength_consistency(
     return True
 
 
+def _lbfgs_multistart(
+    model: DWCMModel,
+    theta0: torch.Tensor,
+    tol: float,
+    max_iter: int,
+    n_starts: int = 4,
+) -> SolverResult:
+    """L-BFGS with multiple random restarts if the default init fails.
+
+    Tries *theta0* ("strengths" initialisation) first, then up to ``n_starts-1``
+    random initialisations generated with ``torch.manual_seed(i)``.  Returns
+    the best result found (lowest MaxRelError).
+
+    Args:
+        model:    DWCMModel instance.
+        theta0:   Default initial parameter vector (from model.initial_theta).
+        tol:      Convergence tolerance.
+        max_iter: Maximum iterations per L-BFGS run.
+        n_starts: Total number of starting points to try (including theta0).
+
+    Returns:
+        :class:`~src.solvers.base.SolverResult` with the best solution found.
+    """
+    import tracemalloc as _tm
+    import time as _t
+    from src.solvers.base import SolverResult as _SR
+
+    res_fn = _make_clamped_residual(model)
+    nll_fn = _make_clamped_nll(model)
+
+    best_result: Optional[SolverResult] = None
+    best_err = float("inf")
+    total_iters = 0
+    combined_ram = 0
+    t_start = _t.perf_counter()
+
+    starts = [theta0] + [
+        model.initial_theta("random") for _ in range(n_starts - 1)
+    ]
+    for i, t0 in enumerate(starts):
+        # Set a different random seed per start for reproducibility
+        torch.manual_seed(i)
+        result = solve_lbfgs(
+            res_fn, t0, tol=tol, m=20, max_iter=max_iter,
+            neg_loglik_fn=nll_fn, theta_bounds=(_ETA_MIN, _ETA_MAX),
+        )
+        total_iters += result.iterations
+        combined_ram = max(combined_ram, result.peak_ram_bytes)
+        err = model.max_relative_error(result.theta)
+        if err < best_err:
+            best_err = err
+            best_result = result
+        if result.converged:
+            break
+
+    elapsed = _t.perf_counter() - t_start
+    assert best_result is not None
+    return _SR(
+        theta=best_result.theta,
+        converged=best_result.converged,
+        iterations=total_iters,
+        residuals=best_result.residuals,
+        elapsed_time=elapsed,
+        peak_ram_bytes=combined_ram,
+        message=best_result.message,
+    )
+
+
 def _make_solvers(
     model: DWCMModel,
     theta0: torch.Tensor,
@@ -266,74 +374,100 @@ def _make_solvers(
     nll_fn = _make_clamped_nll(model)
     jac_fn = _make_clamped_jacobian(model)
 
-    # Adaptive max_iter for fixed-point: cap so each solver run takes ≤ ~0.5 s.
-    # Rough cost per iteration: O(N) element operations ≈ N / 5e5 seconds.
-    # Target: 0.5 s / (N/5e5) = 2.5e5/N iterations, floored at 200, capped at 5000.
-    max_iter_fp: int = max(200, min(5_000, int(50_000 / max(N, 1))))
+    # ---------------------------------------------------------------------------
+    # Per-method iteration budgets.
+    # The residual cost is O(N²) per evaluation.
+    # Empirical: N=100→0.3ms, N=1k→8ms, N=5k→170ms, N=10k→650ms, N=50k→15s
+    # 
+    # Plain FP-GS/Jacobi: these don't converge for heterogeneous Pareto networks
+    # but we run them to measure how well they do (up to ~1s budget).
+    # Anderson-GS and L-BFGS: given a larger budget since they converge.
+    # ---------------------------------------------------------------------------
+    residual_ms = max(0.3e-3, (N / 1_000) ** 2 * 8e-3)  # seconds per residual
+
+    # Plain FP gets only ~1 s budget (enough to see it won't converge, fast enough)
+    MAX_FP_PLAIN_ITER: int = max(10, min(5_000, int(1.0 / residual_ms)))
+    # Anderson-accelerated FP gets ~30 s budget (converges fast when it works)
+    MAX_FP_ANDERSON_ITER: int = max(10, min(10_000, int(30.0 / residual_ms)))
+    # L-BFGS: ~30 s budget, each iter costs ~2 residuals
+    MAX_LBFGS_ITER: int = max(10, min(2_000, int(30.0 / (2 * residual_ms))))
+    # Diagonal LM: ~10 s budget
+    MAX_LM_ITER: int = max(10, min(500, int(10.0 / (3 * residual_ms))))
 
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
-    # Fixed-point (always applicable; chunked for large N)
+    # ── Fixed-point GS α=1.0 (plain, fast) ─────────────────────────────────
     solvers.append((
-        "Fixed-point GS α=1.0",
+        "FP-GS α=1.0",
         lambda: solve_fixed_point_dwcm(
             res_fn, theta0, model.s_out, model.s_in,
             tol=tol, damping=1.0, variant="gauss-seidel",
-            max_iter=max_iter_fp,
+            max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
         ),
     ))
+
+    # ── Fixed-point GS α=0.5 (damped) ───────────────────────────────────────
     solvers.append((
-        "Fixed-point GS α=0.5",
+        "FP-GS α=0.5",
         lambda: solve_fixed_point_dwcm(
             res_fn, theta0, model.s_out, model.s_in,
             tol=tol, damping=0.5, variant="gauss-seidel",
-            max_iter=max_iter_fp,
+            max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
         ),
     ))
+
+    # ── Fixed-point GS α=1.0 + Anderson depth=5 (accelerated) ──────────────
+    # Anderson mixing accelerates convergence for heterogeneous networks by
+    # extrapolating from the last 5 FP iterates.
     solvers.append((
-        "Fixed-point Jacobi",
+        "FP-GS Anderson(5)",
+        lambda: solve_fixed_point_dwcm(
+            res_fn, theta0, model.s_out, model.s_in,
+            tol=tol, damping=1.0, variant="gauss-seidel",
+            max_iter=MAX_FP_ANDERSON_ITER, anderson_depth=5,
+        ),
+    ))
+
+    # ── Fixed-point Jacobi ──────────────────────────────────────────────────
+    solvers.append((
+        "FP-Jacobi",
         lambda: solve_fixed_point_dwcm(
             res_fn, theta0, model.s_out, model.s_in,
             tol=tol, damping=1.0, variant="jacobi",
-            max_iter=max_iter_fp,
+            max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
         ),
     ))
 
-    # L-BFGS (always applicable; chunked residual for large N)
-    # Use theta_bounds to keep θ > 0 (DWCM feasibility constraint).
-    # Adaptive max_iter: for large N, residual evaluation is expensive.
-    max_iter_lbfgs: int = max(200, min(500, int(200_000 / max(N, 1))))
+    # ── L-BFGS multi-start ──────────────────────────────────────────────────
+    # Uses the "strengths" initialisation first; if it fails, tries up to 3
+    # random initialisations.  The extra cost is amortised across the n_starts.
     solvers.append((
-        "L-BFGS (m=20)",
-        lambda: solve_lbfgs(
-            res_fn, theta0, tol=tol, m=20,
-            max_iter=max_iter_lbfgs,
-            neg_loglik_fn=nll_fn,
-            theta_bounds=(_ETA_MIN, _ETA_MAX),
-        ),
+        "L-BFGS (multi-start)",
+        lambda: _lbfgs_multistart(model, theta0, tol=tol,
+                                   max_iter=MAX_LBFGS_ITER, n_starts=4),
     ))
 
-    # LM with diagonal Hessian from model (O(N) per step, no full Jacobian needed)
-    # Uses the analytical hessian_diag() which avoids O(N²) computation.
+    # ── Diagonal LM (O(N) RAM, always applicable) ───────────────────────────
     solvers.append((
         "LM (diag Hessian)",
         lambda: _solve_lm_diag_dwcm(model, theta0, tol=tol,
-                                     theta_bounds=(_ETA_MIN, _ETA_MAX)),
+                                     theta_bounds=(_ETA_MIN, _ETA_MAX),
+                                     max_iter=MAX_LM_ITER),
     ))
 
-    # Newton, Broyden, full-Jacobian LM — only for small N
+    # ── Newton, Broyden, full-Jacobian LM — only for small N (O(N²) RAM) ──
     if N <= NEWTON_N_MAX:
         solvers.append((
             "Newton (exact J)",
             lambda: solve_newton(
-                res_fn, jac_fn, theta0, tol=tol,
+                res_fn, jac_fn, theta0, tol=tol, max_iter=200,
                 theta_bounds=(_ETA_MIN, _ETA_MAX),
             ),
         ))
         solvers.append((
             "Broyden (rank-1 J)",
             lambda: solve_broyden(
-                res_fn, jac_fn, theta0, tol=tol,
+                res_fn, jac_fn, theta0, tol=tol, max_iter=500,
                 theta_bounds=(_ETA_MIN, _ETA_MAX),
             ),
         ))
@@ -343,7 +477,7 @@ def _make_solvers(
             "LM (full Jacobian)",
             lambda: solve_lm(
                 res_fn, jac_fn, theta0, tol=tol, diagonal_only=False,
-                theta_bounds=(_ETA_MIN, _ETA_MAX),
+                max_iter=500, theta_bounds=(_ETA_MIN, _ETA_MAX),
             ),
         ))
 
@@ -437,23 +571,23 @@ def _run_single_network(
     for name, fn in solvers:
         t_start = time.perf_counter()
         try:
-            sr: SolverResult = fn()
+            sr: SolverResult = _call_with_timeout(fn, timeout)
             elapsed = time.perf_counter() - t_start
-            if elapsed > timeout:
-                results[name] = dict(
-                    converged=False, iterations=sr.iterations,
-                    max_rel_err=float("nan"), elapsed=elapsed,
-                    peak_ram_mb=float("nan"), status="TIMEOUT",
-                )
-            else:
-                max_rel_err = model.max_relative_error(sr.theta)
-                results[name] = dict(
-                    converged=sr.converged, iterations=sr.iterations,
-                    max_rel_err=max_rel_err,
-                    elapsed=sr.elapsed_time,
-                    peak_ram_mb=sr.peak_ram_bytes / 1024 / 1024,
-                    status="OK" if sr.converged else "NO-CONV",
-                )
+            max_rel_err = model.max_relative_error(sr.theta)
+            results[name] = dict(
+                converged=sr.converged, iterations=sr.iterations,
+                max_rel_err=max_rel_err,
+                elapsed=sr.elapsed_time,
+                peak_ram_mb=sr.peak_ram_bytes / 1024 / 1024,
+                status="OK" if sr.converged else "NO-CONV",
+            )
+        except _TimeoutError:
+            results[name] = dict(
+                converged=False, iterations=0,
+                max_rel_err=float("nan"),
+                elapsed=time.perf_counter() - t_start,
+                peak_ram_mb=float("nan"), status="TIMEOUT",
+            )
         except MemoryError:
             results[name] = dict(
                 converged=False, iterations=0, max_rel_err=float("nan"),

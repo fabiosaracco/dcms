@@ -25,6 +25,7 @@ Usage::
 Memory thresholds
 -----------------
 * N > ``NEWTON_N_MAX``       → skip Newton and Broyden (O(N²) Jacobian).
+* N > ``LBFGS_N_MAX``        → skip L-BFGS (O(N²) residual cost per step makes timeout impractical).
 * N > ``FULL_JAC_LM_N_MAX`` → use diagonal-only LM instead of full-Jacobian LM.
 * N > ``_LARGE_N_THRESHOLD`` (from DWCMModel) → chunked residual / fixed-point.
 """
@@ -98,6 +99,11 @@ NEWTON_N_MAX: int = 500
 
 # Full-Jacobian LM shares the same RAM cost as Newton.
 FULL_JAC_LM_N_MAX: int = 500
+
+# L-BFGS is O(N) RAM per step but each step calls the residual (O(N²) cost).
+# For N > LBFGS_N_MAX the cost per function evaluation is so high that L-BFGS
+# becomes impractical within a reasonable timeout.
+LBFGS_N_MAX: int = 5_000
 
 # LM-diagonal (using hessian_diag, O(N) RAM) — applicable up to this N.
 # For N > DIAG_LM_N_MAX, the diagonal hessian LM is still O(N) but may
@@ -488,13 +494,16 @@ def _make_solvers(
         ),
     ))
 
-    # ── L-BFGS multi-start ──────────────────────────────────────────────────
-    # Tries "strengths", "normalized", "uniform", then random initialisations.
-    solvers.append((
-        "L-BFGS (multi-start)",
-        lambda: _lbfgs_multistart(model, theta0, tol=tol,
-                                   max_iter=MAX_LBFGS_ITER, n_starts=4),
-    ))
+    # ── L-BFGS multi-start (skipped for N > LBFGS_N_MAX) ───────────────────
+    # At large N each gradient evaluation costs O(N²) = ~1.5s at N=10k.
+    # With 5 evals/iter, a 300s timeout allows only ~40 L-BFGS steps — often
+    # insufficient.  Skip for N > LBFGS_N_MAX and rely on Anderson FP instead.
+    if N <= LBFGS_N_MAX:
+        solvers.append((
+            "L-BFGS (multi-start)",
+            lambda: _lbfgs_multistart(model, theta0, tol=tol,
+                                      max_iter=MAX_LBFGS_ITER, n_starts=4),
+        ))
 
     # ── Diagonal LM (O(N) RAM, always applicable) ───────────────────────────
     solvers.append((

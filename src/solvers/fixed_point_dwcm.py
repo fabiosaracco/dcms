@@ -45,6 +45,8 @@ from src.models.dwcm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
 
 # Clamp θ to avoid exp overflow/underflow
 _THETA_CLAMP = 50.0
+# Minimum beta value to prevent log(0) in the theta update
+_BETA_MIN: float = 1e-300
 
 
 def solve_fixed_point_dwcm(
@@ -130,8 +132,8 @@ def solve_fixed_point_dwcm(
                 )
 
             # Damped update in θ-space
-            theta_out_new = -torch.log(beta_out_new.clamp(min=1e-300))
-            theta_in_new = -torch.log(beta_in_new.clamp(min=1e-300))
+            theta_out_new = -torch.log(beta_out_new.clamp(min=_BETA_MIN))
+            theta_in_new = -torch.log(beta_in_new.clamp(min=_BETA_MIN))
             theta_out_new = theta_out_new.clamp(-_THETA_CLAMP, _THETA_CLAMP)
             theta_in_new = theta_in_new.clamp(-_THETA_CLAMP, _THETA_CLAMP)
 
@@ -143,7 +145,11 @@ def solve_fixed_point_dwcm(
             res_norm = res.abs().max().item()
 
             if not math.isfinite(res_norm):
-                message = f"NaN/Inf detected at iteration {n_iter}."
+                message = (
+                    f"NaN/Inf detected in residual at iteration {n_iter} "
+                    f"(max |β_out|={beta_out_new.abs().max().item():.2e}, "
+                    f"max |β_in|={beta_in_new.abs().max().item():.2e})."
+                )
                 break
 
             n_iter += 1

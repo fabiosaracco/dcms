@@ -261,7 +261,11 @@ class TestFixedPointDWCM:
         assert len(result.residuals) == result.iterations
 
     def test_chunked_matches_dense(self) -> None:
-        """Chunked step must give same result as dense step for small N."""
+        """Chunked step must give same result as dense step for small N.
+
+        Uses tol=1e-10 internally so both paths are driven to a very precise
+        solution; the final assertion uses the looser CONV_TOL threshold.
+        """
         model, _ = make_dwcm_model(N=6, seed=7)
         theta0 = model.initial_theta("strengths")
         result_dense = solve_fixed_point_dwcm(

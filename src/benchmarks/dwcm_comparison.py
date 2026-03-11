@@ -362,6 +362,7 @@ def _print_summary_table(
     sizes: list[int],
     tol: float,
     timeout: float,
+    n_seeds: int = DEFAULT_N_SEEDS,
 ) -> None:
     """Print the aggregate statistics table for all sizes and methods.
 
@@ -450,7 +451,7 @@ def _print_summary_table(
 
     print(f"{'='*100}")
     print("Legend:  OK% = fraction of runs that converged  |  — = no converged runs")
-    print(f"         Intervals show mean ± 2σ across the {DEFAULT_N_SEEDS} realisations")
+    print(f"         Intervals show mean ± 2σ across the {n_seeds} realisations")
     print()
 
 
@@ -489,7 +490,7 @@ def run_dwcm_comparison(
         )
         all_records.extend(records)
 
-    _print_summary_table(all_records, sizes, tol, timeout)
+    _print_summary_table(all_records, sizes, tol, timeout, n_seeds=n_seeds)
 
 
 # ---------------------------------------------------------------------------

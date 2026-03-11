@@ -291,11 +291,17 @@ def _lbfgs_multistart(
     max_iter: int,
     n_starts: int = 4,
 ) -> SolverResult:
-    """L-BFGS with multiple random restarts if the default init fails.
+    """L-BFGS with multiple initialisations if the default init fails.
 
-    Tries *theta0* ("strengths" initialisation) first, then up to ``n_starts-1``
-    random initialisations generated with ``torch.manual_seed(i)``.  Returns
-    the best result found (lowest MaxRelError).
+    Tries starting points in this order, stopping as soon as one converges:
+
+    1. ``theta0`` — the "strengths" mean-field approximation (default).
+    2. ``"normalized"`` — β_i = s_i / Σ_j s_j (Squartini & Garlaschelli 2011).
+    3. ``"uniform"``    — all betas equal to the median of the strengths init.
+    4. ``"random"``     — uniform random θ ∈ [0.1, 2.0] (with torch.manual_seed).
+
+    Extra random restarts fill up to ``n_starts`` total attempts.  Returns the
+    result with the lowest MaxRelError across all starts.
 
     Args:
         model:    DWCMModel instance.
@@ -307,7 +313,6 @@ def _lbfgs_multistart(
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best solution found.
     """
-    import tracemalloc as _tm
     import time as _t
     from src.solvers.base import SolverResult as _SR
 
@@ -320,11 +325,16 @@ def _lbfgs_multistart(
     combined_ram = 0
     t_start = _t.perf_counter()
 
-    starts = [theta0] + [
-        model.initial_theta("random") for _ in range(n_starts - 1)
-    ]
-    for i, t0 in enumerate(starts):
-        # Set a different random seed per start for reproducibility
+    # Build ordered list of starting points
+    starts: list[torch.Tensor] = [theta0]
+    for method in ("normalized", "uniform"):
+        starts.append(model.initial_theta(method))
+    # Fill remaining slots with random restarts
+    for i in range(max(0, n_starts - len(starts))):
+        torch.manual_seed(i)
+        starts.append(model.initial_theta("random"))
+
+    for i, t0 in enumerate(starts[:n_starts]):
         torch.manual_seed(i)
         result = solve_lbfgs(
             res_fn, t0, tol=tol, m=20, max_iter=max_iter,
@@ -416,17 +426,49 @@ def _make_solvers(
         ),
     ))
 
-    # ── Fixed-point GS α=1.0 + Anderson depth=5 (accelerated) ──────────────
-    # Anderson mixing accelerates convergence for heterogeneous networks by
-    # extrapolating from the last 5 FP iterates.
-    solvers.append((
-        "FP-GS Anderson(5)",
-        lambda: solve_fixed_point_dwcm(
-            res_fn, theta0, model.s_out, model.s_in,
-            tol=tol, damping=1.0, variant="gauss-seidel",
-            max_iter=MAX_FP_ANDERSON_ITER, anderson_depth=5,
-        ),
-    ))
+    # ── Fixed-point GS + Anderson depth=5, multi-start ──────────────────────
+    # Tries "strengths", "normalized", "uniform", and "random" initialisations
+    # in sequence, stopping as soon as one converges.  The Anderson mixing
+    # (Walker & Ni 2011) extrapolates from the last 5 FP iterates and typically
+    # achieves 100% convergence for Pareto networks regardless of the init.
+    def _fp_anderson_multistart() -> SolverResult:
+        import time as _t
+        from src.solvers.base import SolverResult as _SR
+        inits = [theta0,
+                 model.initial_theta("normalized"),
+                 model.initial_theta("uniform"),
+                 model.initial_theta("random")]
+        best: Optional[SolverResult] = None
+        best_err = float("inf")
+        total_iters = 0
+        peak_ram = 0
+        t0_wall = _t.perf_counter()
+        for t0_cand in inits:
+            r = solve_fixed_point_dwcm(
+                res_fn, t0_cand, model.s_out, model.s_in,
+                tol=tol, damping=1.0, variant="gauss-seidel",
+                max_iter=MAX_FP_ANDERSON_ITER, anderson_depth=5,
+            )
+            total_iters += r.iterations
+            peak_ram = max(peak_ram, r.peak_ram_bytes)
+            err = model.max_relative_error(r.theta)
+            if err < best_err:
+                best_err = err
+                best = r
+            if r.converged:
+                break
+        assert best is not None
+        return _SR(
+            theta=best.theta,
+            converged=best.converged,
+            iterations=total_iters,
+            residuals=best.residuals,
+            elapsed_time=_t.perf_counter() - t0_wall,
+            peak_ram_bytes=peak_ram,
+            message=best.message,
+        )
+
+    solvers.append(("FP-GS Anderson(5) multi-init", _fp_anderson_multistart))
 
     # ── Fixed-point Jacobi ──────────────────────────────────────────────────
     solvers.append((
@@ -439,8 +481,7 @@ def _make_solvers(
     ))
 
     # ── L-BFGS multi-start ──────────────────────────────────────────────────
-    # Uses the "strengths" initialisation first; if it fails, tries up to 3
-    # random initialisations.  The extra cost is amortised across the n_starts.
+    # Tries "strengths", "normalized", "uniform", then random initialisations.
     solvers.append((
         "L-BFGS (multi-start)",
         lambda: _lbfgs_multistart(model, theta0, tol=tol,

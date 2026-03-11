@@ -273,16 +273,28 @@ class DWCMModel:
     def initial_theta(self, method: str = "strengths") -> torch.Tensor:
         """Return a sensible starting point θ₀ for the solvers.
 
-        The ``"strengths"`` approximation β_i ≈ s_i / (s_i + N − 1) comes
-        from inverting the mean-field estimate s ≈ (N−1)β/(1−β).
-        Zero-strength nodes (s_i = 0) have β_i = 0 exactly, so θ_i = _ETA_MAX.
+        Several initialisation strategies are provided:
 
-        All returned θ values are clamped to [_ETA_MIN, _ETA_MAX] so that the
-        feasibility constraint β_out_i * β_in_j < 1 is satisfied.
+        * ``"strengths"`` (default): β_i ≈ sqrt(s_i / (s_i + N − 1)), derived
+          by inverting the symmetric mean-field estimate s ≈ (N−1)β²/(1−β²).
+          Works well when the strength distribution is not too heterogeneous.
+
+        * ``"normalized"`` (Squartini & Garlaschelli 2011, analytical approx.):
+          β_i^{out} = s_i^{out} / Σ_j s_j^{out}, β_i^{in} = s_i^{in} / Σ_j s_j^{in}.
+          Each β is proportional to the node's fractional share of total weight.
+
+        * ``"uniform"`` : all betas set to the geometric mean of the
+          "strengths" approximation — gives a flat starting point useful as a
+          multi-start alternative.
+
+        * ``"random"`` : uniform random values in θ ∈ [0.1, 2.0].
+
+        Zero-strength nodes always have β_i = 0 exactly (θ_i = _ETA_MAX)
+        regardless of method.  All θ values are clamped to [_ETA_MIN, _ETA_MAX].
 
         Args:
-            method: ``"strengths"`` — use s/(s+N-1) approximation;
-                    ``"random"``    — uniform random values in [0.1, 2.0].
+            method: One of ``"strengths"``, ``"normalized"``,
+                    ``"uniform"``, ``"random"``.
 
         Returns:
             Initial parameter vector θ₀, shape (2N,).
@@ -295,17 +307,50 @@ class DWCMModel:
             s_in_safe = self.s_in.clamp(min=1e-15)
             beta_out = torch.sqrt(s_out_safe / (s_out_safe + (N - 1)))
             beta_in = torch.sqrt(s_in_safe / (s_in_safe + (N - 1)))
-            # Clamp β to (0, 1) before taking log
-            beta_out = beta_out.clamp(1e-15, 1.0 - 1e-15)
-            beta_in = beta_in.clamp(1e-15, 1.0 - 1e-15)
-            theta_out = (-torch.log(beta_out)).clamp(_ETA_MIN, _ETA_MAX)
-            theta_in = (-torch.log(beta_in)).clamp(_ETA_MIN, _ETA_MAX)
+        elif method == "normalized":
+            # Squartini & Garlaschelli (2011) analytical approximation:
+            # β_i^{out} = s_out_i / Σ_j s_out_j  (fraction of total out-weight)
+            # β_i^{in}  = s_in_i  / Σ_j s_in_j
+            S_out = self.s_out.sum().clamp(min=1e-15)
+            S_in = self.s_in.sum().clamp(min=1e-15)
+            beta_out = self.s_out.clamp(min=1e-15) / S_out
+            beta_in = self.s_in.clamp(min=1e-15) / S_in
+        elif method == "uniform":
+            # Flat initialisation: all betas equal to the geometric-mean of the
+            # "strengths" approximation.  Useful as a diversity-inducing restart.
+            s_out_safe = self.s_out.clamp(min=1e-15)
+            s_in_safe = self.s_in.clamp(min=1e-15)
+            beta_ref_out = torch.sqrt(s_out_safe / (s_out_safe + (N - 1)))
+            beta_ref_in = torch.sqrt(s_in_safe / (s_in_safe + (N - 1)))
+            # Use median of positive entries as the common value
+            pos_out = beta_ref_out[~self.zero_out]
+            pos_in = beta_ref_in[~self.zero_in]
+            med_out = pos_out.median().item() if pos_out.numel() > 0 else 0.5
+            med_in = pos_in.median().item() if pos_in.numel() > 0 else 0.5
+            beta_out = torch.full((N,), med_out, dtype=torch.float64)
+            beta_in = torch.full((N,), med_in, dtype=torch.float64)
         elif method == "random":
             # No fixed seed — genuinely random each call
             theta_out = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
             theta_in = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
+            # Skip the β→θ conversion below
+            theta_out = torch.where(
+                self.zero_out, torch.full_like(theta_out, _ETA_MAX), theta_out
+            )
+            theta_in = torch.where(
+                self.zero_in, torch.full_like(theta_in, _ETA_MAX), theta_in
+            )
+            return torch.cat([theta_out.clamp(_ETA_MIN, _ETA_MAX),
+                              theta_in.clamp(_ETA_MIN, _ETA_MAX)])
         else:
             raise ValueError(f"Unknown initial-guess method: {method!r}")
+
+        # Clamp β to (0, 1) before taking log (shared by strengths/normalized/uniform)
+        beta_out = beta_out.clamp(1e-15, 1.0 - 1e-15)
+        beta_in = beta_in.clamp(1e-15, 1.0 - 1e-15)
+        theta_out = (-torch.log(beta_out)).clamp(_ETA_MIN, _ETA_MAX)
+        theta_in = (-torch.log(beta_in)).clamp(_ETA_MIN, _ETA_MAX)
+
         # Zero-strength nodes: β = 0 exactly ↔ θ → +∞ (clamped to +_ETA_MAX)
         theta_out = torch.where(
             self.zero_out, torch.full_like(theta_out, _ETA_MAX), theta_out

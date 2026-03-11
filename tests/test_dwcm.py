@@ -213,6 +213,22 @@ class TestInitialTheta:
         assert theta0.shape == torch.Size([20])
         assert torch.isfinite(theta0).all()
 
+    def test_normalized_method(self) -> None:
+        """normalized: β_i = s_i / Σ_j s_j — shape, finite, positive."""
+        model, _ = make_dwcm_model(N=10)
+        theta0 = model.initial_theta("normalized")
+        assert theta0.shape == torch.Size([20])
+        assert torch.isfinite(theta0).all()
+        assert (theta0 > 0).all(), "All initial θ must be strictly positive for DWCM"
+
+    def test_uniform_method(self) -> None:
+        """uniform: all betas equal to the median of the strengths init."""
+        model, _ = make_dwcm_model(N=10)
+        theta0 = model.initial_theta("uniform")
+        assert theta0.shape == torch.Size([20])
+        assert torch.isfinite(theta0).all()
+        assert (theta0 > 0).all()
+
     def test_unknown_method_raises(self) -> None:
         model, _ = make_dwcm_model(N=4)
         with pytest.raises(ValueError):
@@ -221,14 +237,16 @@ class TestInitialTheta:
     def test_feasibility_of_initial_theta(self) -> None:
         """Initial θ must satisfy the feasibility constraint β_i * β_j < 1."""
         model, _ = make_dwcm_model(N=20)
-        theta0 = model.initial_theta("strengths")
-        N = model.N
-        beta_out = torch.exp(-theta0[:N])
-        beta_in = torch.exp(-theta0[N:])
-        max_product = (beta_out[:, None] * beta_in[None, :]).fill_diagonal_(0.0).max().item()
-        assert max_product < 1.0, (
-            f"Feasibility violated: max(β_out_i * β_in_j) = {max_product:.4f}"
-        )
+        for method in ("strengths", "normalized", "uniform"):
+            theta0 = model.initial_theta(method)
+            N = model.N
+            beta_out = torch.exp(-theta0[:N])
+            beta_in = torch.exp(-theta0[N:])
+            max_product = (beta_out[:, None] * beta_in[None, :]).fill_diagonal_(0.0).max().item()
+            assert max_product < 1.0, (
+                f"Feasibility violated for method={method!r}: "
+                f"max(β_out_i * β_in_j) = {max_product:.4f}"
+            )
 
 
 class TestConstraintError:

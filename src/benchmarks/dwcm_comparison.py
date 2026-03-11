@@ -19,8 +19,8 @@ Usage::
     # Multi-seed comparison at several sizes (Phase 4 full run)
     python -m src.benchmarks.dwcm_comparison --sizes 1000 5000 10000 50000
 
-    # Quick validation (fewer seeds)
-    python -m src.benchmarks.dwcm_comparison --n 100 --n_seeds 3
+    # Quick validation (fewer seeds, explicit start seed for reproducibility)
+    python -m src.benchmarks.dwcm_comparison --n 100 --n_seeds 3 --start_seed 42
 
 Memory thresholds
 -----------------
@@ -366,15 +366,17 @@ def _make_solvers(
     model: DWCMModel,
     theta0: torch.Tensor,
     tol: float,
+    timeout: float = SOLVER_TIMEOUT,
 ) -> list[tuple[str, Callable[[], SolverResult]]]:
     """Return a list of (name, callable) solver pairs for *model*.
 
     Methods requiring O(N²) RAM are omitted for large N.
 
     Args:
-        model:  The DWCMModel instance.
-        theta0: Initial parameter vector (all positive).
-        tol:    Convergence tolerance.
+        model:   The DWCMModel instance.
+        theta0:  Initial parameter vector (all positive).
+        tol:     Convergence tolerance.
+        timeout: Per-solver hard timeout in seconds (used to set iteration budgets).
 
     Returns:
         Ordered list of ``(name, solver_callable)`` pairs.
@@ -386,23 +388,29 @@ def _make_solvers(
 
     # ---------------------------------------------------------------------------
     # Per-method iteration budgets.
-    # The residual cost is O(N²) per evaluation.
-    # Empirical: N=100→0.3ms, N=1k→8ms, N=5k→170ms, N=10k→650ms, N=50k→15s
-    # 
-    # Plain FP-GS/Jacobi: these don't converge for heterogeneous Pareto networks
-    # but we run them to measure how well they do (up to ~1s budget).
-    # Anderson-GS and L-BFGS: given a larger budget since they converge.
+    # The residual cost is O(N²) per evaluation (chunked for N > _LARGE_N_THRESHOLD).
+    # Empirical calibration (chunked, single CPU core):
+    #   N=100 →   0.3 ms,  N=1k →  8 ms,  N=5k → 200 ms,
+    #   N=10k → ~1.5  s,  N=50k → ~15 s
+    # The calibration formula uses a piecewise fit:
+    #   - for N ≤ 5k:  cost ≈ (N/1k)² × 8 ms  (GPU-friendly tensor ops)
+    #   - for N > 5k:  cost ≈ (N/1k)² × 15 ms  (chunked overhead dominates)
     # ---------------------------------------------------------------------------
-    residual_ms = max(0.3e-3, (N / 1_000) ** 2 * 8e-3)  # seconds per residual
+    if N <= 5_000:
+        residual_s = max(3e-4, (N / 1_000) ** 2 * 8e-3)
+    else:
+        residual_s = max(3e-4, (N / 1_000) ** 2 * 15e-3)
 
-    # Plain FP gets only ~1 s budget (enough to see it won't converge, fast enough)
-    MAX_FP_PLAIN_ITER: int = max(10, min(5_000, int(1.0 / residual_ms)))
-    # Anderson-accelerated FP gets ~30 s budget (converges fast when it works)
-    MAX_FP_ANDERSON_ITER: int = max(10, min(10_000, int(30.0 / residual_ms)))
-    # L-BFGS: ~30 s budget, each iter costs ~2 residuals
-    MAX_LBFGS_ITER: int = max(10, min(2_000, int(30.0 / (2 * residual_ms))))
-    # Diagonal LM: ~10 s budget
-    MAX_LM_ITER: int = max(10, min(500, int(10.0 / (3 * residual_ms))))
+    # Plain FP-GS/Jacobi: only ~1 s budget (enough to see it won't converge)
+    MAX_FP_PLAIN_ITER: int = max(10, min(5_000, int(1.0 / residual_s)))
+    # Anderson-accelerated FP: budget = min(timeout, 300 s)
+    # At N=10k (residual≈1.5s) this gives ~200 iterations within 300s
+    anderson_budget_s = min(timeout, 300.0) if timeout > 0 else 300.0
+    MAX_FP_ANDERSON_ITER: int = max(20, min(10_000, int(anderson_budget_s / residual_s)))
+    # L-BFGS: each iter costs ~3-5 residuals (gradient + line search)
+    MAX_LBFGS_ITER: int = max(20, min(2_000, int(anderson_budget_s / (5 * residual_s))))
+    # Diagonal LM: ~10 s budget (it rarely converges for DWCM anyway)
+    MAX_LM_ITER: int = max(10, min(500, int(10.0 / (3 * residual_s))))
 
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
@@ -606,7 +614,7 @@ def _run_single_network(
 
     model = DWCMModel(s_out, s_in)
     theta0 = model.initial_theta("strengths")
-    solvers = _make_solvers(model, theta0, tol)
+    solvers = _make_solvers(model, theta0, tol, timeout=timeout)
 
     results: dict[str, dict] = {}
     for name, fn in solvers:
@@ -684,7 +692,7 @@ def run_multi_seed_comparison(
         print(f"\n{'='*74}")
         print(
             f"DWCM Multi-Seed Comparison  |  N={N:,} nodes  |  "
-            f"{n_seeds} runs  |  tol={tol:.0e}"
+            f"{n_seeds} runs  |  tol={tol:.0e}  |  start_seed={start_seed}"
         )
         print(f"{'='*74}")
 
@@ -891,9 +899,18 @@ if __name__ == "__main__":
                         help=f"Convergence tolerance (default: {DEFAULT_TOL})")
     parser.add_argument("--timeout", type=float, default=SOLVER_TIMEOUT,
                         help=f"Per-solver time limit in seconds (default: {SOLVER_TIMEOUT})")
-    parser.add_argument("--start_seed", type=int, default=0,
-                        help="Base random seed (default: 0)")
+    parser.add_argument("--start_seed", type=int, default=None,
+                        help="Base random seed (default: random, from current time)")
     args = parser.parse_args()
+
+    # If start_seed is not provided, use a time-based random seed so that
+    # different invocations naturally sample different realisations.
+    import time as _time_mod
+    effective_start_seed: int = (
+        args.start_seed
+        if args.start_seed is not None
+        else int(_time_mod.time() * 1000) % (2 ** 31)
+    )
 
     if args.sizes is not None:
         # Scaling mode: run multi-seed for each size
@@ -902,7 +919,7 @@ if __name__ == "__main__":
             n_seeds=args.n_seeds,
             tol=args.tol,
             timeout=args.timeout,
-            start_seed=args.start_seed,
+            start_seed=effective_start_seed,
         )
     elif args.seed is not None:
         # Single-network mode
@@ -911,5 +928,5 @@ if __name__ == "__main__":
         # Default: multi-seed on single N
         run_multi_seed_comparison(
             N=args.n, n_seeds=args.n_seeds, tol=args.tol,
-            timeout=args.timeout, start_seed=args.start_seed,
+            timeout=args.timeout, start_seed=effective_start_seed,
         )

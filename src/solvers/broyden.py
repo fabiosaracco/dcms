@@ -38,6 +38,7 @@ def solve_broyden(
     reg: float = 1e-8,
     armijo_c: float = 1e-4,
     max_ls: int = 30,
+    theta_bounds: "Optional[tuple[float, float]]" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Broyden's good-Broyden method with Sherman-Morrison H⁻¹ updates.
 
@@ -54,6 +55,8 @@ def solve_broyden(
         reg:         Tikhonov regularisation for the initial (−J + εI)⁻¹.
         armijo_c:    Armijo constant for line search.
         max_ls:      Max backtracking steps.
+        theta_bounds: Optional ``(theta_lo, theta_hi)`` box constraint applied
+                      at every step.  Defaults to ``(-50, +50)``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -65,6 +68,11 @@ def solve_broyden(
         theta = torch.tensor(theta0, dtype=torch.float64)
     else:
         theta = theta0.clone().to(dtype=torch.float64)
+
+    # Resolve clamp bounds
+    theta_lo: float = theta_bounds[0] if theta_bounds is not None else -_THETA_CLAMP
+    theta_hi: float = theta_bounds[1] if theta_bounds is not None else _THETA_CLAMP
+    theta = theta.clamp(theta_lo, theta_hi)
 
     F = residual_fn(theta)
     n2 = theta.shape[0]
@@ -111,7 +119,7 @@ def solve_broyden(
             alpha = 1.0
             f0 = F.dot(F).item()
             for _ in range(max_ls):
-                theta_new = torch.clamp(theta + alpha * delta, -_THETA_CLAMP, _THETA_CLAMP)
+                theta_new = torch.clamp(theta + alpha * delta, theta_lo, theta_hi)
                 F_new = residual_fn(theta_new)
                 if F_new.dot(F_new).item() <= f0 * (1.0 - 2.0 * armijo_c * alpha):
                     break

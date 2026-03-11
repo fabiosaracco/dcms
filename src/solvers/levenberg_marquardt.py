@@ -43,6 +43,7 @@ def solve_lm(
     lam_down: float = 0.1,
     lam_max: float = 1e10,
     diagonal_only: bool = False,
+    theta_bounds: "Optional[tuple[float, float]]" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Levenberg-Marquardt with adaptive damping.
 
@@ -58,6 +59,8 @@ def solve_lm(
         lam_max:       Maximum λ before declaring failure.
         diagonal_only: If True, use only diag(JᵀJ) instead of the full JᵀJ.
                        Cheaper for large N.
+        theta_bounds:  Optional ``(theta_lo, theta_hi)`` box constraint applied
+                       at every step.  Defaults to ``(-50, +50)``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -69,6 +72,11 @@ def solve_lm(
         theta = torch.tensor(theta0, dtype=torch.float64)
     else:
         theta = theta0.clone().to(dtype=torch.float64)
+
+    # Resolve clamp bounds
+    theta_lo: float = theta_bounds[0] if theta_bounds is not None else -_THETA_CLAMP
+    theta_hi: float = theta_bounds[1] if theta_bounds is not None else _THETA_CLAMP
+    theta = theta.clamp(theta_lo, theta_hi)
 
     F = residual_fn(theta)
     cost = F.dot(F).item()
@@ -108,7 +116,7 @@ def solve_lm(
                     lam *= lam_up
                     continue
 
-            theta_new = torch.clamp(theta + delta, -_THETA_CLAMP, _THETA_CLAMP)
+            theta_new = torch.clamp(theta + delta, theta_lo, theta_hi)
             F_new = residual_fn(theta_new)
             cost_new = F_new.dot(F_new).item()
 

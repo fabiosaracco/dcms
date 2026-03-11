@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import math
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -56,10 +57,15 @@ from src.utils.wng import k_s_generator_pl
 # ---------------------------------------------------------------------------
 
 # Newton and Broyden need the full N×N Jacobian (O(N²) RAM).
-NEWTON_N_MAX: int = 2_000
+NEWTON_N_MAX: int = 500
 
 # Full-Jacobian LM shares the same RAM cost as Newton.
-FULL_JAC_LM_N_MAX: int = 2_000
+FULL_JAC_LM_N_MAX: int = 500
+
+# LM-diagonal (using hessian_diag, O(N) RAM) — applicable up to this N.
+# For N > DIAG_LM_N_MAX, the diagonal hessian LM is still O(N) but may
+# converge poorly due to ill-conditioning; we keep it for all sizes.
+DIAG_LM_N_MAX: int = 200_000
 
 # Default network sizes to benchmark
 DEFAULT_SIZES: list[int] = [1_000, 5_000, 10_000, 50_000]
@@ -80,6 +86,112 @@ DEFAULT_N_SEEDS: int = 10
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _solve_lm_diag_dwcm(
+    model: DWCMModel,
+    theta0: torch.Tensor,
+    tol: float = DEFAULT_TOL,
+    theta_bounds: tuple[float, float] = (_ETA_MIN, _ETA_MAX),
+    max_iter: int = 500,
+    lam0: float = 1e-3,
+    lam_up: float = 10.0,
+    lam_down: float = 0.1,
+    lam_max: float = 1e10,
+) -> SolverResult:
+    """LM with O(N) diagonal Hessian (no full Jacobian materialised).
+
+    Uses model.hessian_diag() and model.residual() only, avoiding the O(N²)
+    Jacobian allocation.  The normal equations reduce to:
+
+        (diag(H) + λ) δ = −F
+
+    where H = ∂F/∂θ = Hess(L) (negative semi-definite) and diag(H) ≤ 0.
+
+    We regularise as: (−diag(H) + λ) δ = F, so δ = F / (−diag(H) + λ).
+
+    Args:
+        model:        DWCMModel instance.
+        theta0:       Initial parameter vector, shape (2N,).
+        tol:          Convergence tolerance.
+        theta_bounds: (theta_lo, theta_hi) clamp applied at every step.
+        max_iter:     Maximum iterations.
+        lam0:         Initial damping λ.
+        lam_up:       λ increase factor on rejection.
+        lam_down:     λ decrease factor on acceptance.
+        lam_max:      Maximum λ before failure.
+
+    Returns:
+        :class:`~src.solvers.base.SolverResult` instance.
+    """
+    import tracemalloc as _tm
+    import time as _t
+    from src.solvers.base import SolverResult as _SR
+
+    _tm.start()
+    t0 = _t.perf_counter()
+
+    theta_lo, theta_hi = theta_bounds
+    theta = theta0.clone().to(dtype=torch.float64).clamp(theta_lo, theta_hi)
+
+    F = model.residual(theta.clamp(theta_lo, theta_hi))
+    cost = F.dot(F).item()
+    lam = lam0
+
+    residuals: list[float] = []
+    converged = False
+    n_iter = 0
+    message = "Maximum iterations reached without convergence."
+
+    try:
+        for _ in range(max_iter):
+            res_norm = F.abs().max().item()
+            if not math.isfinite(res_norm):
+                message = f"NaN/Inf at iteration {n_iter}."
+                break
+            if res_norm < tol:
+                converged = True
+                message = f"Converged in {n_iter} iteration(s)."
+                break
+
+            # Diagonal of Hess(L) = ∂F/∂θ — all entries ≤ 0
+            h_diag = model.hessian_diag(theta.clamp(theta_lo, theta_hi))
+            neg_h = -h_diag  # ≥ 0
+
+            # LM step: δ = F / (−diag(H) + λ)
+            delta = F / (neg_h + lam)
+
+            theta_new = (theta + delta).clamp(theta_lo, theta_hi)
+            F_new = model.residual(theta_new)
+            cost_new = F_new.dot(F_new).item()
+
+            if cost_new < cost:
+                theta = theta_new
+                F = F_new
+                cost = cost_new
+                lam = max(lam * lam_down, 1e-14)
+                n_iter += 1
+                residuals.append(F.abs().max().item())
+            else:
+                lam *= lam_up
+
+            if lam > lam_max:
+                message = f"Damping λ={lam:.2e} exceeded maximum."
+                break
+    finally:
+        elapsed = _t.perf_counter() - t0
+        _, peak_ram = _tm.get_traced_memory()
+        _tm.stop()
+
+    return _SR(
+        theta=theta.detach().numpy(),
+        converged=converged,
+        iterations=n_iter,
+        residuals=residuals,
+        elapsed_time=elapsed,
+        peak_ram_bytes=peak_ram,
+        message=message,
+    )
+
 
 def _make_clamped_residual(model: DWCMModel) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return a residual function that clamps θ to valid DWCM range before evaluating."""
@@ -154,10 +266,10 @@ def _make_solvers(
     nll_fn = _make_clamped_nll(model)
     jac_fn = _make_clamped_jacobian(model)
 
-    # Adaptive max_iter for fixed-point: large N converges slowly so cap iterations
-    # to avoid multi-minute runs that are statistically better captured by timeout.
-    # Formula: aim for ~5M total element operations, floor at 500.
-    max_iter_fp: int = max(500, min(10_000, int(5_000_000 / max(N, 1))))
+    # Adaptive max_iter for fixed-point: cap so each solver run takes ≤ ~0.5 s.
+    # Rough cost per iteration: O(N) element operations ≈ N / 5e5 seconds.
+    # Target: 0.5 s / (N/5e5) = 2.5e5/N iterations, floored at 200, capped at 5000.
+    max_iter_fp: int = max(200, min(5_000, int(50_000 / max(N, 1))))
 
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
@@ -188,32 +300,42 @@ def _make_solvers(
     ))
 
     # L-BFGS (always applicable; chunked residual for large N)
+    # Use theta_bounds to keep θ > 0 (DWCM feasibility constraint).
+    # Adaptive max_iter: for large N, residual evaluation is expensive.
+    max_iter_lbfgs: int = max(200, min(500, int(200_000 / max(N, 1))))
     solvers.append((
         "L-BFGS (m=20)",
         lambda: solve_lbfgs(
             res_fn, theta0, tol=tol, m=20,
+            max_iter=max_iter_lbfgs,
             neg_loglik_fn=nll_fn,
+            theta_bounds=(_ETA_MIN, _ETA_MAX),
         ),
     ))
 
-    # LM diagonal-only (always applicable — O(N) RAM)
+    # LM with diagonal Hessian from model (O(N) per step, no full Jacobian needed)
+    # Uses the analytical hessian_diag() which avoids O(N²) computation.
     solvers.append((
         "LM (diag Hessian)",
-        lambda: solve_lm(
-            res_fn, jac_fn, theta0, tol=tol,
-            diagonal_only=True,
-        ),
+        lambda: _solve_lm_diag_dwcm(model, theta0, tol=tol,
+                                     theta_bounds=(_ETA_MIN, _ETA_MAX)),
     ))
 
     # Newton, Broyden, full-Jacobian LM — only for small N
     if N <= NEWTON_N_MAX:
         solvers.append((
             "Newton (exact J)",
-            lambda: solve_newton(res_fn, jac_fn, theta0, tol=tol),
+            lambda: solve_newton(
+                res_fn, jac_fn, theta0, tol=tol,
+                theta_bounds=(_ETA_MIN, _ETA_MAX),
+            ),
         ))
         solvers.append((
             "Broyden (rank-1 J)",
-            lambda: solve_broyden(res_fn, jac_fn, theta0, tol=tol),
+            lambda: solve_broyden(
+                res_fn, jac_fn, theta0, tol=tol,
+                theta_bounds=(_ETA_MIN, _ETA_MAX),
+            ),
         ))
 
     if N <= FULL_JAC_LM_N_MAX:
@@ -221,6 +343,7 @@ def _make_solvers(
             "LM (full Jacobian)",
             lambda: solve_lm(
                 res_fn, jac_fn, theta0, tol=tol, diagonal_only=False,
+                theta_bounds=(_ETA_MIN, _ETA_MAX),
             ),
         ))
 

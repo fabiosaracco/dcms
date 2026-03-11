@@ -32,19 +32,23 @@ def _wolfe_line_search(
     c1: float = 1e-4,
     c2: float = 0.9,
     max_ls: int = 50,
+    theta_lo: float = -_THETA_CLAMP,
+    theta_hi: float = _THETA_CLAMP,
 ) -> tuple[float, torch.Tensor, torch.Tensor, bool]:
     """Wolfe condition line search.
 
     Args:
-        f:       Scalar objective function.
-        g:       Gradient function (returns torch.Tensor).
-        theta:   Current parameter vector.
-        p:       Search direction.
-        f0:      f(theta).
-        g0:      g(theta).
-        c1:      Sufficient decrease constant (Armijo).
-        c2:      Curvature constant.
-        max_ls:  Max number of function evaluations.
+        f:        Scalar objective function.
+        g:        Gradient function (returns torch.Tensor).
+        theta:    Current parameter vector.
+        p:        Search direction.
+        f0:       f(theta).
+        g0:       g(theta).
+        c1:       Sufficient decrease constant (Armijo).
+        c2:       Curvature constant.
+        max_ls:   Max number of function evaluations.
+        theta_lo: Lower bound for each θ component (default: -50).
+        theta_hi: Upper bound for each θ component (default: +50).
 
     Returns:
         ``(alpha, theta_new, g_new, success)``
@@ -58,7 +62,7 @@ def _wolfe_line_search(
     g_new = g0
 
     for _ in range(max_ls):
-        theta_new = torch.clamp(theta + alpha * p, -_THETA_CLAMP, _THETA_CLAMP)
+        theta_new = torch.clamp(theta + alpha * p, theta_lo, theta_hi)
         f_new = f(theta_new)
         g_new = g(theta_new)
 
@@ -91,13 +95,14 @@ def solve_lbfgs(
     max_iter: int = 1_000,
     m: int = 20,
     neg_loglik_fn: Optional[Callable[["ArrayLike"], float]] = None,  # type: ignore[name-defined]
+    theta_bounds: Optional[tuple[float, float]] = None,
 ) -> SolverResult:
     """L-BFGS quasi-Newton solver.
 
-    Minimises −L(θ) where L is the DCM log-likelihood.  The gradient of
-    −L is −F(θ) = −residual_fn(θ).  If *neg_loglik_fn* is not provided,
-    the objective value is approximated as ½‖F‖² for line-search purposes
-    (same zero, consistent descent direction).
+    Minimises −L(θ) where L is the DCM (or DWCM) log-likelihood.  The
+    gradient of −L is −F(θ) = −residual_fn(θ).  If *neg_loglik_fn* is not
+    provided, the objective value is approximated as ½‖F‖² for line-search
+    purposes (same zero, consistent descent direction).
 
     Args:
         residual_fn:   Function F(θ) → residual tensor, shape (2N,).
@@ -107,6 +112,10 @@ def solve_lbfgs(
         m:             Number of curvature pairs to store.
         neg_loglik_fn: Optional callable −L(θ) → float for exact line search.
                        If None, ½‖F‖² is used as a surrogate.
+        theta_bounds:  Optional ``(theta_lo, theta_hi)`` box constraint applied
+                       at every step (clamp).  Useful for DWCM where θ > 0 is
+                       required for feasibility.  Defaults to
+                       ``(-_THETA_CLAMP, +_THETA_CLAMP)`` = ``(-50, +50)``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -118,6 +127,13 @@ def solve_lbfgs(
         theta = torch.tensor(theta0, dtype=torch.float64)
     else:
         theta = theta0.clone().to(dtype=torch.float64)
+
+    # Resolve bounds
+    theta_lo: float = theta_bounds[0] if theta_bounds is not None else -_THETA_CLAMP
+    theta_hi: float = theta_bounds[1] if theta_bounds is not None else _THETA_CLAMP
+
+    # Clamp initial theta to the feasible box
+    theta = theta.clamp(theta_lo, theta_hi)
 
     # Gradient of −L is −F (we minimise −L)
     def grad_neg_L(th: torch.Tensor) -> torch.Tensor:
@@ -186,13 +202,14 @@ def solve_lbfgs(
             # Wolfe line search
             # ---------------------------------------------------------------
             _, theta_new, g_new, ls_ok = _wolfe_line_search(
-                objective, grad_neg_L, theta, p, f, g
+                objective, grad_neg_L, theta, p, f, g,
+                theta_lo=theta_lo, theta_hi=theta_hi,
             )
 
             if not ls_ok or not torch.isfinite(theta_new).all():
                 # Fallback: simple steepest descent step
                 alpha_fb = min(1e-3, 1.0 / (g.norm().item() + 1e-14))
-                theta_new = torch.clamp(theta - alpha_fb * g, -_THETA_CLAMP, _THETA_CLAMP)
+                theta_new = torch.clamp(theta - alpha_fb * g, theta_lo, theta_hi)
                 g_new = grad_neg_L(theta_new)
 
             # ---------------------------------------------------------------

@@ -457,6 +457,7 @@ class TestLBFGSDWCM:
         result = solve_lbfgs(
             self._make_clamped_residual(model), theta0, tol=1e-10, max_iter=2000,
             neg_loglik_fn=self._make_clamped_nll(model),
+            theta_bounds=(_ETA_MIN, _ETA_MAX),
         )
         err = model.constraint_error(result.theta)
         assert err < CONV_TOL, f"N={N} LBFGS error={err:.3e}"
@@ -487,6 +488,7 @@ class TestNewtonDWCM:
             self._make_clamped_residual(model),
             self._make_clamped_jacobian(model),
             theta0, tol=1e-10, max_iter=100,
+            theta_bounds=(_ETA_MIN, _ETA_MAX),
         )
         err = model.constraint_error(result.theta)
         assert err < CONV_TOL, f"N={N} Newton error={err:.3e}"
@@ -515,6 +517,7 @@ class TestBroydenDWCM:
             self._make_clamped_residual(model),
             self._make_clamped_jacobian(model),
             theta0, tol=1e-10, max_iter=500,
+            theta_bounds=(_ETA_MIN, _ETA_MAX),
         )
         err = model.constraint_error(result.theta)
         assert err < CONV_TOL, f"N={N} Broyden error={err:.3e}"
@@ -543,6 +546,7 @@ class TestLevenbergMarquardtDWCM:
             self._make_clamped_residual(model),
             self._make_clamped_jacobian(model),
             theta0, tol=1e-10, max_iter=500,
+            theta_bounds=(_ETA_MIN, _ETA_MAX),
         )
         err = model.constraint_error(result.theta)
         assert err < CONV_TOL, f"N={N} LM error={err:.3e}"

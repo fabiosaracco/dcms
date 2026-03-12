@@ -73,9 +73,30 @@ def solve_newton(
     else:
         theta = theta0.clone().to(dtype=torch.float64)
 
-    # Resolve clamp bounds
-    theta_lo: float = theta_bounds[0] if theta_bounds is not None else -_THETA_CLAMP
-    theta_hi: float = theta_bounds[1] if theta_bounds is not None else _THETA_CLAMP
+    # Resolve and validate clamp bounds
+    if theta_bounds is None:
+        theta_lo: float = -_THETA_CLAMP
+        theta_hi: float = _THETA_CLAMP
+    else:
+        if not isinstance(theta_bounds, (tuple, list)) or len(theta_bounds) != 2:
+            raise ValueError(
+                f"theta_bounds must be a 2-element (lo, hi) sequence or None; got {theta_bounds!r}"
+            )
+        try:
+            theta_lo = float(theta_bounds[0])
+            theta_hi = float(theta_bounds[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"theta_bounds values must be numeric; got {theta_bounds!r}"
+            ) from exc
+        if not (math.isfinite(theta_lo) and math.isfinite(theta_hi)):
+            raise ValueError(
+                f"theta_bounds values must be finite; got ({theta_lo}, {theta_hi})"
+            )
+        if theta_lo >= theta_hi:
+            raise ValueError(
+                f"theta_bounds must satisfy lo < hi; got ({theta_lo}, {theta_hi})"
+            )
     theta = theta.clamp(theta_lo, theta_hi)
 
     F = residual_fn(theta)

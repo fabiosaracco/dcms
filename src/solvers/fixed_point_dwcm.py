@@ -83,9 +83,14 @@ def _anderson_mixing(
         if abs(c_sum) < 1e-14 or not math.isfinite(c_sum):
             raise RuntimeError("Degenerate Anderson weights.")
         c = c / c_sum  # normalise: Σ c_i = 1
-        # Clamp to prevent wild extrapolation
+        # Clamp to prevent wild extrapolation, then re-normalise safely
         c = c.clamp(-10.0, 10.0)
-        c = c / c.sum()
+        c_sum_clamped = c.sum().item()
+        if abs(c_sum_clamped) < 1e-14 or not math.isfinite(c_sum_clamped):
+            # Post-clamp weights are degenerate; fall back to uniform mixing.
+            c = ones / m
+        else:
+            c = c / c_sum_clamped
     except RuntimeError:
         c = ones / m  # fallback: simple uniform mixing
 

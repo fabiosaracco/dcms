@@ -48,8 +48,8 @@ _DEFAULT_CHUNK: int = 512
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
     """Convert *x* to a float64 CPU torch.Tensor (no-copy if already correct)."""
     if isinstance(x, torch.Tensor):
-        return x.to(dtype=dtype)
-    return torch.tensor(x, dtype=dtype)
+        return x.to(device="cpu", dtype=dtype)
+    return torch.tensor(x, dtype=dtype, device="cpu")
 
 
 class DWCMModel:

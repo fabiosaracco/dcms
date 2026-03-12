@@ -36,6 +36,7 @@ def solve_newton(
     max_reg: float = 1e2,
     armijo_c: float = 1e-4,
     max_ls: int = 30,
+    theta_bounds: "Optional[tuple[float, float]]" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Full Newton method with Tikhonov regularisation and Armijo line search.
 
@@ -57,6 +58,9 @@ def solve_newton(
         max_reg:     Maximum regularisation (triggers failure if exceeded).
         armijo_c:    Armijo sufficient-decrease constant.
         max_ls:      Max backtracking steps.
+        theta_bounds: Optional ``(theta_lo, theta_hi)`` box constraint applied
+                      at every step.  Useful for DWCM where θ > 0 is required
+                      for feasibility.  Defaults to ``(-50, +50)``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -68,6 +72,32 @@ def solve_newton(
         theta = torch.tensor(theta0, dtype=torch.float64)
     else:
         theta = theta0.clone().to(dtype=torch.float64)
+
+    # Resolve and validate clamp bounds
+    if theta_bounds is None:
+        theta_lo: float = -_THETA_CLAMP
+        theta_hi: float = _THETA_CLAMP
+    else:
+        if not isinstance(theta_bounds, (tuple, list)) or len(theta_bounds) != 2:
+            raise ValueError(
+                f"theta_bounds must be a 2-element (lo, hi) sequence or None; got {theta_bounds!r}"
+            )
+        try:
+            theta_lo = float(theta_bounds[0])
+            theta_hi = float(theta_bounds[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"theta_bounds values must be numeric; got {theta_bounds!r}"
+            ) from exc
+        if not (math.isfinite(theta_lo) and math.isfinite(theta_hi)):
+            raise ValueError(
+                f"theta_bounds values must be finite; got ({theta_lo}, {theta_hi})"
+            )
+        if theta_lo >= theta_hi:
+            raise ValueError(
+                f"theta_bounds must satisfy lo < hi; got ({theta_lo}, {theta_hi})"
+            )
+    theta = theta.clamp(theta_lo, theta_hi)
 
     F = residual_fn(theta)
     n2 = theta.shape[0]
@@ -112,7 +142,7 @@ def solve_newton(
             alpha = 1.0
             f0 = F.dot(F).item()
             for _ in range(max_ls):
-                theta_new = torch.clamp(theta + alpha * delta, -_THETA_CLAMP, _THETA_CLAMP)
+                theta_new = torch.clamp(theta + alpha * delta, theta_lo, theta_hi)
                 F_new = residual_fn(theta_new)
                 if F_new.dot(F_new).item() <= f0 * (1.0 - 2.0 * armijo_c * alpha):
                     break

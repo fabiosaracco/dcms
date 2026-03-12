@@ -43,6 +43,7 @@ def solve_lm(
     lam_down: float = 0.1,
     lam_max: float = 1e10,
     diagonal_only: bool = False,
+    theta_bounds: "Optional[tuple[float, float]]" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Levenberg-Marquardt with adaptive damping.
 
@@ -58,6 +59,8 @@ def solve_lm(
         lam_max:       Maximum λ before declaring failure.
         diagonal_only: If True, use only diag(JᵀJ) instead of the full JᵀJ.
                        Cheaper for large N.
+        theta_bounds:  Optional ``(theta_lo, theta_hi)`` box constraint applied
+                       at every step.  Defaults to ``(-50, +50)``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -69,6 +72,32 @@ def solve_lm(
         theta = torch.tensor(theta0, dtype=torch.float64)
     else:
         theta = theta0.clone().to(dtype=torch.float64)
+
+    # Resolve and validate clamp bounds
+    if theta_bounds is None:
+        theta_lo: float = -_THETA_CLAMP
+        theta_hi: float = _THETA_CLAMP
+    else:
+        if not isinstance(theta_bounds, (tuple, list)) or len(theta_bounds) != 2:
+            raise ValueError(
+                f"theta_bounds must be a 2-element (lo, hi) sequence or None; got {theta_bounds!r}"
+            )
+        try:
+            theta_lo = float(theta_bounds[0])
+            theta_hi = float(theta_bounds[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"theta_bounds values must be numeric; got {theta_bounds!r}"
+            ) from exc
+        if not (math.isfinite(theta_lo) and math.isfinite(theta_hi)):
+            raise ValueError(
+                f"theta_bounds values must be finite; got ({theta_lo}, {theta_hi})"
+            )
+        if theta_lo >= theta_hi:
+            raise ValueError(
+                f"theta_bounds must satisfy lo < hi; got ({theta_lo}, {theta_hi})"
+            )
+    theta = theta.clamp(theta_lo, theta_hi)
 
     F = residual_fn(theta)
     cost = F.dot(F).item()
@@ -108,7 +137,7 @@ def solve_lm(
                     lam *= lam_up
                     continue
 
-            theta_new = torch.clamp(theta + delta, -_THETA_CLAMP, _THETA_CLAMP)
+            theta_new = torch.clamp(theta + delta, theta_lo, theta_hi)
             F_new = residual_fn(theta_new)
             cost_new = F_new.dot(F_new).item()
 

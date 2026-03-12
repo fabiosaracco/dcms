@@ -375,6 +375,7 @@ def _make_solvers(
     theta0: torch.Tensor,
     tol: float,
     timeout: float = SOLVER_TIMEOUT,
+    fast: bool = False,
 ) -> list[tuple[str, Callable[[], SolverResult]]]:
     """Return a list of (name, callable) solver pairs for *model*.
 
@@ -385,6 +386,7 @@ def _make_solvers(
         theta0:  Initial parameter vector (all positive).
         tol:     Convergence tolerance.
         timeout: Per-solver hard timeout in seconds (used to set iteration budgets).
+        fast:    If True, skip plain FP/Jacobi and LM; only run Anderson and L-BFGS.
 
     Returns:
         Ordered list of ``(name, solver_callable)`` pairs.
@@ -449,24 +451,26 @@ def _make_solvers(
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
     # ── Fixed-point GS α=1.0 (plain, fast) ─────────────────────────────────
-    solvers.append((
-        "FP-GS α=1.0",
-        lambda: solve_fixed_point_dwcm(
-            res_fn, theta0, model.s_out, model.s_in,
-            tol=tol, damping=1.0, variant="gauss-seidel",
-            max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-        ),
-    ))
+    if not fast:
+        solvers.append((
+            "FP-GS α=1.0",
+            lambda: solve_fixed_point_dwcm(
+                res_fn, theta0, model.s_out, model.s_in,
+                tol=tol, damping=1.0, variant="gauss-seidel",
+                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
+            ),
+        ))
 
     # ── Fixed-point GS α=0.5 (damped) ───────────────────────────────────────
-    solvers.append((
-        "FP-GS α=0.5",
-        lambda: solve_fixed_point_dwcm(
-            res_fn, theta0, model.s_out, model.s_in,
-            tol=tol, damping=0.5, variant="gauss-seidel",
-            max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-        ),
-    ))
+    if not fast:
+        solvers.append((
+            "FP-GS α=0.5",
+            lambda: solve_fixed_point_dwcm(
+                res_fn, theta0, model.s_out, model.s_in,
+                tol=tol, damping=0.5, variant="gauss-seidel",
+                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
+            ),
+        ))
 
     # ── Fixed-point GS + Anderson depth=10, multi-start ─────────────────────
     # Anderson depth=10 keeps more history than depth=5, better for heterogeneous
@@ -511,14 +515,15 @@ def _make_solvers(
     solvers.append(("FP-GS Anderson(10) multi-init", _fp_anderson_multistart))
 
     # ── Fixed-point Jacobi ──────────────────────────────────────────────────
-    solvers.append((
-        "FP-Jacobi",
-        lambda: solve_fixed_point_dwcm(
-            res_fn, theta0, model.s_out, model.s_in,
-            tol=tol, damping=1.0, variant="jacobi",
-            max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-        ),
-    ))
+    if not fast:
+        solvers.append((
+            "FP-Jacobi",
+            lambda: solve_fixed_point_dwcm(
+                res_fn, theta0, model.s_out, model.s_in,
+                tol=tol, damping=1.0, variant="jacobi",
+                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
+            ),
+        ))
 
     # ── L-BFGS multi-start (skipped for N > LBFGS_N_MAX) ───────────────────
     # At large N each gradient evaluation costs O(N²) = ~1.5s at N=10k.
@@ -532,12 +537,13 @@ def _make_solvers(
         ))
 
     # ── Diagonal LM (O(N) RAM, always applicable) ───────────────────────────
-    solvers.append((
-        "LM (diag Hessian)",
-        lambda: _solve_lm_diag_dwcm(model, theta0, tol=tol,
-                                     theta_bounds=(_ETA_MIN, _ETA_MAX),
-                                     max_iter=MAX_LM_ITER),
-    ))
+    if not fast:
+        solvers.append((
+            "LM (diag Hessian)",
+            lambda: _solve_lm_diag_dwcm(model, theta0, tol=tol,
+                                         theta_bounds=(_ETA_MIN, _ETA_MAX),
+                                         max_iter=MAX_LM_ITER),
+        ))
 
     # ── Newton, Broyden, full-Jacobian LM — only for small N (O(N²) RAM) ──
     if N <= NEWTON_N_MAX:
@@ -628,6 +634,7 @@ def _run_single_network(
     seed: int,
     tol: float,
     timeout: float,
+    fast: bool = False,
 ) -> Optional[dict[str, dict]]:
     """Run all DWCM solvers on one network realisation.
 
@@ -636,6 +643,7 @@ def _run_single_network(
         seed:    Random seed.
         tol:     Convergence tolerance.
         timeout: Per-solver time limit (seconds).
+        fast:    If True, skip plain FP/Jacobi and LM; only Anderson and L-BFGS.
 
     Returns:
         Dict mapping solver name → result dict, or None if the network is invalid.
@@ -649,7 +657,7 @@ def _run_single_network(
 
     model = DWCMModel(s_out, s_in)
     theta0 = model.initial_theta("strengths")
-    solvers = _make_solvers(model, theta0, tol, timeout=timeout)
+    solvers = _make_solvers(model, theta0, tol, timeout=timeout, fast=fast)
 
     results: dict[str, dict] = {}
     for name, fn in solvers:
@@ -703,6 +711,7 @@ def run_multi_seed_comparison(
     timeout: float = SOLVER_TIMEOUT,
     start_seed: int = 0,
     verbose: bool = True,
+    fast: bool = False,
 ) -> dict[str, dict]:
     """Run all DWCM solvers on *n_seeds* independent network realisations.
 
@@ -719,6 +728,7 @@ def run_multi_seed_comparison(
         timeout:    Per-solver time limit in seconds.
         start_seed: First random seed to try.
         verbose:    If True, print detailed output.
+        fast:       If True, skip plain FP/Jacobi and LM; only Anderson and L-BFGS.
 
     Returns:
         Dict mapping solver_name → aggregate_stats_dict.
@@ -743,7 +753,7 @@ def run_multi_seed_comparison(
                 f"Could not find {n_seeds} valid networks for N={N} "
                 f"in {max_attempts} attempts."
             )
-        results = _run_single_network(N, candidate_seed, tol, timeout)
+        results = _run_single_network(N, candidate_seed, tol, timeout, fast=fast)
         if results is None:
             candidate_seed += 1
             continue
@@ -936,6 +946,10 @@ if __name__ == "__main__":
                         help=f"Per-solver time limit in seconds (default: {SOLVER_TIMEOUT})")
     parser.add_argument("--start_seed", type=int, default=None,
                         help="Base random seed (default: random, from current time)")
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Skip plain FP/Jacobi and LM; run only Anderson and L-BFGS methods",
+    )
     args = parser.parse_args()
 
     # If start_seed is not provided, use a time-based random seed so that
@@ -964,4 +978,5 @@ if __name__ == "__main__":
         run_multi_seed_comparison(
             N=args.n, n_seeds=args.n_seeds, tol=args.tol,
             timeout=args.timeout, start_seed=effective_start_seed,
+            fast=args.fast,
         )

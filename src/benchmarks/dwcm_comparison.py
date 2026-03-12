@@ -344,8 +344,10 @@ def _lbfgs_multistart(
 
     for i, t0 in enumerate(starts[:n_starts]):
         torch.manual_seed(i)
+        # Divide budget equally among starts so all get a chance.
+        iter_per_start = max(30, max_iter // n_starts)
         result = solve_lbfgs(
-            res_fn, t0, tol=tol, m=20, max_iter=max_iter,
+            res_fn, t0, tol=tol, m=20, max_iter=iter_per_start,
             neg_loglik_fn=nll_fn, theta_bounds=(_ETA_MIN, _ETA_MAX),
         )
         total_iters += result.iterations
@@ -475,6 +477,10 @@ def _make_solvers(
     # ── Fixed-point GS + Anderson depth=10, multi-start ─────────────────────
     # Anderson depth=10 keeps more history than depth=5, better for heterogeneous
     # networks where the plain FP oscillates with a period > 5 iterates.
+    # Budget is divided equally among 4 inits so all get a chance within timeout.
+    _N_ANDERSON_INITS = 4
+    _ITER_PER_ANDERSON_INIT = max(50, MAX_FP_ANDERSON_ITER // _N_ANDERSON_INITS)
+
     def _fp_anderson_multistart() -> SolverResult:
         import time as _t
         from src.solvers.base import SolverResult as _SR
@@ -491,7 +497,7 @@ def _make_solvers(
             r = solve_fixed_point_dwcm(
                 res_fn, t0_cand, model.s_out, model.s_in,
                 tol=tol, damping=1.0, variant="gauss-seidel",
-                max_iter=MAX_FP_ANDERSON_ITER, anderson_depth=10,
+                max_iter=_ITER_PER_ANDERSON_INIT, anderson_depth=10,
             )
             total_iters += r.iterations
             peak_ram = max(peak_ram, r.peak_ram_bytes)

@@ -101,9 +101,9 @@ NEWTON_N_MAX: int = 500
 FULL_JAC_LM_N_MAX: int = 500
 
 # L-BFGS is O(N) RAM per step but each step calls the residual (O(N²) cost).
-# For N > LBFGS_N_MAX the cost per function evaluation is so high that L-BFGS
-# becomes impractical within a reasonable timeout.
-LBFGS_N_MAX: int = 5_000
+# For very large N the cost per gradient evaluation grows rapidly; for moderate
+# large N (up to 15k) L-BFGS is still practical within a generous timeout.
+LBFGS_N_MAX: int = 15_000
 
 # LM-diagonal (using hessian_diag, O(N) RAM) — applicable up to this N.
 # For N > DIAG_LM_N_MAX, the diagonal hessian LM is still O(N) but may
@@ -401,22 +401,31 @@ def _make_solvers(
     # The calibration formula uses a piecewise fit:
     #   - for N ≤ 5k:  cost ≈ (N/1k)² × 8 ms  (GPU-friendly tensor ops)
     #   - for N > 5k:  cost ≈ (N/1k)² × 15 ms  (chunked overhead dominates)
+    # Iteration budgets are set so that each method can use the full timeout.
+    # No artificial iteration cap is imposed beyond the budget derived from timeout.
     # ---------------------------------------------------------------------------
     if N <= 5_000:
         residual_s = max(3e-4, (N / 1_000) ** 2 * 8e-3)
     else:
         residual_s = max(3e-4, (N / 1_000) ** 2 * 15e-3)
 
-    # Plain FP-GS/Jacobi: only ~1 s budget (enough to see it won't converge)
-    MAX_FP_PLAIN_ITER: int = max(10, min(5_000, int(1.0 / residual_s)))
-    # Anderson-accelerated FP: budget = min(timeout, 300 s)
-    # At N=10k (residual≈1.5s) this gives ~200 iterations within 300s
-    anderson_budget_s = min(timeout, 300.0) if timeout > 0 else 300.0
-    MAX_FP_ANDERSON_ITER: int = max(20, min(10_000, int(anderson_budget_s / residual_s)))
+    # Budget for methods that are expected to converge: full timeout
+    # timeout=0 means "no limit" → use a large fixed budget (10 000 iters)
+    full_budget_s = timeout if timeout > 0 else 1e9
+
+    # Plain FP-GS/Jacobi: give them 20% of the timeout budget so we can
+    # measure convergence rate, not just report "didn't converge in 1 s".
+    plain_budget_s = min(full_budget_s * 0.2, 30.0) if N <= 5_000 else min(full_budget_s * 0.1, 60.0)
+    MAX_FP_PLAIN_ITER: int = max(50, min(20_000, int(plain_budget_s / residual_s)))
+
+    # Anderson-accelerated FP: full timeout budget
+    MAX_FP_ANDERSON_ITER: int = max(100, min(50_000, int(full_budget_s / residual_s)))
+
     # L-BFGS: each iter costs ~3-5 residuals (gradient + line search)
-    MAX_LBFGS_ITER: int = max(20, min(2_000, int(anderson_budget_s / (5 * residual_s))))
-    # Diagonal LM: ~10 s budget (it rarely converges for DWCM anyway)
-    MAX_LM_ITER: int = max(10, min(500, int(10.0 / (3 * residual_s))))
+    MAX_LBFGS_ITER: int = max(50, min(5_000, int(full_budget_s / (5 * residual_s))))
+
+    # Diagonal LM: give it the full budget too (rarely converges, but let it try)
+    MAX_LM_ITER: int = max(50, min(2_000, int(full_budget_s / (3 * residual_s))))
 
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
@@ -440,11 +449,9 @@ def _make_solvers(
         ),
     ))
 
-    # ── Fixed-point GS + Anderson depth=5, multi-start ──────────────────────
-    # Tries "strengths", "normalized", "uniform", and "random" initialisations
-    # in sequence, stopping as soon as one converges.  The Anderson mixing
-    # (Walker & Ni 2011) extrapolates from the last 5 FP iterates and typically
-    # achieves 100% convergence for Pareto networks regardless of the init.
+    # ── Fixed-point GS + Anderson depth=10, multi-start ─────────────────────
+    # Anderson depth=10 keeps more history than depth=5, better for heterogeneous
+    # networks where the plain FP oscillates with a period > 5 iterates.
     def _fp_anderson_multistart() -> SolverResult:
         import time as _t
         from src.solvers.base import SolverResult as _SR
@@ -461,7 +468,7 @@ def _make_solvers(
             r = solve_fixed_point_dwcm(
                 res_fn, t0_cand, model.s_out, model.s_in,
                 tol=tol, damping=1.0, variant="gauss-seidel",
-                max_iter=MAX_FP_ANDERSON_ITER, anderson_depth=5,
+                max_iter=MAX_FP_ANDERSON_ITER, anderson_depth=10,
             )
             total_iters += r.iterations
             peak_ram = max(peak_ram, r.peak_ram_bytes)
@@ -482,7 +489,7 @@ def _make_solvers(
             message=best.message,
         )
 
-    solvers.append(("FP-GS Anderson(5) multi-init", _fp_anderson_multistart))
+    solvers.append(("FP-GS Anderson(10) multi-init", _fp_anderson_multistart))
 
     # ── Fixed-point Jacobi ──────────────────────────────────────────────────
     solvers.append((

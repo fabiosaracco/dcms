@@ -67,6 +67,7 @@ def _call_with_timeout(fn: Callable, timeout_s: float):
     Args:
         fn:        Zero-argument callable to invoke.
         timeout_s: Maximum allowed wall-clock seconds (rounded to nearest int).
+                   Pass 0 or a negative value to disable the timeout entirely.
 
     Returns:
         Whatever *fn()* returns.
@@ -74,7 +75,8 @@ def _call_with_timeout(fn: Callable, timeout_s: float):
     Raises:
         _TimeoutError: If *fn()* exceeds *timeout_s* seconds.
     """
-    if not hasattr(signal, "SIGALRM"):  # Windows fallback
+    if not hasattr(signal, "SIGALRM") or timeout_s <= 0:
+        # No timeout: Windows fallback, or caller explicitly disabled it.
         return fn()
 
     def _handler(signum: int, frame: object) -> None:
@@ -416,16 +418,33 @@ def _make_solvers(
     # Plain FP-GS/Jacobi: give them 20% of the timeout budget so we can
     # measure convergence rate, not just report "didn't converge in 1 s".
     plain_budget_s = min(full_budget_s * 0.2, 30.0) if N <= 5_000 else min(full_budget_s * 0.1, 60.0)
-    MAX_FP_PLAIN_ITER: int = max(50, min(20_000, int(plain_budget_s / residual_s)))
+    # Plain FP-GS/Jacobi: cap at 500 iterations — enough to characterise
+    # convergence behaviour without wasting time on hopeless cases.
+    MAX_FP_PLAIN_ITER: int = max(50, min(500, int(plain_budget_s / residual_s)))
 
-    # Anderson-accelerated FP: full timeout budget
-    MAX_FP_ANDERSON_ITER: int = max(100, min(50_000, int(full_budget_s / residual_s)))
+    # Anderson-accelerated FP: full timeout budget, capped at 500 iterations
+    # for large N where each residual evaluation is expensive (O(N²) cost).
+    # At N=10k with ~1.5s/eval, 500 iterations ≈ 750s per init attempt — generous.
+    if N > 5_000:
+        max_anderson_cap = 500
+    else:
+        max_anderson_cap = 10_000
+    MAX_FP_ANDERSON_ITER: int = max(100, min(max_anderson_cap, int(full_budget_s / residual_s)))
 
     # L-BFGS: each iter costs ~3-5 residuals (gradient + line search)
-    MAX_LBFGS_ITER: int = max(50, min(5_000, int(full_budget_s / (5 * residual_s))))
+    # Cap at 200 iterations for large N (200 × 5 evals × 1.5s ≈ 1500s)
+    if N > 5_000:
+        max_lbfgs_cap = 200
+    else:
+        max_lbfgs_cap = 5_000
+    MAX_LBFGS_ITER: int = max(50, min(max_lbfgs_cap, int(full_budget_s / (5 * residual_s))))
 
-    # Diagonal LM: give it the full budget too (rarely converges, but let it try)
-    MAX_LM_ITER: int = max(50, min(2_000, int(full_budget_s / (3 * residual_s))))
+    # Diagonal LM: cap at 500 iterations for large N
+    if N > 5_000:
+        max_lm_cap = 100
+    else:
+        max_lm_cap = 2_000
+    MAX_LM_ITER: int = max(50, min(max_lm_cap, int(full_budget_s / (3 * residual_s))))
 
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 

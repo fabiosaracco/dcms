@@ -5,22 +5,28 @@ The DWCM strength equations are
     s_out_i = Σ_{j≠i} β_out_i · β_in_j / (1 − β_out_i · β_in_j)
     s_in_i  = Σ_{j≠i} β_out_j · β_in_i / (1 − β_out_j · β_in_i)
 
-with β = exp(−θ).  Isolating β_out_i gives the fixed-point update
+with β = exp(−θ).  Three variants are implemented:
 
-    β_out_i^{new} = s_out_i / D_out_i
-    where  D_out_i = Σ_{j≠i} β_in_j / (1 − β_out_i · β_in_j)
+* **Gauss-Seidel** — β-space fixed-point; out-multipliers are updated
+  first; the updated values are immediately used when computing new
+  in-multipliers.  Update: β_out_i^{new} = s_out_i / D_out_i.
+* **Jacobi**       — β-space fixed-point; all multipliers are updated
+  simultaneously using values from the *previous* iteration.
+* **theta-newton** — θ-space coordinate Newton step.  For each node i
+  the exact 1-D Newton step is computed directly in θ-space:
 
-and analogously for β_in_i.
+      Δθ_out_i = −F_i / F′_i
+      where F_i  = Σ_{j≠i} W_ij − s_out_i   (residual)
+            F′_i = −Σ_{j≠i} W_ij(1+W_ij)    (diagonal Hessian, ≤ 0)
+            W_ij = 1/expm1(θ_out_i + θ_in_j)
 
-Two variants are implemented:
+  The per-node step is clipped to ``[−max_step, +max_step]``.  Because
+  the update is additive in θ, β > 1 is never produced — this variant
+  is robust to high-strength hub nodes that cause the β-space variants
+  to oscillate.
 
-* **Gauss-Seidel** — out-multipliers are updated first; the updated values
-  are immediately used when computing new in-multipliers.
-* **Jacobi**       — all multipliers are updated simultaneously using values
-  from the *previous* iteration.
-
-Both variants support an optional damping factor α ∈ (0, 1].  The update
-is carried out in θ-space:
+The Gauss-Seidel and Jacobi variants support an optional damping factor
+α ∈ (0, 1]:
 
     θ_i^{t+1} = α · (−log β_i^{new}) + (1−α) · θ_i^{t}
 
@@ -42,6 +48,14 @@ import torch
 
 from .base import SolverResult
 from src.models.dwcm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
+
+# Maximum ℓ∞ norm of the Anderson FP-residual r_k = g(θ_k) − θ_k accepted
+# into the mixing history.  Iterates beyond this threshold are skipped to
+# prevent Anderson mixing from being contaminated by extreme values.  The
+# threshold is most relevant for the theta-newton variant, which can produce
+# large transient steps during the initial phase when θ is far from the
+# solution, but the guard applies uniformly to all variants.
+_ANDERSON_MAX_NORM: float = 1e6
 
 
 def _anderson_mixing(
@@ -108,6 +122,7 @@ def solve_fixed_point_dwcm(
     variant: str = "gauss-seidel",
     chunk_size: int = 0,
     anderson_depth: int = 0,
+    max_step: float = 1.0,
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -119,8 +134,14 @@ def solve_fixed_point_dwcm(
         s_in:   Observed in-strength sequence, shape (N,).
         tol:    Convergence tolerance on the ℓ∞ residual norm.
         max_iter: Maximum number of iterations.
-        damping: Damping factor α ∈ (0, 1].  α=1 → no damping.
-        variant: ``"jacobi"`` or ``"gauss-seidel"``.
+        damping: Damping factor α ∈ (0, 1] for the ``"jacobi"`` and
+            ``"gauss-seidel"`` variants.  α=1 → no damping (pure FP update).
+            Not used by the ``"theta-newton"`` variant; use ``max_step``
+            instead to control the Newton step size for that variant.
+        variant: One of ``"jacobi"``, ``"gauss-seidel"``, or
+            ``"theta-newton"``.  The first two solve in β-space; the last
+            performs coordinate Newton steps directly in θ-space, which avoids
+            the β > 1 clamping oscillation that affects high-strength hub nodes.
         chunk_size: If > 0, process the N×N products in chunks of this size
             to avoid materialising the full matrix (useful for large N).
             If 0, auto-select: dense for N ≤ ``_LARGE_N_THRESHOLD``, chunked
@@ -130,6 +151,11 @@ def solve_fixed_point_dwcm(
             give the best convergence acceleration.  Uses the m most recent
             FP outputs to compute the next iterate via constrained
             least-squares mixing (Walker & Ni 2011).
+        max_step: Maximum per-node Newton step |Δθ| allowed in the
+            ``"theta-newton"`` variant.  Ignored by ``"jacobi"`` and
+            ``"gauss-seidel"``.  Default 1.0 (one unit in log-space);
+            reduce to ~0.5 for very heterogeneous networks to improve
+            robustness at the cost of slower convergence per iteration.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -188,13 +214,17 @@ def solve_fixed_point_dwcm(
                 #   F_i  = Σ_{j≠i} W_ij − s_i   (expected − observed strength)
                 #   F′_i = −Σ_{j≠i} W_ij(1+W_ij) (diagonal Hessian entry, ≤ 0)
                 #   W_ij = 1/expm1(θ_out_i + θ_in_j)
-                # Step is clipped to [−damping, +damping] to prevent overshooting.
+                # Step is clipped to [−max_step, +max_step] to prevent overshooting.
+                # `damping` is not used here; use the `max_step` parameter instead.
                 if effective_chunk > 0:
                     fp_raw = _theta_newton_step_chunked(
-                        theta, s_out, s_in, effective_chunk, damping
+                        theta, s_out, s_in, effective_chunk, max_step
                     )
                 else:
-                    fp_raw = _theta_newton_step_dense(theta, s_out, s_in, damping)
+                    fp_raw = _theta_newton_step_dense(theta, s_out, s_in, max_step)
+                # For theta-newton the step clipping already safeguards the size;
+                # skip the extra blend to avoid doubly attenuating the update.
+                theta_fp = fp_raw
             else:
                 # β-space fixed-point iteration (Gauss-Seidel or Jacobi)
                 # Physical multipliers: β = exp(-θ), β ∈ (0, 1)
@@ -241,10 +271,10 @@ def solve_fixed_point_dwcm(
                 theta_in_new = (-torch.log(beta_in_new)).clamp(_ETA_MIN, _ETA_MAX)
                 fp_raw = torch.cat([theta_out_new, theta_in_new])
 
-            # Damped FP output: g(θ) = α * FP_raw(θ) + (1−α) * θ
-            # For theta-newton, fp_raw already has per-node step clamping;
-            # the blend here provides an extra global damping knob (α=1 = no blend).
-            theta_fp = (damping * fp_raw + (1.0 - damping) * theta).clamp(_ETA_MIN, _ETA_MAX)
+                # Damped FP output: g(θ) = α * FP_raw(θ) + (1−α) * θ
+                theta_fp = (damping * fp_raw + (1.0 - damping) * theta).clamp(
+                    _ETA_MIN, _ETA_MAX
+                )
 
             if anderson_depth > 1:
                 # Anderson acceleration: keep history and mix.
@@ -252,7 +282,6 @@ def solve_fixed_point_dwcm(
                 # Anderson mixing from being contaminated by extreme iterates.
                 r_k = theta_fp - theta
                 r_k_norm = r_k.abs().max().item()
-                _ANDERSON_MAX_NORM = 1e6
                 if math.isfinite(r_k_norm) and (
                     variant != "theta-newton" or r_k_norm < _ANDERSON_MAX_NORM
                 ):

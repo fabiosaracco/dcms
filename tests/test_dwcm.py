@@ -451,6 +451,89 @@ class TestFixedPointDWCM:
         )
 
 
+class TestThetaNewtonDWCM:
+    """Tests for the theta-newton variant of solve_fixed_point_dwcm."""
+
+    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
+    def test_converges(self, N: int, seed: int) -> None:
+        """theta-newton must converge on small systems with known solution."""
+        model, _ = make_dwcm_model(N=N, seed=seed)
+        theta0 = model.initial_theta("strengths")
+        result = solve_fixed_point_dwcm(
+            model.residual, theta0, model.s_out, model.s_in,
+            tol=1e-10, max_iter=5000, variant="theta-newton", max_step=1.0,
+        )
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, f"N={N} theta-newton error={err:.3e}"
+
+    @pytest.mark.parametrize("N,seed", [(4, 2), (10, 3)])
+    def test_converges_with_anderson(self, N: int, seed: int) -> None:
+        """theta-newton + Anderson acceleration must converge on small systems."""
+        model, _ = make_dwcm_model(N=N, seed=seed)
+        theta0 = model.initial_theta("strengths")
+        result = solve_fixed_point_dwcm(
+            model.residual, theta0, model.s_out, model.s_in,
+            tol=1e-10, max_iter=5000, variant="theta-newton",
+            max_step=1.0, anderson_depth=10,
+        )
+        err = model.constraint_error(result.theta)
+        assert err < CONV_TOL, f"N={N} theta-newton+Anderson error={err:.3e}"
+
+    def test_zero_strength_nodes_pinned(self) -> None:
+        """theta-newton must pin θ = _ETA_MAX for zero-strength nodes."""
+        # Build a model where node 0 has s_out=0 and node N-1 has s_in=0
+        rng = np.random.default_rng(99)
+        N = 6
+        theta_true = rng.uniform(0.5, 2.0, size=2 * N)
+        beta_out = np.exp(-theta_true[:N])
+        beta_in = np.exp(-theta_true[N:])
+        beta_mat = beta_out[:, None] * beta_in[None, :]
+        W = beta_mat / (1.0 - beta_mat)
+        np.fill_diagonal(W, 0.0)
+        s_out = W.sum(axis=1)
+        s_in = W.sum(axis=0)
+        # Force node 0 out-strength and last node in-strength to zero
+        s_out[0] = 0.0
+        s_in[N - 1] = 0.0
+        model = DWCMModel(s_out, s_in)
+        theta0 = model.initial_theta("strengths")
+        result = solve_fixed_point_dwcm(
+            model.residual, theta0, model.s_out, model.s_in,
+            tol=1e-8, max_iter=200, variant="theta-newton", max_step=1.0,
+        )
+        theta_arr = result.theta
+        assert theta_arr[0] == pytest.approx(_ETA_MAX, abs=1e-12), \
+            f"Zero s_out node θ_out[0] should be _ETA_MAX, got {theta_arr[0]}"
+        assert theta_arr[N + N - 1] == pytest.approx(_ETA_MAX, abs=1e-12), \
+            f"Zero s_in node θ_in[N-1] should be _ETA_MAX, got {theta_arr[N + N - 1]}"
+
+    def test_chunked_matches_dense(self) -> None:
+        """Chunked theta-newton step must give the same result as the dense path."""
+        from src.solvers.fixed_point_dwcm import (
+            _theta_newton_step_dense, _theta_newton_step_chunked,
+        )
+        model, theta_np = make_dwcm_model(N=8, seed=5)
+        theta_t = torch.tensor(theta_np, dtype=torch.float64)
+        dense = _theta_newton_step_dense(theta_t, model.s_out, model.s_in, max_step=1.0)
+        chunked = _theta_newton_step_chunked(theta_t, model.s_out, model.s_in,
+                                             chunk_size=3, max_step=1.0)
+        assert torch.allclose(dense, chunked, atol=1e-13), (
+            f"Max diff dense vs chunked: {(dense - chunked).abs().max().item():.3e}"
+        )
+
+    def test_result_fields(self) -> None:
+        """SolverResult must have positive elapsed_time and non-negative peak_ram."""
+        model, _ = make_dwcm_model(N=4, seed=0)
+        theta0 = model.initial_theta("strengths")
+        result = solve_fixed_point_dwcm(
+            model.residual, theta0, model.s_out, model.s_in,
+            tol=1e-8, max_iter=10, variant="theta-newton", max_step=1.0,
+        )
+        assert result.elapsed_time >= 0.0
+        assert result.peak_ram_bytes >= 0
+        assert len(result.residuals) > 0
+
+
 class TestLBFGSDWCM:
     """Tests for L-BFGS solver on DWCM problems."""
 

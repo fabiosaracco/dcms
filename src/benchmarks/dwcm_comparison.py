@@ -474,6 +474,17 @@ def _make_solvers(
             ),
         ))
 
+    # ── Fixed-point GS α=0.3 (more damped) ──────────────────────────────────
+    if not fast:
+        solvers.append((
+            "FP-GS α=0.3",
+            lambda: solve_fixed_point_dwcm(
+                res_fn, theta0, model.s_out, model.s_in,
+                tol=tol, damping=0.3, variant="gauss-seidel",
+                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
+            ),
+        ))
+
     # ── Fixed-point GS + Anderson depth=10, multi-start ─────────────────────
     # Anderson depth=10 keeps more history than depth=5, better for heterogeneous
     # networks where the plain FP oscillates with a period > 5 iterates.
@@ -519,6 +530,51 @@ def _make_solvers(
         )
 
     solvers.append(("FP-GS Anderson(10) multi-init", _fp_anderson_multistart))
+
+    # ── θ-space coordinate Newton (robust to hub nodes) ─────────────────────
+    # Uses per-node Newton steps in θ-space which cannot produce β > 1,
+    # making it robust to high-strength hub nodes that cause β-space FP to
+    # oscillate.  Anderson acceleration is enabled for faster convergence.
+    _ITER_PER_TN_INIT = max(50, MAX_FP_ANDERSON_ITER // _N_ANDERSON_INITS)
+
+    def _theta_newton_multistart() -> SolverResult:
+        import time as _t
+        from src.solvers.base import SolverResult as _SR
+        inits = [theta0,
+                 model.initial_theta("normalized"),
+                 model.initial_theta("uniform"),
+                 model.initial_theta("random")]
+        best: Optional[SolverResult] = None
+        best_err = float("inf")
+        total_iters = 0
+        peak_ram = 0
+        t0_wall = _t.perf_counter()
+        for t0_cand in inits:
+            r = solve_fixed_point_dwcm(
+                res_fn, t0_cand, model.s_out, model.s_in,
+                tol=tol, variant="theta-newton",
+                max_iter=_ITER_PER_TN_INIT, anderson_depth=10, max_step=1.0,
+            )
+            total_iters += r.iterations
+            peak_ram = max(peak_ram, r.peak_ram_bytes)
+            err = model.max_relative_error(r.theta)
+            if err < best_err:
+                best_err = err
+                best = r
+            if r.converged:
+                break
+        assert best is not None
+        return _SR(
+            theta=best.theta,
+            converged=best.converged,
+            iterations=total_iters,
+            residuals=best.residuals,
+            elapsed_time=_t.perf_counter() - t0_wall,
+            peak_ram_bytes=peak_ram,
+            message=best.message,
+        )
+
+    solvers.append(("θ-Newton Anderson(10) multi-init", _theta_newton_multistart))
 
     # ── Fixed-point Jacobi ──────────────────────────────────────────────────
     if not fast:
@@ -749,6 +805,8 @@ def run_multi_seed_comparison(
 
     # Collect results across seeds
     all_stats: dict[str, list[dict]] = {}
+    # Track seeds where no method converged (for diagnostic follow-up)
+    bad_seeds: list[int] = []
     valid_count = 0
     candidate_seed = start_seed
     max_attempts = n_seeds * 20
@@ -764,8 +822,12 @@ def run_multi_seed_comparison(
             candidate_seed += 1
             continue
 
+        any_converged = any(r["converged"] for r in results.values())
+        if not any_converged:
+            bad_seeds.append(candidate_seed)
+
         if verbose:
-            print(f"\n  Seed {candidate_seed}:")
+            print(f"\n  Seed {candidate_seed}{'' if any_converged else ' ⚠ NO METHOD CONVERGED'}:")
             for name, r in results.items():
                 tag = "✓" if r["converged"] else "✗"
                 rel_err_str = (
@@ -786,46 +848,87 @@ def run_multi_seed_comparison(
         valid_count += 1
         candidate_seed += 1
 
-    # Compute aggregate statistics
+    if verbose and bad_seeds:
+        print(f"\n  ⚠ Seeds where NO method converged: {bad_seeds}")
+
+    # Compute aggregate statistics.
+    # Performance metrics (time, iters, RAM, error) are computed only over
+    # the converged runs so that the table reflects actual solver performance
+    # rather than being diluted by timeouts/failures.
     agg: dict[str, dict] = {}
     for name, runs in all_stats.items():
-        times = np.array([r["elapsed"] for r in runs])
-        rams = np.array([r["peak_ram_mb"] for r in runs if np.isfinite(r["peak_ram_mb"])])
-        iters = np.array([r["iterations"] for r in runs])
-        errs = np.array([r["max_rel_err"] for r in runs if np.isfinite(r["max_rel_err"])])
-        conv_count = sum(r["converged"] for r in runs)
+        conv_runs = [r for r in runs if r["converged"]]
+        conv_count = len(conv_runs)
+
+        # All runs (converged + not) for time — so total wall time is visible
+        times_all = np.array([r["elapsed"] for r in runs])
+        # Converged-only for performance metrics
+        times_conv = np.array([r["elapsed"] for r in conv_runs]) if conv_runs else np.array([])
+        rams_conv = np.array(
+            [r["peak_ram_mb"] for r in conv_runs if np.isfinite(r["peak_ram_mb"])]
+        )
+        iters_conv = np.array([r["iterations"] for r in conv_runs]) if conv_runs else np.array([])
+        errs_conv = np.array(
+            [r["max_rel_err"] for r in conv_runs if np.isfinite(r["max_rel_err"])]
+        )
+
+        def _mean2s(arr: np.ndarray) -> tuple[float, float]:
+            if len(arr) == 0:
+                return float("nan"), float("nan")
+            return arr.mean(), (2 * arr.std(ddof=1) if len(arr) > 1 else 0.0)
+
+        t_mean, t_2s = _mean2s(times_conv)
+        r_mean, r_2s = _mean2s(rams_conv)
+        i_mean, i_2s = _mean2s(iters_conv)
+        e_mean, e_2s = _mean2s(errs_conv)
 
         agg[name] = {
             "conv_rate": conv_count / len(runs),
             "conv_count": conv_count,
             "n_runs": len(runs),
-            "time_mean": times.mean(),
-            "time_2sigma": 2 * times.std(ddof=1) if len(times) > 1 else 0.0,
-            "ram_mean": rams.mean() if len(rams) > 0 else float("nan"),
-            "ram_2sigma": (2 * rams.std(ddof=1) if len(rams) > 1 else 0.0),
-            "iter_mean": iters.mean(),
-            "iter_2sigma": 2 * iters.std(ddof=1) if len(iters) > 1 else 0.0,
-            "err_mean": errs.mean() if len(errs) > 0 else float("nan"),
-            "err_2sigma": (2 * errs.std(ddof=1) if len(errs) > 1 else 0.0),
+            # Performance statistics computed over converged runs only
+            "time_mean": t_mean,
+            "time_2sigma": t_2s,
+            "ram_mean": r_mean,
+            "ram_2sigma": r_2s,
+            "iter_mean": i_mean,
+            "iter_2sigma": i_2s,
+            "err_mean": e_mean,
+            "err_2sigma": e_2s,
+            # Also expose total-run time for informational purposes
+            "time_all_mean": times_all.mean(),
         }
 
     if verbose:
-        _print_aggregate_table(N, agg, n_seeds)
+        _print_aggregate_table(N, agg, n_seeds, bad_seeds=bad_seeds)
 
-    return agg
+    return agg, bad_seeds
 
 
-def _print_aggregate_table(N: int, agg: dict[str, dict], n_seeds: int) -> None:
+def _print_aggregate_table(
+    N: int,
+    agg: dict[str, dict],
+    n_seeds: int,
+    bad_seeds: Optional[list[int]] = None,
+) -> None:
     """Print the aggregate statistics table.
 
+    Performance metrics (Time, RAM, Iters, MaxRelErr) are reported only over
+    the runs that converged.  This keeps the table interpretable: a method
+    that converges on 2 out of 5 seeds reports the mean time *for those 2 runs*,
+    not for all 5 (where the failed ones may be cut short by a timeout or
+    iteration cap).
+
     Args:
-        N:       Number of nodes.
-        agg:     Aggregate statistics from :func:`run_multi_seed_comparison`.
-        n_seeds: Number of realisations used.
+        N:         Number of nodes.
+        agg:       Aggregate statistics from :func:`run_multi_seed_comparison`.
+        n_seeds:   Number of realisations used.
+        bad_seeds: List of seeds where no method converged (optional).
     """
-    print(f"\n{'─'*74}")
+    print(f"\n{'─'*80}")
     print(f"Aggregate Statistics  |  N={N:,}  |  {n_seeds} runs")
-    print(f"{'─'*74}")
+    print(f"(Performance metrics computed over converged runs only)")
+    print(f"{'─'*80}")
 
     col = [26, 10, 22, 22, 16, 16]
     header = (
@@ -840,12 +943,18 @@ def _print_aggregate_table(N: int, agg: dict[str, dict], n_seeds: int) -> None:
 
     for name, s in agg.items():
         conv_pct = f"{s['conv_rate']:.0%}"
-        time_str = f"{s['time_mean']:.3f}±{s['time_2sigma']:.3f}"
+        if np.isfinite(s["time_mean"]):
+            time_str = f"{s['time_mean']:.3f}±{s['time_2sigma']:.3f}"
+        else:
+            time_str = "   —"
         if np.isfinite(s["ram_mean"]):
             ram_str = f"{s['ram_mean']:.1f}±{s['ram_2sigma']:.1f}"
         else:
             ram_str = "   —"
-        iter_str = f"{s['iter_mean']:.0f}±{s['iter_2sigma']:.0f}"
+        if np.isfinite(s["iter_mean"]):
+            iter_str = f"{s['iter_mean']:.0f}±{s['iter_2sigma']:.0f}"
+        else:
+            iter_str = "   —"
         if np.isfinite(s["err_mean"]):
             err_str = f"{s['err_mean']:.2e}±{s['err_2sigma']:.2e}"
         else:
@@ -857,6 +966,9 @@ def _print_aggregate_table(N: int, agg: dict[str, dict], n_seeds: int) -> None:
             f"{iter_str:^{col[4]}} "
             f"{err_str:^{col[5]}}"
         )
+
+    if bad_seeds:
+        print(f"\n  ⚠ Seeds where no method converged: {bad_seeds}")
     print()
 
 
@@ -883,13 +995,15 @@ def run_scaling_comparison(
         start_seed: Base random seed.
     """
     all_agg: dict[int, dict[str, dict]] = {}
+    all_bad: dict[int, list[int]] = {}
 
     for N in sizes:
-        agg = run_multi_seed_comparison(
+        agg, bad = run_multi_seed_comparison(
             N=N, n_seeds=n_seeds, tol=tol, timeout=timeout,
             start_seed=start_seed, verbose=True,
         )
         all_agg[N] = agg
+        all_bad[N] = bad
 
     # Summary table
     print(f"\n{'='*74}")
@@ -918,7 +1032,9 @@ def run_scaling_comparison(
             if N in all_agg and method in all_agg[N]:
                 r = all_agg[N][method]
                 conv_rate = f"{r['conv_rate']:.0%}"
-                time_str = f"{r['time_mean']:.1f}s"
+                # Show converged-run mean time (nan → —)
+                t = r["time_mean"]
+                time_str = f"{t:.1f}s" if np.isfinite(t) else "—"
                 cell = f"{conv_rate} {time_str}"
             else:
                 cell = "—"
@@ -926,8 +1042,15 @@ def run_scaling_comparison(
         print(row)
 
     print()
-    print("Columns: convergence rate  mean time")
+    print("Columns: convergence rate  mean time (converged runs only)")
     print(f"Timeout: {timeout:.0f}s per solver")
+    # Report bad seeds per size
+    any_bad = any(v for v in all_bad.values())
+    if any_bad:
+        print("\nSeeds where no method converged:")
+        for N, seeds in all_bad.items():
+            if seeds:
+                print(f"  N={N:,}: {seeds}")
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1079,14 @@ if __name__ == "__main__":
         "--fast", action="store_true",
         help="Skip plain FP/Jacobi and LM; run only Anderson and L-BFGS methods",
     )
+    parser.add_argument(
+        "--phase4", action="store_true",
+        help=(
+            "Phase 4 focused mode: N=5k, 5 seeds, FP-GS α∈{1,0.5,0.3}, "
+            "FP-GS Anderson(10), θ-Newton Anderson(10), and L-BFGS.  "
+            "Bad seeds (no method converges) are saved to bad_seeds_phase4.txt."
+        ),
+    )
     args = parser.parse_args()
 
     # If start_seed is not provided, use a time-based random seed so that
@@ -967,7 +1098,36 @@ if __name__ == "__main__":
         else int(_time_mod.time() * 1000) % (2 ** 31)
     )
 
-    if args.sizes is not None:
+    if args.phase4:
+        # Phase-4 focused mode: N=5k, 5 seeds, key methods only.
+        _phase4_N = 5_000
+        _phase4_seeds = 5
+        print(f"\n{'='*74}")
+        print(
+            f"Phase 4 focused benchmark  |  N={_phase4_N:,} nodes  |  "
+            f"{_phase4_seeds} seeds  |  start_seed={effective_start_seed}"
+        )
+        print(f"{'='*74}")
+        agg, bad_seeds = run_multi_seed_comparison(
+            N=_phase4_N,
+            n_seeds=_phase4_seeds,
+            tol=args.tol,
+            timeout=args.timeout,
+            start_seed=effective_start_seed,
+            verbose=True,
+            fast=False,
+        )
+        # Save bad seeds to file for diagnostic follow-up
+        bad_seeds_path = "bad_seeds_phase4.txt"
+        with open(bad_seeds_path, "w") as _f:
+            _f.write(f"# Phase4 bad seeds (N={_phase4_N}, start_seed={effective_start_seed})\n")
+            for _s in bad_seeds:
+                _f.write(f"{_s}\n")
+        if bad_seeds:
+            print(f"\nBad seeds saved to {bad_seeds_path}: {bad_seeds}")
+        else:
+            print(f"\nAll seeds converged. No bad seeds recorded.")
+    elif args.sizes is not None:
         # Scaling mode: run multi-seed for each size
         run_scaling_comparison(
             sizes=args.sizes,

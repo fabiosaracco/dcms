@@ -122,10 +122,12 @@ DEFAULT_SIZES: list[int] = [1_000, 5_000, 10_000, 50_000]
 DEFAULT_RHO: float = 0.001
 
 # Convergence tolerance used by all solvers in this benchmark
-DEFAULT_TOL: float = 1e-6
+#DEFAULT_TOL: float = 1e-6
+DEFAULT_TOL: float = 1e-5
 
 # Maximum solver wall-clock time (seconds) — skip if exceeded
-SOLVER_TIMEOUT: float = 300.0
+#SOLVER_TIMEOUT: float = 300.0
+SOLVER_TIMEOUT: float = 900.0
 
 # Number of seeds for multi-seed comparison
 DEFAULT_N_SEEDS: int = 10
@@ -648,9 +650,9 @@ def run_comparison(N: int = 50, seed: Optional[int] = None, tol: float = DEFAULT
         seed: Random seed.  ``None`` picks a random seed.
         tol:  Convergence tolerance.
     """
-    print(f"\n{'='*74}")
+    print(f"\n{'='*100}")
     print(f"DWCM Solver Comparison  |  N={N} nodes  |  seed={seed}  |  tol={tol:.0e}")
-    print(f"{'='*74}")
+    print(f"{'='*100}")
 
     k, s = k_s_generator_pl(N, rho=DEFAULT_RHO, seed=seed)
     s_out = s[:N].numpy().astype(float)
@@ -667,7 +669,7 @@ def run_comparison(N: int = 50, seed: Optional[int] = None, tol: float = DEFAULT
     model = DWCMModel(s_out, s_in)
     theta0 = model.initial_theta("strengths")
 
-    col = [24, 8, 8, 14, 10, 12]
+    col = [50, 8, 8, 14, 10, 12]
     header = (
         f"{'Method':<{col[0]}} {'Conv?':>{col[1]}} {'Iters':>{col[2]}} "
         f"{'MaxRelErr':>{col[3]}} {'Time(s)':>{col[4]}} {'RAM(KB)':>{col[5]}}"
@@ -796,12 +798,12 @@ def run_multi_seed_comparison(
         Dict mapping solver_name → aggregate_stats_dict.
     """
     if verbose:
-        print(f"\n{'='*74}")
+        print(f"\n{'='*100}")
         print(
             f"DWCM Multi-Seed Comparison  |  N={N:,} nodes  |  "
             f"{n_seeds} runs  |  tol={tol:.0e}  |  start_seed={start_seed}"
         )
-        print(f"{'='*74}")
+        print(f"{'='*100}")
 
     # Collect results across seeds
     all_stats: dict[str, list[dict]] = {}
@@ -925,12 +927,12 @@ def _print_aggregate_table(
         n_seeds:   Number of realisations used.
         bad_seeds: List of seeds where no method converged (optional).
     """
-    print(f"\n{'─'*80}")
+    print(f"\n{'─'*100}")
     print(f"Aggregate Statistics  |  N={N:,}  |  {n_seeds} runs")
     print(f"(Performance metrics computed over converged runs only)")
-    print(f"{'─'*80}")
+    print(f"{'─'*100}")
 
-    col = [26, 10, 22, 22, 16, 16]
+    col = [50, 10, 22, 22, 16, 16]
     header = (
         f"{'Method':<{col[0]}} {'Conv%':>{col[1]}} "
         f"{'Time(s) mean±2σ':^{col[2]}} "

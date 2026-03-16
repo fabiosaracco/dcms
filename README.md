@@ -241,7 +241,7 @@ result = solve_fixed_point_dwcm(
 | `"jacobi"` | All multipliers updated simultaneously from the previous iterate.  Slower and less stable than Gauss-Seidel. |
 | `"theta-newton"` | Coordinate Newton steps directly in θ-space.  Avoids the β > 1 clamping oscillation that affects high-strength hub nodes.  Pair with `anderson_depth ≥ 5` for best results. |
 
-**Anderson acceleration** (`anderson_depth > 0`): uses the `m` most recent fixed-point outputs to compute the next iterate via constrained least-squares mixing (Walker & Ni 2011).  Values of 5–10 give the best acceleration.  Compatible with all three variants.
+**Anderson acceleration** (`anderson_depth ≥ 2`): uses the `m` most recent fixed-point outputs to compute the next iterate via constrained least-squares mixing (Walker & Ni 2011).  Setting `anderson_depth=1` behaves identically to plain fixed-point (mixing requires at least two history points); values of 5–10 give the best acceleration.  Compatible with all three variants.
 
 **`max_step`**: caps the per-node Newton step `|Δθ|` in the `"theta-newton"` variant.  Default `1.0` (one unit in log-space) is sufficient for most networks; reduce to `0.5` for networks with very high-strength hubs to improve robustness at the cost of slower convergence per iteration.
 
@@ -296,7 +296,7 @@ Convergence tolerance: `tol = 1e-6`.  Statistics (mean ± 2σ) are computed over
 | L-BFGS (m=20)          |  100% |         56 ± 67 |    7.3 ± 19.5    | 5.7e-7 ± 6.1e-7 |
 
 > **Notes:**  
-> - Approximately half the random networks in this seed range are "hard" (near-infeasible β products), causing plain FP-GS to fail within the 30 s time budget.  On well-conditioned networks, FP-GS converges in ≈ 8 iterations (< 0.15 s).  
+> - Approximately half the random networks in this seed range are "hard" (near-infeasible β products), causing plain FP-GS to fail within the default 300 s solver timeout.  On well-conditioned networks, FP-GS converges in ≈ 8 iterations (< 0.15 s).  
 > - **L-BFGS is the only method that converges on all 10 networks**, at the cost of higher and more variable run time on hard instances.  
 > - θ-Newton Anderson(10) offers the best robustness–speed trade-off (80 % convergence, sub-second on converged runs).
 
@@ -327,6 +327,7 @@ At N = 5 000, methods that require an explicit N × N Jacobian (~800 MB) are not
 
 Benchmark over **10 random networks** generated with `k_s_generator_pl(N=5000, rho=1e-3)`.
 Convergence tolerance: `tol = 1e-6`.  Statistics (mean ± 2σ) are computed over converged runs only.  Conv% is measured over all 10 networks.
+> **Note:** only 2 seeds were fully observed during the benchmark run; remaining values are extrapolated from observed scaling and should be treated as indicative.  Re-run `python -m src.benchmarks.dwcm_comparison --n 5000 --n_seeds 10` to obtain exact numbers.
 
 | Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MRE (mean±2σ) |
 |--------|------:|----------------:|-----------------:|---------------:|
@@ -338,9 +339,9 @@ Convergence tolerance: `tol = 1e-6`.  Statistics (mean ± 2σ) are computed over
 
 > **Notes:**  
 > - Each fixed-point iteration at N = 5 000 materialises a 5 000 × 5 000 weight matrix (~200 MB); per-iteration cost is ~0.5 s.  
-> - L-BFGS each step calls the residual function (O(N²)), making it significantly slower than at N = 1 000.  On hard networks it may approach the 3 min time budget before converging.  
+> - L-BFGS each step calls the residual function (O(N²)), making it significantly slower than at N = 1 000.  On hard networks it may approach the default 300 s solver timeout before converging.  
 > - θ-Newton Anderson(10) provides the best robustness at this scale while remaining O(N) in memory.  
-> - For N > 5 000, switch to chunked computation (`chunk_size=500`) to reduce peak RAM.
+> - For N > 5 000, chunked computation is enabled automatically when `chunk_size=0` (the default); the chunk size can be tuned explicitly (e.g. `chunk_size=512`) if further memory control is needed.
 
 ---
 

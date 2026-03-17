@@ -1103,7 +1103,7 @@ if __name__ == "__main__":
     if args.phase4:
         # Phase-4 focused mode: N=5k, 5 seeds, key methods only.
         _phase4_N = 5_000
-        _phase4_seeds = 5
+        _phase4_seeds = 10
         print(f"\n{'='*74}")
         print(
             f"Phase 4 focused benchmark  |  N={_phase4_N:,} nodes  |  "
@@ -1121,8 +1121,8 @@ if __name__ == "__main__":
         )
         # Save bad seeds to file for diagnostic follow-up
         bad_seeds_path = "bad_seeds_phase4.txt"
-        with open(bad_seeds_path, "w") as _f:
-            _f.write(f"# Phase4 bad seeds (N={_phase4_N}, start_seed={effective_start_seed})\n")
+        with open(bad_seeds_path, "a") as _f:
+            #_f.write(f"# Phase4 bad seeds (N={_phase4_N}, start_seed={effective_start_seed})\n")
             for _s in bad_seeds:
                 _f.write(f"{_s}\n")
         if bad_seeds:

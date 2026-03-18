@@ -445,9 +445,6 @@ def solve_fixed_point_daecm(
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
 
     # Convert inputs to tensors
-    for name, val in [("s_out", s_out), ("s_in", s_in)]:
-        if not isinstance(val, torch.Tensor):
-            locals()[name] = torch.tensor(val, dtype=torch.float64)
     if not isinstance(s_out, torch.Tensor):
         s_out = torch.tensor(s_out, dtype=torch.float64)
     else:

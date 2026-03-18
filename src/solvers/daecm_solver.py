@@ -274,7 +274,6 @@ def solve_daecm(
     Returns:
         :class:`DaECMResult` with all statistics from both steps.
     """
-    tracemalloc.start()
     t_total = time.perf_counter()
     N = model.N
 
@@ -380,13 +379,9 @@ def solve_daecm(
                 model.initial_theta_weight(theta_topo_final, method="random")
             )
 
-    # Pre-compute p_ij for dense path
+    # Pre-compute p_ij for dense path (includes zero-degree masks)
     if N <= 5_000:
-        topo_out = theta_topo_final[:N]
-        topo_in = theta_topo_final[N:]
-        log_xy = -topo_out[:, None] - topo_in[None, :]
-        P_mat = torch.sigmoid(log_xy)
-        P_mat.fill_diagonal_(0.0)
+        P_mat = model.pij_matrix(theta_topo_final)
     else:
         P_mat = None
 
@@ -454,7 +449,14 @@ def solve_daecm(
                 tol=tol, max_iter=min(weight_max_iter, 500),
                 theta_bounds=(_ETA_MIN, _ETA_MAX),
             )
-        elif weight_method in ("lm", "lm-diag"):
+        elif weight_method == "lm":
+            r = solve_lm(
+                w_res_fn, w_jac_fn, tw0,
+                tol=tol, max_iter=min(weight_max_iter, 500),
+                diagonal_only=False,
+                theta_bounds=(_ETA_MIN, _ETA_MAX),
+            )
+        elif weight_method == "lm-diag":
             r = _solve_lm_diag_daecm(
                 model, theta_topo_final, tw0,
                 tol=tol, theta_bounds=(_ETA_MIN, _ETA_MAX),
@@ -472,8 +474,7 @@ def solve_daecm(
 
     assert weight_result is not None
 
-    _, peak_ram = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    peak_ram = max(topo_result.peak_ram_bytes, weight_result.peak_ram_bytes)
     elapsed = time.perf_counter() - t_total
 
     topo_ok = topo_result.converged
@@ -544,7 +545,6 @@ def solve_daecm_joint_lbfgs(
     Returns:
         :class:`DaECMResult` with combined statistics.
     """
-    tracemalloc.start()
     t_total = time.perf_counter()
     N = model.N
 
@@ -564,8 +564,6 @@ def solve_daecm_joint_lbfgs(
 
     # If warm-start already converged, return early
     if warmup_result.converged:
-        _, peak_ram = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
         elapsed = time.perf_counter() - t_total
         return DaECMResult(
             theta_topo=warmup_result.theta_topo,
@@ -578,7 +576,7 @@ def solve_daecm_joint_lbfgs(
             topo_residuals=warmup_result.topo_residuals,
             weight_residuals=warmup_result.weight_residuals,
             elapsed_time=elapsed,
-            peak_ram_bytes=peak_ram,
+            peak_ram_bytes=warmup_result.peak_ram_bytes,
             message="Joint L-BFGS: converged in warm-start phase.",
         )
 
@@ -609,9 +607,8 @@ def solve_daecm_joint_lbfgs(
         theta_bounds=None,  # we handle clamping ourselves
     )
 
-    _, peak_ram = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
     elapsed = time.perf_counter() - t_total
+    peak_ram = max(warmup_result.peak_ram_bytes, joint_result.peak_ram_bytes)
 
     theta_final = _clamp(torch.tensor(joint_result.theta, dtype=torch.float64))
     theta_topo_final = theta_final[:2 * N].numpy()

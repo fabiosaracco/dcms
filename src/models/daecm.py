@@ -584,6 +584,62 @@ class DaECMModel:
         return torch.cat([theta_b_out, theta_b_in])
 
     # ------------------------------------------------------------------
+    # Joint 4N residual and NLL (for full L-BFGS over all parameters)
+    # ------------------------------------------------------------------
+
+    def residual_joint(self, theta_full: _ArrayLike) -> torch.Tensor:
+        """Return the full 4N residual [F_topo | F_strength].
+
+        The parameter vector is ``theta_full = [θ_out | θ_in | θ_β_out | θ_β_in]``
+        of length 4N.
+
+        Args:
+            theta_full: Joint parameter vector, shape (4N,).
+
+        Returns:
+            Residual vector, shape (4N,).
+        """
+        theta_full = _to_tensor(theta_full)
+        N = self.N
+        theta_topo = theta_full[:2 * N]
+        theta_weight = theta_full[2 * N:]
+        F_topo = self._dcm.residual(theta_topo)
+        F_str = self.residual_strength(theta_topo, theta_weight)
+        return torch.cat([F_topo, F_str])
+
+    def neg_log_likelihood_joint(self, theta_full: _ArrayLike) -> float:
+        """Return the joint negative log-likelihood −L_topo − L_weight.
+
+        The topology NLL is the standard DCM NLL; the weight NLL is the
+        conditioned DWCM NLL.  The parameter vector is
+        ``theta_full = [θ_out | θ_in | θ_β_out | θ_β_in]`` of length 4N.
+
+        Args:
+            theta_full: Joint parameter vector, shape (4N,).
+
+        Returns:
+            Scalar −L(θ) to be minimised.
+        """
+        theta_full = _to_tensor(theta_full)
+        N = self.N
+        theta_topo = theta_full[:2 * N]
+        theta_weight = theta_full[2 * N:]
+        nll_topo = self._dcm.neg_log_likelihood(theta_topo)
+        nll_str = self.neg_log_likelihood_strength(theta_topo, theta_weight)
+        return nll_topo + nll_str
+
+    def constraint_error_joint(self, theta_full: _ArrayLike) -> float:
+        """Return max-abs residual over all 4N constraints.
+
+        Args:
+            theta_full: Joint parameter vector, shape (4N,).
+
+        Returns:
+            max|F(θ)| (scalar).
+        """
+        return self.residual_joint(theta_full).abs().max().item()
+
+    # ------------------------------------------------------------------
     # Constraint evaluation
     # ------------------------------------------------------------------
 

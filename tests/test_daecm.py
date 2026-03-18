@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.daecm import DaECMModel, _ETA_MAX, _ETA_MIN
-from src.solvers.daecm_solver import DaECMResult, solve_daecm
+from src.solvers.daecm_solver import DaECMResult, solve_daecm, solve_daecm_joint_lbfgs
 from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
 
 
@@ -467,3 +467,45 @@ class TestFixedPointDaECM:
             variant="theta-newton",
         )
         assert result.converged or result.residuals[-1] < CONV_TOL * 10
+
+
+# ---------------------------------------------------------------------------
+# Joint L-BFGS tests
+# ---------------------------------------------------------------------------
+
+class TestJointLBFGS:
+    """Test the joint 4N L-BFGS solver."""
+
+    def test_joint_residual_shape(self) -> None:
+        """Joint residual must have length 4N."""
+        model, theta_topo_true, theta_weight_true = make_daecm_model(N=4, seed=0)
+        theta_full = np.concatenate([theta_topo_true, theta_weight_true])
+        F = model.residual_joint(theta_full)
+        assert F.shape == (16,)
+
+    def test_joint_nll_finite(self) -> None:
+        """Joint NLL must be a finite scalar."""
+        model, theta_topo_true, theta_weight_true = make_daecm_model(N=4, seed=0)
+        theta_full = np.concatenate([theta_topo_true, theta_weight_true])
+        nll = model.neg_log_likelihood_joint(theta_full)
+        assert np.isfinite(nll)
+
+    def test_joint_lbfgs_converges_n4(self) -> None:
+        """Joint L-BFGS must converge on N=4."""
+        model, _, _ = make_daecm_model(N=4, seed=0)
+        result = solve_daecm_joint_lbfgs(model, tol=1e-6, max_iter=5_000)
+        assert result.converged, f"Joint L-BFGS did not converge: {result.message}"
+        err = model.constraint_error_joint(
+            np.concatenate([result.theta_topo, result.theta_weight])
+        )
+        assert err < 1e-5, f"Joint error={err:.2e}"
+
+    def test_joint_lbfgs_converges_n10(self) -> None:
+        """Joint L-BFGS must converge on N=10."""
+        model, _, _ = make_daecm_model(N=10, seed=0)
+        result = solve_daecm_joint_lbfgs(model, tol=1e-6, max_iter=5_000)
+        assert result.converged, f"Joint L-BFGS did not converge: {result.message}"
+        err = model.constraint_error_joint(
+            np.concatenate([result.theta_topo, result.theta_weight])
+        )
+        assert err < 1e-5, f"Joint error={err:.2e}"

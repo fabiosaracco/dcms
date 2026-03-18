@@ -45,7 +45,7 @@ import torch
 from src.models.daecm import DaECMModel, _ETA_MIN, _ETA_MAX
 from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
-from src.solvers.daecm_solver import DaECMResult, solve_daecm, _solve_lm_diag_daecm
+from src.solvers.daecm_solver import DaECMResult, solve_daecm, _solve_lm_diag_daecm, solve_daecm_joint_lbfgs
 from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
 from src.solvers.quasi_newton import solve_lbfgs
 from src.solvers.newton import solve_newton
@@ -559,6 +559,16 @@ def run_comparison(
             f"{mre:>{col[3]}.3e} {result.elapsed_time:>{col[4]}.3f} "
             f"{result.peak_ram_bytes/1024:>{col[5]}.1f}"
         )
+
+    # Joint L-BFGS (full 4N)
+    jr = solve_daecm_joint_lbfgs(model, tol=tol, max_iter=2_000, m=20)
+    mre_j = model.max_relative_error(jr.theta_topo, jr.theta_weight)
+    conv_j = "YES" if jr.converged else "NO"
+    print(
+        f"{'L-BFGS joint (4N)':<{col[0]}} {conv_j:>{col[1]}} {jr.topo_iterations:>{col[2]}} "
+        f"{mre_j:>{col[3]}.3e} {jr.elapsed_time:>{col[4]}.3f} "
+        f"{jr.peak_ram_bytes/1024:>{col[5]}.1f}"
+    )
     print()
 
 
@@ -653,6 +663,38 @@ def _run_single_network(
                 elapsed=time.perf_counter() - t_start,
                 peak_ram_mb=float("nan"), status="ERR",
             )
+
+    # ── Joint L-BFGS (full 4N optimisation, independent of the two-step topo) ──
+    t_start = time.perf_counter()
+    try:
+        jr: DaECMResult = _call_with_timeout(
+            lambda: solve_daecm_joint_lbfgs(
+                model, tol=tol, max_iter=2_000, m=20,
+            ),
+            timeout,
+        )
+        mre = model.max_relative_error(jr.theta_topo, jr.theta_weight)
+        results["L-BFGS joint (4N)"] = dict(
+            converged=jr.converged,
+            iterations=jr.topo_iterations,
+            max_rel_err=mre,
+            elapsed=jr.elapsed_time,
+            peak_ram_mb=jr.peak_ram_bytes / 1024 / 1024,
+            status="OK" if jr.converged else "NO-CONV",
+        )
+    except _TimeoutError:
+        results["L-BFGS joint (4N)"] = dict(
+            converged=False, iterations=0, max_rel_err=float("nan"),
+            elapsed=time.perf_counter() - t_start,
+            peak_ram_mb=float("nan"), status="TIMEOUT",
+        )
+    except Exception:
+        results["L-BFGS joint (4N)"] = dict(
+            converged=False, iterations=0, max_rel_err=float("nan"),
+            elapsed=time.perf_counter() - t_start,
+            peak_ram_mb=float("nan"), status="ERR",
+        )
+
     return results
 
 

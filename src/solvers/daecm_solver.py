@@ -506,6 +506,140 @@ def solve_daecm(
     )
 
 
+# ---------------------------------------------------------------------------
+# Joint (full 4N) L-BFGS solver
+# ---------------------------------------------------------------------------
+
+def solve_daecm_joint_lbfgs(
+    model: DaECMModel,
+    theta_topo0: Optional[torch.Tensor] = None,
+    theta_weight0: Optional[torch.Tensor] = None,
+    tol: float = 1e-5,
+    max_iter: int = 5_000,
+    m: int = 20,
+) -> DaECMResult:
+    """Solve the DaECM by jointly optimising all 4N parameters with L-BFGS.
+
+    Uses a two-phase strategy:
+
+    1. **Warm-start** — solve the two-step DaECM (LBFGS topology, then LBFGS
+       weight) to obtain a good initial point.
+    2. **Joint refinement** — minimise the combined negative log-likelihood
+       ``−L_topo(θ_topo) − L_weight(θ_topo, θ_weight)`` over the full 4N
+       parameter vector ``[θ_out | θ_in | θ_β_out | θ_β_in]``.
+
+    This avoids the slow convergence of pure joint optimisation due to the
+    different NLL scales between topology and weight terms.
+
+    Args:
+        model:         DaECMModel instance.
+        theta_topo0:   Initial topology guess, shape (2N,).  Defaults to
+                       ``model.initial_theta_topo("degrees")``.
+        theta_weight0: Initial weight guess, shape (2N,).  Defaults to
+                       ``model.initial_theta_weight(theta_topo0)``.
+        tol:           Convergence tolerance on the ℓ∞ residual norm.
+        max_iter:      Maximum L-BFGS iterations for the joint phase.
+        m:             Number of stored curvature pairs.
+
+    Returns:
+        :class:`DaECMResult` with combined statistics.
+    """
+    tracemalloc.start()
+    t_total = time.perf_counter()
+    N = model.N
+
+    # Phase 1: warm-start via two-step solve
+    warmup_result = solve_daecm(
+        model,
+        theta_topo0=theta_topo0,
+        theta_weight0=theta_weight0,
+        topo_method="lbfgs",
+        weight_method="lbfgs",
+        tol=tol,
+        topo_max_iter=min(max_iter, 5_000),
+        weight_max_iter=min(max_iter, 3_000),
+    )
+
+    warmup_iters = warmup_result.topo_iterations + warmup_result.weight_iterations
+
+    # If warm-start already converged, return early
+    if warmup_result.converged:
+        _, peak_ram = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        elapsed = time.perf_counter() - t_total
+        return DaECMResult(
+            theta_topo=warmup_result.theta_topo,
+            theta_weight=warmup_result.theta_weight,
+            topo_converged=warmup_result.topo_converged,
+            weight_converged=warmup_result.weight_converged,
+            converged=True,
+            topo_iterations=warmup_iters,
+            weight_iterations=0,
+            topo_residuals=warmup_result.topo_residuals,
+            weight_residuals=warmup_result.weight_residuals,
+            elapsed_time=elapsed,
+            peak_ram_bytes=peak_ram,
+            message="Joint L-BFGS: converged in warm-start phase.",
+        )
+
+    # Phase 2: joint refinement over all 4N parameters
+    theta_topo_ws = torch.tensor(warmup_result.theta_topo, dtype=torch.float64)
+    theta_weight_ws = torch.tensor(warmup_result.theta_weight, dtype=torch.float64)
+    theta0 = torch.cat([theta_topo_ws, theta_weight_ws])
+
+    theta_lo = torch.cat([
+        torch.full((2 * N,), -_ETA_MAX, dtype=torch.float64),
+        torch.full((2 * N,), _ETA_MIN, dtype=torch.float64),
+    ])
+    theta_hi = torch.full((4 * N,), _ETA_MAX, dtype=torch.float64)
+
+    def _clamp(t: torch.Tensor) -> torch.Tensor:
+        return torch.max(torch.min(t, theta_hi), theta_lo)
+
+    def residual_fn(theta: torch.Tensor) -> torch.Tensor:
+        return model.residual_joint(_clamp(theta))
+
+    def nll_fn(theta: torch.Tensor) -> float:
+        return model.neg_log_likelihood_joint(_clamp(theta))
+
+    joint_result = solve_lbfgs(
+        residual_fn, _clamp(theta0),
+        tol=tol, max_iter=max_iter, m=m,
+        neg_loglik_fn=nll_fn,
+        theta_bounds=None,  # we handle clamping ourselves
+    )
+
+    _, peak_ram = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    elapsed = time.perf_counter() - t_total
+
+    theta_final = _clamp(torch.tensor(joint_result.theta, dtype=torch.float64))
+    theta_topo_final = theta_final[:2 * N].numpy()
+    theta_weight_final = theta_final[2 * N:].numpy()
+
+    topo_err = model.constraint_error_topo(theta_topo_final)
+    weight_err = model.constraint_error_strength(theta_topo_final, theta_weight_final)
+    topo_ok = topo_err < tol
+    weight_ok = weight_err < tol
+
+    total_iters = warmup_iters + joint_result.iterations
+
+    return DaECMResult(
+        theta_topo=theta_topo_final,
+        theta_weight=theta_weight_final,
+        topo_converged=topo_ok,
+        weight_converged=weight_ok,
+        converged=(topo_ok and weight_ok),
+        topo_iterations=total_iters,
+        weight_iterations=0,
+        topo_residuals=warmup_result.topo_residuals + joint_result.residuals,
+        weight_residuals=warmup_result.weight_residuals,
+        elapsed_time=elapsed,
+        peak_ram_bytes=peak_ram,
+        message=f"Joint L-BFGS: {joint_result.message}",
+    )
+
+
 def _to_tensor(
     x: "numpy.ndarray | torch.Tensor",  # type: ignore[name-defined]
 ) -> torch.Tensor:

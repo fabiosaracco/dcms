@@ -170,6 +170,7 @@ class DaECMModel:
         self,
         theta_topo: _ArrayLike,
         theta_weight: _ArrayLike,
+        P: "Optional[torch.Tensor]" = None,  # type: ignore[name-defined]
     ) -> torch.Tensor:
         """Return the strength-equation residual F_w(θ_β).
 
@@ -181,12 +182,36 @@ class DaECMModel:
         Args:
             theta_topo:   Topology parameters, shape (2N,).
             theta_weight: Weight parameters [θ_β_out | θ_β_in], shape (2N,).
+            P:            Optional pre-computed DCM probability matrix (N, N).
+                          If provided, avoids recomputing ``p_ij`` each call.
 
         Returns:
             Residual vector F_w, shape (2N,).
         """
         if self.N > _LARGE_N_THRESHOLD:
             return self._residual_strength_chunked(theta_topo, theta_weight)
+        if P is not None:
+            # Fast path: use pre-computed P
+            P_mat = P if isinstance(P, torch.Tensor) else torch.tensor(P, dtype=torch.float64)
+            theta_weight = _to_tensor(theta_weight)
+            N = self.N
+            tb_out = theta_weight[:N]
+            tb_in = theta_weight[N:]
+            z = tb_out[:, None] + tb_in[None, :]
+            z_safe = z.clamp(min=1e-15)
+            G = 1.0 / torch.expm1(z_safe)
+            G.fill_diagonal_(0.0)
+            if self.zero_s_out.any():
+                G[self.zero_s_out] = 0.0
+            if self.zero_s_in.any():
+                G[:, self.zero_s_in] = 0.0
+            W = P_mat * G
+            s_out_hat = W.sum(dim=1)
+            s_in_hat = W.sum(dim=0)
+            F = torch.empty(2 * N, dtype=torch.float64)
+            F[:N] = s_out_hat - self.s_out
+            F[N:] = s_in_hat - self.s_in
+            return F
         W = self.wij_matrix_conditioned(theta_topo, theta_weight)
         s_out_hat = W.sum(dim=1)   # expected out-strength
         s_in_hat = W.sum(dim=0)    # expected in-strength

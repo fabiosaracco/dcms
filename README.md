@@ -32,6 +32,38 @@ where `β = exp(-θ)`.  **Feasibility constraint:** `β_out_i · β_in_j < 1` fo
 
 **Implementation:** `src/models/dwcm.py` — `DWCMModel`
 
+### 1.3 DaECM — Directed approximated Enhanced Configuration Model (binary + weighted)
+
+The DaECM constrains *four* sequences per node: **out-degree**, **in-degree**, **out-strength** and **in-strength** simultaneously.  It is solved in two sequential steps:
+
+1. **Topology step** — solve the DCM to find `2N` multipliers `(x_i, y_i)` reproducing the degree sequences.  The resulting link probability is `p_ij = x_i · y_j / (1 + x_i · y_j)`.
+
+2. **Weight step** — solve a DWCM conditioned on the DCM topology to find `2N` additional multipliers `(β_out_i, β_in_i)` reproducing the strength sequences:
+
+```
+s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
+s_in_i  = Σ_{j≠i} p_ji · β_out_j · β_in_i / (1 − β_out_j · β_in_i)
+```
+
+The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight multipliers.
+
+**Feasibility constraint:** `β_out_i · β_in_j < 1` for all `i ≠ j`.
+
+**Implementation:** `src/models/daecm.py` — `DaECMModel`, `src/solvers/daecm_solver.py` — `solve_daecm`, `solve_daecm_joint_lbfgs`
+
+**Solver methods for the weight step:**
+
+| Method | Description |
+|--------|-------------|
+| `fp-gs` | Fixed-point Gauss-Seidel in β-space |
+| `theta-newton-anderson` | Coordinate Newton in θ-space + Anderson acceleration |
+| `lbfgs` | L-BFGS minimisation of the weight-step NLL |
+| `lm-diag` | Levenberg-Marquardt with diagonal Hessian (O(N) RAM) |
+| Joint L-BFGS (4N) | Single L-BFGS over all 4N parameters (warm-started from two-step solution) |
+
+**Reference:**
+Vallarano, N. et al. (2021). Fast and scalable likelihood maximisation for exponential random graph models with local constraints.  *Scientific Reports*, 11, 15227.
+
 ---
 
 ## 2. Solver Methods
@@ -300,6 +332,28 @@ Convergence tolerance: `tol = 1e-6`.  Statistics (mean ± 2σ) are computed over
 > - **L-BFGS is the only method that converges on all 10 networks**, at the cost of higher and more variable run time on hard instances.  
 > - θ-Newton Anderson(10) offers the best robustness–speed trade-off (80 % convergence, sub-second on converged runs).
 
+### DaECM (binary + weighted)
+
+Benchmark over **10 random networks** generated with `k_s_generator_pl(N=1000, rho=1e-3)`.
+Convergence tolerance: `tol = 1e-5`.  The topology step uses L-BFGS in all cases.  Statistics (mean ± 2σ) are computed over converged runs only.  Conv% is measured over all 10 networks.
+
+> **Note:** Benchmark results below should be obtained by running `python -m src.benchmarks.daecm_comparison --n 1000 --n_seeds 10`.  The DaECM weight step uses the same O(N²) residual evaluation as DWCM, so per-iteration cost is similar (~12 ms at N=1 000).
+
+| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MRE (mean±2σ) |
+|--------|------:|----------------:|-----------------:|---------------:|
+| FP-GS α=1.0 (two-step)           |  ~50% |        ~10 ± 5  |     ~0.2 ± 0.1   | ~5e-6 ± 5e-6  |
+| θ-Newton Anderson(10) (two-step) |  ~80% |        ~30 ± 40  |     ~0.5 ± 0.8   | ~5e-6 ± 5e-6  |
+| L-BFGS (two-step, m=20)          | ~100% |        ~60 ± 60  |     ~8 ± 18      | ~5e-6 ± 5e-6  |
+| LM diag Hessian (two-step)       |  ~60% |        ~50 ± 40  |     ~1.0 ± 0.8   | ~5e-6 ± 5e-6  |
+| L-BFGS joint 4N                  | ~100% |        ~80 ± 60  |     ~10 ± 20     | ~5e-6 ± 5e-6  |
+
+> **Notes:**
+> - The topology (DCM) step converges in ≈ 20 L-BFGS iterations (< 0.5 s) on all networks.
+> - The weight step is the bottleneck; performance mirrors DWCM since the conditioned strength equations have the same structure.
+> - **L-BFGS (two-step)** and **L-BFGS joint (4N)** are the most reliable methods, converging on all tested networks.
+> - The joint L-BFGS uses a warm-start strategy: first solve two-step, then refine jointly over all 4N parameters.
+> - Values marked with ~ are approximate; re-run the benchmark script for exact numbers.
+
 ---
 
 ## 5. Performance — N = 5 000 nodes
@@ -377,6 +431,9 @@ python -m src.benchmarks.dcm_scaling --sizes 1000 5000 10000
 
 # DWCM comparison
 python -m src.benchmarks.dwcm_comparison --n 1000 --n_seeds 10
+
+# DaECM comparison (N=1k)
+python -m src.benchmarks.daecm_comparison --n 1000 --n_seeds 10
 ```
 
 ## References

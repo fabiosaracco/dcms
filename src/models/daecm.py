@@ -49,9 +49,12 @@ _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
 _ETA_MIN: float = 1e-10
 # θ_β upper bound: exp(−50) ≈ 2e-22, essentially zero weight contribution.
 _ETA_MAX: float = 50.0
+# Maximum allowed β_out * β_in product; individual β may exceed 1 as long
+# as the pairwise product stays below this threshold.
+_Q_MAX: float = 0.9999
 
 # For N > this threshold, use chunked computation to avoid N×N materialisation.
-_LARGE_N_THRESHOLD: int = 5_000
+_LARGE_N_THRESHOLD: int = 2_000
 
 # Number of rows processed per chunk when using memory-efficient mode.
 _DEFAULT_CHUNK: int = 512
@@ -147,7 +150,7 @@ class DaECMModel:
 
         # G_ij = β_out_i β_in_j / (1 - β_out_i β_in_j) = 1/expm1(z_ij)
         z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
-        z_safe = z.clamp(min=1e-15)
+        z_safe = z.clamp(min=1e-8)
         G = 1.0 / torch.expm1(z_safe)                   # (N, N)
         G.fill_diagonal_(0.0)
 
@@ -198,7 +201,7 @@ class DaECMModel:
             tb_out = theta_weight[:N]
             tb_in = theta_weight[N:]
             z = tb_out[:, None] + tb_in[None, :]
-            z_safe = z.clamp(min=1e-15)
+            z_safe = z.clamp(min=1e-8)
             G = 1.0 / torch.expm1(z_safe)
             G.fill_diagonal_(0.0)
             if self.zero_s_out.any():
@@ -265,7 +268,7 @@ class DaECMModel:
             z_chunk = (
                 theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
             )  # (chunk, N)
-            z_safe = z_chunk.clamp(min=1e-15)
+            z_safe = z_chunk.clamp(min=1e-8)
             g_chunk = 1.0 / torch.expm1(z_safe)  # (chunk, N)
 
             w_chunk = p_chunk * g_chunk           # (chunk, N)
@@ -326,7 +329,7 @@ class DaECMModel:
 
         # G matrix
         z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
-        z_safe = z.clamp(min=1e-15)
+        z_safe = z.clamp(min=1e-8)
         G = 1.0 / torch.expm1(z_safe)
         G.fill_diagonal_(0.0)
 
@@ -371,7 +374,7 @@ class DaECMModel:
         theta_b_in = theta_weight[N:]
 
         z = theta_b_out[:, None] + theta_b_in[None, :]
-        z_safe = z.clamp(min=1e-15)
+        z_safe = z.clamp(min=1e-8)
         G = 1.0 / torch.expm1(z_safe)
         G.fill_diagonal_(0.0)
 
@@ -422,7 +425,7 @@ class DaECMModel:
         theta_b_in = theta_weight[N:]
 
         z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
-        z_safe = z.clamp(min=1e-15)
+        z_safe = z.clamp(min=1e-8)
         # −log(1 − exp(−z)) = −log1p(−exp(−z))
         log_term = -torch.log1p(-torch.exp(-z_safe))  # (N, N)
         log_term.fill_diagonal_(0.0)                   # exclude self-loops
@@ -471,7 +474,7 @@ class DaECMModel:
             z_chunk = (
                 theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
             )  # (chunk, N)
-            z_safe = z_chunk.clamp(min=1e-15)
+            z_safe = z_chunk.clamp(min=1e-8)
             log_chunk = -torch.log1p(-torch.exp(-z_safe))  # (chunk, N)
 
             # Zero out diagonal
@@ -512,6 +515,9 @@ class DaECMModel:
 
         * ``"strengths"`` (default): β_i ≈ sqrt(s_i / (s_i + N − 1))
           (same mean-field as DWCM, ignoring the p_ij factor).
+        * ``"topology"``: mean-field init β = sqrt(s/(s+k)) where k is the
+          observed degree.  Uses k_out/k_in rather than N-1 so the prior
+          is correct for sparse networks where hubs connect to k << N nodes.
         * ``"normalized"``: β_i^{out} = s_i^{out} / Σ_j s_j^{out}.
         * ``"uniform"``: all betas set to the median of the strengths init.
         * ``"random"``: uniform θ_β ∈ [0.1, 2.0].
@@ -548,6 +554,16 @@ class DaECMModel:
             med_in = pos_in.median().item() if pos_in.numel() > 0 else 0.5
             beta_out = torch.full((N,), med_out, dtype=torch.float64)
             beta_in = torch.full((N,), med_in, dtype=torch.float64)
+        elif method == "topology":
+            # Mean-field init: β = sqrt(s/(s+k)) where k is the observed degree.
+            # For DaECM the weight sums are over connected neighbors (≈ k_out, k_in nodes)
+            # rather than all N nodes, so s/(s+k) is a much better prior than s/(s+N-1).
+            k_out_safe = self.k_out.clamp(min=1.0)
+            k_in_safe = self.k_in.clamp(min=1.0)
+            s_out_safe = self.s_out.clamp(min=1e-15)
+            s_in_safe = self.s_in.clamp(min=1e-15)
+            beta_out = torch.sqrt(s_out_safe / (s_out_safe + k_out_safe))
+            beta_in = torch.sqrt(s_in_safe / (s_in_safe + k_in_safe))
         elif method == "random":
             theta_b_out = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
             theta_b_in = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)

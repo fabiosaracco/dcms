@@ -555,9 +555,9 @@ class DaECMModel:
             beta_out = torch.full((N,), med_out, dtype=torch.float64)
             beta_in = torch.full((N,), med_in, dtype=torch.float64)
         elif method == "topology":
-            # Mean-field init: β = sqrt(s/(s+k)) where k is the observed degree.
-            # For DaECM the weight sums are over connected neighbors (≈ k_out, k_in nodes)
-            # rather than all N nodes, so s/(s+k) is a much better prior than s/(s+N-1).
+            # Mean-field init β = sqrt(s/(s+k)).  For DaECM the weight sums
+            # are over connected neighbours (≈ k_out, k_in nodes) rather than
+            # all N nodes, so s/(s+k) is a better prior than s/(s+N−1).
             k_out_safe = self.k_out.clamp(min=1.0)
             k_in_safe = self.k_in.clamp(min=1.0)
             s_out_safe = self.s_out.clamp(min=1e-15)
@@ -584,11 +584,12 @@ class DaECMModel:
         else:
             raise ValueError(f"Unknown initial-guess method: {method!r}")
 
-        # Convert β → θ_β; clamp to feasible range
-        beta_out = beta_out.clamp(1e-15, 1.0 - 1e-15)
-        beta_in = beta_in.clamp(1e-15, 1.0 - 1e-15)
-        theta_b_out = (-torch.log(beta_out)).clamp(_ETA_MIN, _ETA_MAX)
-        theta_b_in = (-torch.log(beta_in)).clamp(_ETA_MIN, _ETA_MAX)
+        # Convert β → θ_β; allow β > 1 (θ_β < 0) for nodes whose solution
+        # requires it (e.g. high s/k where the coupled β is small).
+        beta_out = beta_out.clamp(min=1e-15)
+        beta_in = beta_in.clamp(min=1e-15)
+        theta_b_out = (-torch.log(beta_out)).clamp(-_ETA_MAX, _ETA_MAX)
+        theta_b_in = (-torch.log(beta_in)).clamp(-_ETA_MAX, _ETA_MAX)
 
         # Zero-strength nodes: β = 0 exactly ↔ θ_β → +∞
         theta_b_out = torch.where(

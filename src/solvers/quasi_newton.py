@@ -51,7 +51,7 @@ def _wolfe_line_search(
         theta_hi: Upper bound for each θ component (default: +50).
 
     Returns:
-        ``(alpha, theta_new, g_new, success)``
+        ``(alpha, theta_new, g_new, f_new, success)``
     """
     alpha = 1.0
     alpha_lo, alpha_hi = 0.0, math.inf
@@ -60,6 +60,7 @@ def _wolfe_line_search(
 
     theta_new = theta
     g_new = g0
+    f_new = f0
 
     for _ in range(max_ls):
         theta_new = torch.clamp(theta + alpha * p, theta_lo, theta_hi)
@@ -72,7 +73,7 @@ def _wolfe_line_search(
         else:
             derphi = g_new.dot(p).item()
             if abs(derphi) <= -c2 * derphi0:
-                return alpha, theta_new, g_new, True
+                return alpha, theta_new, g_new, f_new, True
             if derphi >= 0:
                 alpha_hi = alpha
             alpha_lo = alpha
@@ -85,7 +86,7 @@ def _wolfe_line_search(
         if alpha < 1e-14:
             break
 
-    return alpha, theta_new, g_new, False
+    return alpha, theta_new, g_new, f_new, False
 
 
 def solve_lbfgs(
@@ -96,6 +97,8 @@ def solve_lbfgs(
     m: int = 20,
     neg_loglik_fn: Optional[Callable[["ArrayLike"], float]] = None,  # type: ignore[name-defined]
     theta_bounds: Optional[tuple[float, float]] = None,
+    residual_and_nll_fn: Optional[Callable[[torch.Tensor], tuple[torch.Tensor, float]]] = None,
+    stagnation_window: int = 0,
 ) -> SolverResult:
     """L-BFGS quasi-Newton solver.
 
@@ -116,6 +119,14 @@ def solve_lbfgs(
                        at every step (clamp).  Useful for DWCM where θ > 0 is
                        required for feasibility.  Defaults to
                        ``(-_THETA_CLAMP, +_THETA_CLAMP)`` = ``(-50, +50)``.
+        residual_and_nll_fn: Optional callable returning ``(F(θ), −L(θ))`` in
+                       a single pass, avoiding double computation of the N×N
+                       weight matrix.  When provided, ``neg_loglik_fn`` is
+                       ignored and both objective and gradient are derived from
+                       this single function.
+        stagnation_window: If > 0, stop early when the residual fails to
+                       improve by at least 1% over this many iterations.
+                       Default 0 (disabled).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -156,18 +167,42 @@ def solve_lbfgs(
     # Clamp initial theta to the feasible box
     theta = theta.clamp(theta_lo, theta_hi)
 
-    # Gradient of −L is −F (we minimise −L)
-    def grad_neg_L(th: torch.Tensor) -> torch.Tensor:
-        return -residual_fn(th)
+    # -- Build objective and gradient functions ---------------------------------
+    # When residual_and_nll_fn is provided, both are derived from a single pass
+    # over the W matrix (halving the cost per line-search evaluation).
+    if residual_and_nll_fn is not None:
+        _cache_theta: Optional[torch.Tensor] = None
+        _cache_F: Optional[torch.Tensor] = None
+        _cache_nll: Optional[float] = None
 
-    if neg_loglik_fn is not None:
+        def _ensure_cache(th: torch.Tensor) -> None:
+            nonlocal _cache_theta, _cache_F, _cache_nll
+            if _cache_theta is None or not torch.equal(th, _cache_theta):
+                _cache_F, _cache_nll = residual_and_nll_fn(th)
+                _cache_theta = th.clone()
+
+        def grad_neg_L(th: torch.Tensor) -> torch.Tensor:
+            _ensure_cache(th)
+            assert _cache_F is not None
+            return -_cache_F
+
         def objective(th: torch.Tensor) -> float:
-            return neg_loglik_fn(th)
+            _ensure_cache(th)
+            assert _cache_nll is not None
+            return _cache_nll
     else:
-        # Surrogate: ½‖F‖² has the same zero but may differ in shape.
-        def objective(th: torch.Tensor) -> float:
-            F = residual_fn(th)
-            return 0.5 * F.dot(F).item()
+        # Gradient of −L is −F (we minimise −L)
+        def grad_neg_L(th: torch.Tensor) -> torch.Tensor:
+            return -residual_fn(th)
+
+        if neg_loglik_fn is not None:
+            def objective(th: torch.Tensor) -> float:
+                return neg_loglik_fn(th)
+        else:
+            # Surrogate: ½‖F‖² has the same zero but may differ in shape.
+            def objective(th: torch.Tensor) -> float:
+                F = residual_fn(th)
+                return 0.5 * F.dot(F).item()
 
     n_iter = 0
     g = grad_neg_L(theta)   # gradient of −L = −F; ‖g‖∞ = ‖F‖∞
@@ -176,6 +211,11 @@ def solve_lbfgs(
 
     converged = False
     message = "Maximum iterations reached without convergence."
+
+    # Stagnation detection (opt-in via stagnation_window > 0)
+    _STAG_FRAC = 0.01
+    _stag_best: float = math.inf
+    _stag_cur_best: float = math.inf
 
     # L-BFGS history (all torch tensors)
     s_hist: list[torch.Tensor] = []
@@ -194,6 +234,21 @@ def solve_lbfgs(
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
                 break
+
+            # Stagnation detection (only when enabled)
+            if stagnation_window > 0:
+                _stag_cur_best = min(_stag_cur_best, res_norm)
+                if n_iter > 0 and n_iter % stagnation_window == 0:
+                    improvement = (_stag_best - _stag_cur_best) / (_stag_best + 1e-300)
+                    if improvement < _STAG_FRAC:
+                        message = (
+                            f"Stagnation detected at iteration {n_iter} "
+                            f"(best residual {_stag_cur_best:.4e}, "
+                            f"improvement {improvement:.2%} < {_STAG_FRAC:.0%})."
+                        )
+                        break
+                    _stag_best = _stag_cur_best
+                    _stag_cur_best = math.inf
 
             # ---------------------------------------------------------------
             # L-BFGS two-loop recursion to compute search direction p = -H g
@@ -222,7 +277,7 @@ def solve_lbfgs(
             # ---------------------------------------------------------------
             # Wolfe line search
             # ---------------------------------------------------------------
-            _, theta_new, g_new, ls_ok = _wolfe_line_search(
+            _, theta_new, g_new, f_new, ls_ok = _wolfe_line_search(
                 objective, grad_neg_L, theta, p, f, g,
                 theta_lo=theta_lo, theta_hi=theta_hi,
             )
@@ -232,6 +287,7 @@ def solve_lbfgs(
                 alpha_fb = min(1e-3, 1.0 / (g.norm().item() + 1e-14))
                 theta_new = torch.clamp(theta - alpha_fb * g, theta_lo, theta_hi)
                 g_new = grad_neg_L(theta_new)
+                f_new = objective(theta_new)
 
             # ---------------------------------------------------------------
             # Update L-BFGS history
@@ -250,7 +306,7 @@ def solve_lbfgs(
 
             theta = theta_new
             g = g_new
-            f = objective(theta)
+            f = f_new
             n_iter += 1
             residuals.append(g.abs().max().item())
     finally:

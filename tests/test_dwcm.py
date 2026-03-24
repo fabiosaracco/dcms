@@ -443,7 +443,7 @@ class TestFixedPointDWCM:
         D_out = D_out_mat.sum(dim=1)
         beta_out_new_dense = torch.where(D_out > 0, model.s_out / D_out, beta_out)
 
-        beta_out_new_chunked, _ = _fp_step_chunked_dwcm(
+        beta_out_new_chunked, _, _ = _fp_step_chunked_dwcm(
             beta_out, beta_in, model.s_out, model.s_in, chunk_size=3, variant="gauss-seidel"
         )
         assert torch.allclose(beta_out_new_dense, beta_out_new_chunked, atol=1e-13), (
@@ -514,11 +514,14 @@ class TestThetaNewtonDWCM:
         )
         model, theta_np = make_dwcm_model(N=8, seed=5)
         theta_t = torch.tensor(theta_np, dtype=torch.float64)
-        dense = _theta_newton_step_dense(theta_t, model.s_out, model.s_in, max_step=1.0)
-        chunked = _theta_newton_step_chunked(theta_t, model.s_out, model.s_in,
+        dense, F_dense = _theta_newton_step_dense(theta_t, model.s_out, model.s_in, max_step=1.0)
+        chunked, F_chunked = _theta_newton_step_chunked(theta_t, model.s_out, model.s_in,
                                              chunk_size=3, max_step=1.0)
         assert torch.allclose(dense, chunked, atol=1e-13), (
             f"Max diff dense vs chunked: {(dense - chunked).abs().max().item():.3e}"
+        )
+        assert torch.allclose(F_dense, F_chunked, atol=1e-13), (
+            f"Max diff F dense vs chunked: {(F_dense - F_chunked).abs().max().item():.3e}"
         )
 
     def test_result_fields(self) -> None:

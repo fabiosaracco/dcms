@@ -442,6 +442,101 @@ class DWCMModel:
         return dot_term + log_total
 
     # ------------------------------------------------------------------
+    # Combined residual + neg_log_likelihood (avoids double W computation)
+    # ------------------------------------------------------------------
+
+    def residual_and_neg_log_likelihood(
+        self, theta: _ArrayLike
+    ) -> tuple[torch.Tensor, float]:
+        """Compute both F(θ) and −L(θ) from a single pass over the W matrix.
+
+        This is ~2× faster than calling ``residual()`` and
+        ``neg_log_likelihood()`` separately, since both share the same
+        z = θ_out[:,None] + θ_in[None,:] computation.
+
+        Args:
+            theta: Parameter vector [θ_out | θ_in], shape (2N,).
+
+        Returns:
+            ``(F, nll)`` where F is the residual (shape (2N,)) and nll is
+            the scalar −L(θ).
+        """
+        if self.N > _LARGE_N_THRESHOLD:
+            return self._residual_and_nll_chunked(theta)
+
+        theta = _to_tensor(theta)
+        N = self.N
+        theta_out = theta[:N]
+        theta_in = theta[N:]
+
+        z = theta_out[:, None] + theta_in[None, :]  # (N, N)
+        z_safe = z.clamp(min=1e-15)
+
+        # Residual from W = 1/expm1(z)
+        W = 1.0 / torch.expm1(z_safe)
+        W.fill_diagonal_(0.0)
+        if self.zero_out.any():
+            W[self.zero_out, :] = 0.0
+        if self.zero_in.any():
+            W[:, self.zero_in] = 0.0
+
+        F = torch.empty(2 * N, dtype=torch.float64)
+        F[:N] = W.sum(dim=1) - self.s_out
+        F[N:] = W.sum(dim=0) - self.s_in
+
+        # NLL from -log1p(-exp(-z))
+        log_term = -torch.log1p(-torch.exp(-z_safe))
+        log_term.fill_diagonal_(0.0)
+        dot_term = theta_out @ self.s_out + theta_in @ self.s_in
+        nll = (dot_term + log_term.sum()).item()
+
+        return F, nll
+
+    def _residual_and_nll_chunked(
+        self, theta: _ArrayLike, chunk_size: int = _DEFAULT_CHUNK
+    ) -> tuple[torch.Tensor, float]:
+        """Chunked version of :meth:`residual_and_neg_log_likelihood`."""
+        theta = _to_tensor(theta)
+        N = self.N
+        theta_out = theta[:N]
+        theta_in = theta[N:]
+
+        s_out_hat = torch.zeros(N, dtype=torch.float64)
+        s_in_hat = torch.zeros(N, dtype=torch.float64)
+        dot_term = (theta_out @ self.s_out + theta_in @ self.s_in).item()
+        log_total = 0.0
+
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            chunk_len = i_end - i_start
+            z = theta_out[i_start:i_end, None] + theta_in[None, :]  # (chunk, N)
+            z_safe = z.clamp(min=1e-15)
+
+            # Residual chunk
+            w_chunk = 1.0 / torch.expm1(z_safe)
+            local_idx = torch.arange(chunk_len, dtype=torch.long)
+            global_idx = torch.arange(i_start, i_end, dtype=torch.long)
+            w_chunk[local_idx, global_idx] = 0.0
+            if self.zero_out[i_start:i_end].any():
+                w_chunk[self.zero_out[i_start:i_end]] = 0.0
+            if self.zero_in.any():
+                w_chunk[:, self.zero_in] = 0.0
+
+            s_out_hat[i_start:i_end] = w_chunk.sum(dim=1)
+            s_in_hat += w_chunk.sum(dim=0)
+
+            # NLL chunk: -log1p(-exp(-z))
+            log_chunk = -torch.log1p(-torch.exp(-z_safe))
+            log_chunk[local_idx, global_idx] = 0.0
+            log_total += log_chunk.sum().item()
+
+        F = torch.empty(2 * N, dtype=torch.float64)
+        F[:N] = s_out_hat - self.s_out
+        F[N:] = s_in_hat - self.s_in
+
+        return F, dot_term + log_total
+
+    # ------------------------------------------------------------------
     # Evaluation of constraint satisfaction
     # ------------------------------------------------------------------
 

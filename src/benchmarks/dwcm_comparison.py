@@ -327,7 +327,11 @@ def _lbfgs_multistart(
     from src.solvers.base import SolverResult as _SR
 
     res_fn = _make_clamped_residual(model)
-    nll_fn = _make_clamped_nll(model)
+
+    # Use combined residual+NLL to avoid double W materialisation in line search
+    def _combined_fn(theta: torch.Tensor) -> tuple[torch.Tensor, float]:
+        theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
+        return model.residual_and_neg_log_likelihood(theta_safe)
 
     best_result: Optional[SolverResult] = None
     best_err = float("inf")
@@ -350,7 +354,9 @@ def _lbfgs_multistart(
         iter_per_start = max(30, max_iter // n_starts)
         result = solve_lbfgs(
             res_fn, t0, tol=tol, m=20, max_iter=iter_per_start,
-            neg_loglik_fn=nll_fn, theta_bounds=(_ETA_MIN, _ETA_MAX),
+            theta_bounds=(_ETA_MIN, _ETA_MAX),
+            residual_and_nll_fn=_combined_fn,
+            stagnation_window=20,
         )
         total_iters += result.iterations
         combined_ram = max(combined_ram, result.peak_ram_bytes)
@@ -418,8 +424,15 @@ def _make_solvers(
         residual_s = max(3e-4, (N / 1_000) ** 2 * 15e-3)
 
     # Budget for methods that are expected to converge: full timeout
-    # timeout=0 means "no limit" → use a large fixed budget (10 000 iters)
-    full_budget_s = timeout if timeout > 0 else 1e9
+    # timeout=0 means "no hard wall-clock limit" — use practical caps to avoid
+    # spending hours on non-converging methods.
+    if timeout > 0:
+        full_budget_s = timeout
+    else:
+        # No timeout: use a generous but finite per-method wall-time budget
+        # scaled to the cost per residual evaluation.
+        # Target: ~5 min per method at any scale.
+        full_budget_s = 300.0
 
     # Plain FP-GS/Jacobi: give them 20% of the timeout budget so we can
     # measure convergence rate, not just report "didn't converge in 1 s".
@@ -428,26 +441,30 @@ def _make_solvers(
     # convergence behaviour without wasting time on hopeless cases.
     MAX_FP_PLAIN_ITER: int = max(50, min(500, int(plain_budget_s / residual_s)))
 
-    # Anderson-accelerated FP: full timeout budget, capped at 500 iterations
-    # for large N where each residual evaluation is expensive (O(N²) cost).
-    # At N=10k with ~1.5s/eval, 500 iterations ≈ 750s per init attempt — generous.
+    # Anderson-accelerated FP: full timeout budget, capped at reasonable values.
+    # Stagnation detection in the solver will stop non-converging runs early.
     if N > 5_000:
         max_anderson_cap = 500
+    elif N >= 1_000:
+        max_anderson_cap = 1_000
     else:
-        max_anderson_cap = 10_000
+        max_anderson_cap = 5_000
     MAX_FP_ANDERSON_ITER: int = max(100, min(max_anderson_cap, int(full_budget_s / residual_s)))
 
     # L-BFGS: each iter costs ~3-5 residuals (gradient + line search)
-    # Cap at 200 iterations for large N (200 × 5 evals × 1.5s ≈ 1500s)
     if N > 5_000:
         max_lbfgs_cap = 200
+    elif N >= 1_000:
+        max_lbfgs_cap = 500
     else:
-        max_lbfgs_cap = 5_000
+        max_lbfgs_cap = 2_000
     MAX_LBFGS_ITER: int = max(50, min(max_lbfgs_cap, int(full_budget_s / (5 * residual_s))))
 
     # Diagonal LM: cap at 500 iterations for large N
     if N > 5_000:
         max_lm_cap = 100
+    elif N >= 1_000:
+        max_lm_cap = 500
     else:
         max_lm_cap = 2_000
     MAX_LM_ITER: int = max(50, min(max_lm_cap, int(full_budget_s / (3 * residual_s))))
@@ -493,6 +510,18 @@ def _make_solvers(
     # Budget is divided equally among 4 inits so all get a chance within timeout.
     _N_ANDERSON_INITS = 4
     _ITER_PER_ANDERSON_INIT = max(50, MAX_FP_ANDERSON_ITER // _N_ANDERSON_INITS)
+    # Per-init wall-clock limit: prevents non-converging inits from burning time.
+    # For N > 2000 in --fast mode, blowup recovery can take ~50 iterations
+    # (~40s at N=5000), so the old 15s cap was insufficient.  Use the full
+    # per-init share of the budget; warm starts (below) ensure later inits
+    # build on the best θ found rather than restarting from scratch.
+    if fast:
+        if N <= 2_000:
+            _TIME_PER_INIT: float = min(15.0, full_budget_s / _N_ANDERSON_INITS)
+        else:
+            _TIME_PER_INIT = full_budget_s / _N_ANDERSON_INITS
+    else:
+        _TIME_PER_INIT = min(60.0, full_budget_s / _N_ANDERSON_INITS)
 
     def _fp_anderson_multistart() -> SolverResult:
         import time as _t
@@ -507,10 +536,18 @@ def _make_solvers(
         peak_ram = 0
         t0_wall = _t.perf_counter()
         for t0_cand in inits:
+            # Warm start: after the first init, begin from the best θ found so
+            # far rather than a fresh initialisation.  This lets each successive
+            # init continue convergence from where the previous one left off,
+            # which is critical when a single init cannot finish within
+            # _TIME_PER_INIT (e.g. after an Anderson-blowup recovery at N=5k).
+            if best is not None and not best.converged:
+                t0_cand = torch.tensor(best.theta, dtype=torch.float64)
             r = solve_fixed_point_dwcm(
                 res_fn, t0_cand, model.s_out, model.s_in,
                 tol=tol, damping=1.0, variant="gauss-seidel",
                 max_iter=_ITER_PER_ANDERSON_INIT, anderson_depth=10,
+                max_time=_TIME_PER_INIT,
             )
             total_iters += r.iterations
             peak_ram = max(peak_ram, r.peak_ram_bytes)
@@ -552,10 +589,14 @@ def _make_solvers(
         peak_ram = 0
         t0_wall = _t.perf_counter()
         for t0_cand in inits:
+            # Warm start: same rationale as _fp_anderson_multistart above.
+            if best is not None and not best.converged:
+                t0_cand = torch.tensor(best.theta, dtype=torch.float64)
             r = solve_fixed_point_dwcm(
                 res_fn, t0_cand, model.s_out, model.s_in,
                 tol=tol, variant="theta-newton",
                 max_iter=_ITER_PER_TN_INIT, anderson_depth=10, max_step=1.0,
+                max_time=_TIME_PER_INIT,
             )
             total_iters += r.iterations
             peak_ram = max(peak_ram, r.peak_ram_bytes)
@@ -593,7 +634,10 @@ def _make_solvers(
     # At large N each gradient evaluation costs O(N²) = ~1.5s at N=10k.
     # With 5 evals/iter, a 300s timeout allows only ~40 L-BFGS steps — often
     # insufficient.  Skip for N > LBFGS_N_MAX and rely on Anderson FP instead.
-    if N <= LBFGS_N_MAX:
+    # In --fast mode, skip L-BFGS for N >= 1000: FP methods converge in seconds,
+    # while L-BFGS takes 5+ minutes due to expensive line-search evaluations.
+    _skip_lbfgs = N > LBFGS_N_MAX or (fast and N >= 1000)
+    if not _skip_lbfgs:
         solvers.append((
             "L-BFGS (multi-start)",
             lambda: _lbfgs_multistart(model, theta0, tol=tol,
@@ -712,7 +756,10 @@ def _run_single_network(
     Returns:
         Dict mapping solver name → result dict, or None if the network is invalid.
     """
+    #t_start = time.perf_counter()
     k, s = k_s_generator_pl(N, rho=DEFAULT_RHO, seed=seed)
+    #elapsed = time.perf_counter() - t_start
+    #print(f'k_s_generator_pl, elapsed={elapsed:.2f} s')
     s_out = s[:N].numpy().astype(float)
     s_in = s[N:].numpy().astype(float)
 
@@ -984,6 +1031,7 @@ def run_scaling_comparison(
     tol: float = DEFAULT_TOL,
     timeout: float = SOLVER_TIMEOUT,
     start_seed: int = 0,
+    fast: bool = False,
 ) -> None:
     """Run multi-seed DWCM comparison for each size in *sizes*.
 
@@ -995,6 +1043,7 @@ def run_scaling_comparison(
         tol:        Convergence tolerance.
         timeout:    Per-solver time limit in seconds.
         start_seed: Base random seed.
+        fast:       If True, skip plain FP/Jacobi and LM; only Anderson and L-BFGS.
     """
     all_agg: dict[int, dict[str, dict]] = {}
     all_bad: dict[int, list[int]] = {}
@@ -1002,7 +1051,7 @@ def run_scaling_comparison(
     for N in sizes:
         agg, bad = run_multi_seed_comparison(
             N=N, n_seeds=n_seeds, tol=tol, timeout=timeout,
-            start_seed=start_seed, verbose=True,
+            start_seed=start_seed, verbose=True, fast=fast,
         )
         all_agg[N] = agg
         all_bad[N] = bad
@@ -1121,7 +1170,7 @@ if __name__ == "__main__":
         )
         # Save bad seeds to file for diagnostic follow-up
         bad_seeds_path = "bad_seeds_phase4.txt"
-        with open(bad_seeds_path, "a") as _f:
+        with open(bad_seeds_path, "a</28>") as _f:
             #_f.write(f"# Phase4 bad seeds (N={_phase4_N}, start_seed={effective_start_seed})\n")
             for _s in bad_seeds:
                 _f.write(f"{_s}\n")
@@ -1137,6 +1186,7 @@ if __name__ == "__main__":
             tol=args.tol,
             timeout=args.timeout,
             start_seed=effective_start_seed,
+            fast=args.fast,
         )
     elif args.seed is not None:
         # Single-network mode

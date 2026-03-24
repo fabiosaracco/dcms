@@ -41,6 +41,7 @@ instead row chunks of size ``_DEFAULT_CHUNK`` are used.
 from __future__ import annotations
 
 import math
+import math
 import time
 import tracemalloc
 from typing import Callable
@@ -52,8 +53,18 @@ from src.solvers.base import SolverResult
 
 _ANDERSON_MAX_NORM: float = 1e6
 
-_ANDERSON_BLOWUP_FACTOR: float = 5.0
+# Allow the residual to grow transiently large while the θ-Newton solver
+# navigates the near-singular region (z → 0⁺, G → ∞).  The line-search in
+# _theta_newton_step_chunked keeps z ≥ _Z_G_CLAMP after each step; once
+# z ≈ 0 the solver self-recovers in O(log(z*/z_0)) steps; only true
+# NaN/Inf blowups should trigger a reset.
+_ANDERSON_BLOWUP_FACTOR: float = 1e8
 _Q_MAX: float = 0.9999  # maximum allowed product β_out * β_in
+
+# Minimum z_ij = θ_β_out_i + θ_β_in_j used in G_ij = 1/expm1(z_safe).
+# Caps G at ~1e8 to avoid division by zero; the line-search (not a hard
+# floor) ensures z stays above this in practice.
+_Z_G_CLAMP: float = 1e-8
 _ANDERSON_THETA_FLOOR: float = 0.1
 _FP_NEWTON_FALLBACK_DELTA: float = 0.1
 _FPGS_NEWTON_RESET_WINDOW: int = 30
@@ -447,10 +458,18 @@ def _theta_newton_step_chunked(
     theta_b_out = theta_weight[:N]
     theta_b_in = theta_weight[N:]
 
-    # First pass: compute out-Newton steps and accumulate F_in at original theta
+    # Pass 1 – Jacobi: compute F_out, H_out (row sums) AND F_in, H_in (col sums)
+    # at the *same* theta_weight.  Updates are applied simultaneously, eliminating
+    # the GS second-pass blowup.
     sum_PG_out = torch.zeros(N, dtype=torch.float64)
     sum_PGG1_out = torch.zeros(N, dtype=torch.float64)
-    sum_PG_in_orig = torch.zeros(N, dtype=torch.float64)
+    sum_PG_in = torch.zeros(N, dtype=torch.float64)
+    sum_PGG1_in = torch.zeros(N, dtype=torch.float64)
+
+    # sig_log_thresh: p_ij > sig_thresh  ⟺  θ_out_i + θ_in_j < sig_log_thresh
+    # Used in pass 2 to identify significant pairs cheaply (no sigmoid).
+    sig_thresh = 0.5 / max(N - 1, 1)
+    sig_log_thresh: float = math.log((1.0 - sig_thresh) / sig_thresh)
 
     for i_start in range(0, N, chunk_size):
         i_end = min(i_start + chunk_size, N)
@@ -463,7 +482,7 @@ def _theta_newton_step_chunked(
         p_chunk = torch.sigmoid(log_xy)  # (chunk, N)
 
         z_chunk = theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
-        z_safe = z_chunk.clamp(min=1e-8)
+        z_safe = z_chunk.clamp(min=_Z_G_CLAMP)  # G ≤ 1/expm1(1e-8) ≈ 1e8
         G_chunk = 1.0 / torch.expm1(z_safe)  # (chunk, N)
 
         local_i = torch.arange(chunk_len, dtype=torch.long)
@@ -473,55 +492,64 @@ def _theta_newton_step_chunked(
         PG_chunk = p_chunk * G_chunk
         PGG1_chunk = p_chunk * G_chunk * (1.0 + G_chunk)
 
-        sum_PG_out[i_start:i_end] = PG_chunk.sum(dim=1)
-        sum_PGG1_out[i_start:i_end] = PGG1_chunk.sum(dim=1)
-        # Column sums give F_in at original theta (free from same PG_chunk)
-        sum_PG_in_orig += PG_chunk.sum(dim=0)
+        sum_PG_out[i_start:i_end] = PG_chunk.sum(dim=1)     # row sums → F_out
+        sum_PGG1_out[i_start:i_end] = PGG1_chunk.sum(dim=1) # row sums → H_out
+        sum_PG_in += PG_chunk.sum(dim=0)                     # col sums → F_in
+        sum_PGG1_in += PGG1_chunk.sum(dim=0)                 # col sums → H_in
 
     F_out = sum_PG_out - s_out
-    F_in_current = sum_PG_in_orig - s_in
-    F_current = torch.cat([F_out, F_in_current])
+    F_in = sum_PG_in - s_in
+    F_current = torch.cat([F_out, F_in])
 
+    # Unclamped (by z) Newton deltas — only max_step limits the magnitude.
     neg_H_out = sum_PGG1_out.clamp(min=1e-15)
     delta_out = (F_out / neg_H_out).clamp(-max_step, max_step)
+
+    neg_H_in = sum_PGG1_in.clamp(min=1e-15)
+    delta_in = (F_in / neg_H_in).clamp(-max_step, max_step)
+
+    # Pass 2 – exact O(N²) asymmetric line-search.
+    # For every significant pair (i,j) where z_ij > _Z_G_CLAMP and the combined
+    # step delta_out_i + delta_in_j < 0, find the maximum alpha ∈ (0,1] such that
+    #   z_ij + alpha*(delta_out_i + delta_in_j) ≥ _Z_G_CLAMP
+    # Then scale only the *negative* delta components by alpha_min, so that
+    # well-behaved nodes (positive delta) keep their full Newton step.
+    # Significance is detected via θ_out+θ_in < sig_log_thresh (no sigmoid).
+    alpha_min = 1.0
+    for i_start in range(0, N, chunk_size):
+        i_end = min(i_start + chunk_size, N)
+        chunk_len = i_end - i_start
+
+        # Fast significance mask: p_ij > sig_thresh ⟺ θ_out_i+θ_in_j < sig_log_thresh
+        theta_sum = theta_topo_out[i_start:i_end, None] + theta_topo_in[None, :]
+        sig_mask = theta_sum < sig_log_thresh  # (chunk, N)
+        local_i = torch.arange(chunk_len, dtype=torch.long)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+        sig_mask[local_i, global_j] = False  # zero diagonal
+
+        z_chunk = theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
+        combined = delta_out[i_start:i_end, None] + delta_in[None, :]
+        active = sig_mask & (z_chunk > _Z_G_CLAMP) & (combined < 0.0)
+
+        if active.any():
+            alpha_chunk = torch.where(
+                active,
+                (z_chunk - _Z_G_CLAMP) / (-combined).clamp(min=1e-300),
+                torch.full_like(z_chunk, float("inf")),
+            )
+            chunk_min = alpha_chunk.min().item()
+            if chunk_min < alpha_min:
+                alpha_min = chunk_min
+
+    if alpha_min < 1.0:
+        delta_out = torch.where(delta_out < 0.0, delta_out * alpha_min, delta_out)
+        delta_in  = torch.where(delta_in  < 0.0, delta_in  * alpha_min, delta_in)
+
     theta_b_out_new = (theta_b_out + delta_out).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_out_new = torch.where(
         s_out == 0, torch.full_like(theta_b_out_new, _ETA_MAX), theta_b_out_new
     )
 
-    # Second pass: compute in-Newton steps (with updated θ_β_out)
-    sum_PG_in = torch.zeros(N, dtype=torch.float64)
-    sum_PGG1_in = torch.zeros(N, dtype=torch.float64)
-
-    for j_start in range(0, N, chunk_size):
-        j_end = min(j_start + chunk_size, N)
-        chunk_len = j_end - j_start
-
-        # p[j, i] for j in chunk, all i
-        log_xy = (
-            -theta_topo_out[j_start:j_end, None]
-            - theta_topo_in[None, :]
-        )
-        p_chunk = torch.sigmoid(log_xy)  # (chunk, N): p[j, i]
-
-        z_chunk = theta_b_out_new[j_start:j_end, None] + theta_b_in[None, :]
-        z_safe = z_chunk.clamp(min=1e-8)
-        G_chunk = 1.0 / torch.expm1(z_safe)  # G[j, i]
-
-        local_j = torch.arange(chunk_len, dtype=torch.long)
-        global_i = torch.arange(j_start, j_end, dtype=torch.long)
-        G_chunk[local_j, global_i] = 0.0
-
-        PG_chunk = p_chunk * G_chunk        # p[j,i] G[j,i]
-        PGG1_chunk = p_chunk * G_chunk * (1.0 + G_chunk)
-
-        # s_in[i] = Σ_j p[j,i] G[j,i]; column sums
-        sum_PG_in += PG_chunk.sum(dim=0)
-        sum_PGG1_in += PGG1_chunk.sum(dim=0)
-
-    F_in = sum_PG_in - s_in
-    neg_H_in = sum_PGG1_in.clamp(min=1e-15)
-    delta_in = (F_in / neg_H_in).clamp(-max_step, max_step)
     theta_b_in_new = (theta_b_in + delta_in).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_in_new = torch.where(
         s_in == 0, torch.full_like(theta_b_in_new, _ETA_MAX), theta_b_in_new
@@ -608,7 +636,7 @@ def solve_fixed_point_daecm(
         theta = theta0.clone().to(dtype=torch.float64)
 
     N = s_out.shape[0]
-    theta = theta.clamp(_ETA_MIN, _ETA_MAX)
+    theta = theta.clamp(-_ETA_MAX, _ETA_MAX)  # allow β>1 (negative θ)
 
     # Decide chunked vs dense
     if chunk_size == 0:

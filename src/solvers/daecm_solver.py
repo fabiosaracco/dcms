@@ -29,6 +29,7 @@ from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
 from src.solvers.fixed_point import solve_fixed_point
 from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from src.solvers.quasi_newton import solve_lbfgs
 from src.solvers.newton import solve_newton
 from src.solvers.broyden import solve_broyden
@@ -255,8 +256,12 @@ def solve_daecm(
                           Defaults to ``model.initial_theta_topo("degrees")``.
         theta_weight0:    Initial weight guess, shape (2N,).
                           Defaults to ``model.initial_theta_weight(theta_topo0)``.
-        topo_method:      Topology solver: ``"fp-gs"``, ``"lbfgs"``,
+        topo_method:      Topology solver: ``"fp-gs"``, ``"fp-gs-anderson"``,
+                          ``"theta-newton-anderson"``, ``"lbfgs"``,
                           ``"newton"``, ``"broyden"``, ``"lm"``.
+                          ``"fp-gs-anderson"`` and ``"theta-newton-anderson"``
+                          use :func:`solve_fixed_point_dcm` with Anderson(10)
+                          acceleration and are recommended for N ≥ 1,000.
         weight_method:    Weight solver: ``"fp-gs"``, ``"fp-gs-anderson"``,
                           ``"theta-newton"``, ``"theta-newton-anderson"``,
                           ``"lbfgs"``, ``"newton"``, ``"broyden"``, ``"lm"``,
@@ -308,6 +313,20 @@ def solve_daecm(
                 dcm.k_out, dcm.k_in,
                 tol=tol, max_iter=topo_max_iter,
                 damping=1.0, variant="gauss-seidel",
+            )
+        elif topo_method == "fp-gs-anderson":
+            r = solve_fixed_point_dcm(
+                dcm.residual, t0_topo,
+                k_out=dcm.k_out, k_in=dcm.k_in,
+                tol=tol, max_iter=topo_max_iter,
+                variant="gauss-seidel", anderson_depth=10,
+            )
+        elif topo_method == "theta-newton-anderson":
+            r = solve_fixed_point_dcm(
+                dcm.residual, t0_topo,
+                k_out=dcm.k_out, k_in=dcm.k_in,
+                tol=tol, max_iter=topo_max_iter,
+                variant="theta-newton", anderson_depth=10,
             )
         elif topo_method == "lbfgs":
             r = solve_lbfgs(

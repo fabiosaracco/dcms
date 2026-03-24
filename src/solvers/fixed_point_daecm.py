@@ -21,8 +21,11 @@ Two variants are implemented:
 
   where D_in_i = Σ_{j≠i} p_ji · β_out_j / (1 − β_out_j · β_in_i).
 
-* **θ-Newton** — θ-space coordinate Newton steps (analogous to the DWCM
-  θ-Newton variant).  For each node i:
+* **θ-Newton** — θ-space Gauss-Seidel Newton steps (analogous to the DWCM
+  θ-Newton variant).  Out-multipliers are updated first (pass 1), then
+  in-multipliers are updated using the fresh θ_β_out values (pass 2).
+
+  For each node i in pass 1:
 
       Δθ_β_out_i = −F_out_i / F′_out_i
 
@@ -31,6 +34,7 @@ Two variants are implemented:
       F′_out_i = −Σ_{j≠i} p_ij · G_ij · (1 + G_ij)
       G_ij     = 1 / expm1(θ_β_out_i + θ_β_in_j)
 
+  Pass 2 mirrors this for the in-multipliers using the updated θ_β_out.
   The per-node step is clipped to ``[−max_step, +max_step]``.
 
 **Anderson acceleration** is available for all variants (depth 0 = plain FP).
@@ -40,7 +44,6 @@ instead row chunks of size ``_DEFAULT_CHUNK`` are used.
 """
 from __future__ import annotations
 
-import math
 import math
 import time
 import tracemalloc
@@ -54,17 +57,33 @@ from src.solvers.base import SolverResult
 _ANDERSON_MAX_NORM: float = 1e6
 
 # Allow the residual to grow transiently large while the θ-Newton solver
-# navigates the near-singular region (z → 0⁺, G → ∞).  The line-search in
-# _theta_newton_step_chunked keeps z ≥ _Z_G_CLAMP after each step; once
-# z ≈ 0 the solver self-recovers in O(log(z*/z_0)) steps; only true
-# NaN/Inf blowups should trigger a reset.
-_ANDERSON_BLOWUP_FACTOR: float = 1e8
+# navigates the near-singular region (z → 0⁺, G → ∞).  The per-node alpha
+# line-search in _theta_newton_step_chunked keeps z ≥ max(z_prev * _Z_NEWTON_FRAC,
+# _Z_NEWTON_FLOOR) after each GS step; the Anderson feasibility guard projects any
+# infeasible mix back to z ≥ floor while keeping history intact for acceleration.
+_ANDERSON_BLOWUP_FACTOR: float = 5000.0  # clear Anderson history if F > 5000 × best
 _Q_MAX: float = 0.9999  # maximum allowed product β_out * β_in
 
 # Minimum z_ij = θ_β_out_i + θ_β_in_j used in G_ij = 1/expm1(z_safe).
-# Caps G at ~1e8 to avoid division by zero; the line-search (not a hard
-# floor) ensures z stays above this in practice.
+# Must be small enough that G(z_clamp) >> s/k for hub nodes (which need
+# large G ≈ s/k ≈ 30–100).  With z_clamp=1e-8, G_max ≈ 10^8, and for
+# a hub-hub pair with p ≈ 1e-5: p * G_max ≈ 1000 >> s_out ≈ 213.
+# This ensures F > 0 at z_clamp, giving delta > 0 so hub nodes always
+# self-escape the z = z_clamp boundary state via the doubling mechanism.
 _Z_G_CLAMP: float = 1e-8
+# Per-node line-search: two constraints keep the Newton step well-behaved.
+#
+# 1) Hard floor (_Z_NEWTON_FLOOR = _Z_G_CLAMP = 1e-8): z never drops below the
+#    clamped region.  At z = z_clamp the doubling mechanism applies (delta ≈ z)
+#    so z doubles each GS step, recovering to z* in ~22 iterations.
+#
+# 2) Relative step limit (_Z_NEWTON_FRAC = 0.5): z may decrease by at most
+#    50 % per step.  Without this limit, a negative Newton step can jump z from
+#    2·z* all the way to z_clamp in a single step, triggering a new blowup.
+#    With the limit: z halves each step from above z*, converging to z* in
+#    log₂(z_initial / z*) steps without ever touching z_clamp.
+_Z_NEWTON_FLOOR: float = _Z_G_CLAMP  # = 1e-8; hard floor (enables doubling)
+_Z_NEWTON_FRAC: float = 0.5          # relative floor; z_new >= z_old * 0.5
 _ANDERSON_THETA_FLOOR: float = 0.1
 _FP_NEWTON_FALLBACK_DELTA: float = 0.1
 _FPGS_NEWTON_RESET_WINDOW: int = 30
@@ -383,7 +402,7 @@ def _theta_newton_step_dense(
     theta_b_in = theta_weight[N:]
 
     z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
-    z_safe = z.clamp(min=1e-8)
+    z_safe = z.clamp(min=_Z_G_CLAMP)
     G = 1.0 / torch.expm1(z_safe)   # G_ij = β_β / (1-β_β), diagonal irrelevant
     G.fill_diagonal_(0.0)
 
@@ -408,7 +427,7 @@ def _theta_newton_step_dense(
 
     # Recompute G with updated θ_β_out (Gauss-Seidel: use fresh θ_β_out)
     z2 = theta_b_out_new[:, None] + theta_b_in[None, :]
-    z2_safe = z2.clamp(min=1e-8)
+    z2_safe = z2.clamp(min=_Z_G_CLAMP)
     G2 = 1.0 / torch.expm1(z2_safe)
     G2.fill_diagonal_(0.0)
 
@@ -438,7 +457,38 @@ def _theta_newton_step_chunked(
     chunk_size: int,
     max_step: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked θ-space coordinate Newton step for the DaECM weight equations.
+    """Chunked θ-space Gauss-Seidel Newton step for DaECM weight equations.
+
+    Two passes over the (N, N) product matrix, mirroring the DWCM chunked
+    Newton step:
+
+    * **Pass 1** — row sums (F_out, neg_H_out) and column sums for the
+      current-state residual (F_in_current).  Accumulates z_min_out[i] =
+      min over significant j of z_ij = θ_β_out_i + θ_β_in_j.
+      Applies **out-direction** Newton step with a per-pass z-floor
+      line-search (z_LS = 0) that prevents any significant pair from
+      having z_ij go negative.
+    * **Pass 2** — column sums using the updated θ_β_out_new (Gauss-Seidel:
+      in-direction sees the fresh out-multipliers).  Accumulates z_min_in[j]
+      and applies the **in-direction** step with the same z-floor line-search.
+
+    **Why two separate line-searches (not one combined)**:
+    In GS mode the two directions are applied sequentially.  A combined
+    (Jacobi) line-search would be unnecessarily conservative for the first
+    direction (would account for δ_in that hasn't been applied yet).  Using
+    per-pass line-searches gives the largest safe step for each direction
+    independently.
+
+    **Why z_LS = 0 (not _Z_G_CLAMP)**:
+    Using z_LS = _Z_G_CLAMP caused stagnation: once z hit exactly the clamp
+    value, available = z − _Z_G_CLAMP = 0 → alpha_cand = 0 → zero step.
+    With z_LS = 0 the available space is z itself, which is always positive
+    until the physical boundary z = 0 is hit.  The G-computation clamp
+    (_Z_G_CLAMP) remains separate and only caps G numerically.
+
+    **z_min is computed over significant pairs only** (p_ij > 0.5/N), so
+    disconnected-pair columns/rows with extreme θ_β values do not force
+    alpha to near-zero unnecessarily.
 
     Args:
         theta_weight:   Current weight parameters [θ_β_out | θ_β_in], shape (2N,).
@@ -451,25 +501,24 @@ def _theta_newton_step_chunked(
 
     Returns:
         Tuple of (updated weight parameters, residual F(θ_current)).
-        The residual is evaluated at the *input* theta_weight (before update).
+        F is evaluated at the *input* theta_weight (before update).
         Shape: ((2N,), (2N,)).
     """
     N = s_out.shape[0]
     theta_b_out = theta_weight[:N]
     theta_b_in = theta_weight[N:]
 
-    # Pass 1 – Jacobi: compute F_out, H_out (row sums) AND F_in, H_in (col sums)
-    # at the *same* theta_weight.  Updates are applied simultaneously, eliminating
-    # the GS second-pass blowup.
+    sig_log_thresh: float = math.log(0.5 / N) - math.log(1.0 - 0.5 / N)
+
+    # ------------------------------------------------------------------
+    # Pass 1: out-direction Newton step
+    # Accumulate row sums (F_out, neg_H_out), col sums for F_current,
+    # and z_min_out[i] = min over significant j of z_ij (for line-search).
+    # ------------------------------------------------------------------
     sum_PG_out = torch.zeros(N, dtype=torch.float64)
     sum_PGG1_out = torch.zeros(N, dtype=torch.float64)
-    sum_PG_in = torch.zeros(N, dtype=torch.float64)
-    sum_PGG1_in = torch.zeros(N, dtype=torch.float64)
-
-    # sig_log_thresh: p_ij > sig_thresh  ⟺  θ_out_i + θ_in_j < sig_log_thresh
-    # Used in pass 2 to identify significant pairs cheaply (no sigmoid).
-    sig_thresh = 0.5 / max(N - 1, 1)
-    sig_log_thresh: float = math.log((1.0 - sig_thresh) / sig_thresh)
+    sum_PG_in_current = torch.zeros(N, dtype=torch.float64)
+    z_min_out = torch.full((N,), float("inf"), dtype=torch.float64)
 
     for i_start in range(0, N, chunk_size):
         i_end = min(i_start + chunk_size, N)
@@ -480,77 +529,107 @@ def _theta_newton_step_chunked(
             - theta_topo_in[None, :]
         )
         p_chunk = torch.sigmoid(log_xy)  # (chunk, N)
+        sig_mask = log_xy > sig_log_thresh  # p > 0.5/N
 
         z_chunk = theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
-        z_safe = z_chunk.clamp(min=_Z_G_CLAMP)  # G ≤ 1/expm1(1e-8) ≈ 1e8
-        G_chunk = 1.0 / torch.expm1(z_safe)  # (chunk, N)
+        z_safe = z_chunk.clamp(min=_Z_G_CLAMP)
+        G_chunk = 1.0 / torch.expm1(z_safe)
 
         local_i = torch.arange(chunk_len, dtype=torch.long)
         global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        G_chunk[local_i, global_j] = 0.0
+        G_chunk[local_i, global_j] = 0.0  # zero diagonal
 
         PG_chunk = p_chunk * G_chunk
-        PGG1_chunk = p_chunk * G_chunk * (1.0 + G_chunk)
+        PGG1_chunk = PG_chunk * (1.0 + G_chunk)
 
-        sum_PG_out[i_start:i_end] = PG_chunk.sum(dim=1)     # row sums → F_out
-        sum_PGG1_out[i_start:i_end] = PGG1_chunk.sum(dim=1) # row sums → H_out
-        sum_PG_in += PG_chunk.sum(dim=0)                     # col sums → F_in
-        sum_PGG1_in += PGG1_chunk.sum(dim=0)                 # col sums → H_in
+        sum_PG_out[i_start:i_end] = PG_chunk.sum(dim=1)
+        sum_PGG1_out[i_start:i_end] = PGG1_chunk.sum(dim=1)
+        sum_PG_in_current += PG_chunk.sum(dim=0)
+
+        # z_min_out[i]: min over significant j of (theta_b_out_i + theta_b_in_j)
+        z_sig = torch.where(sig_mask, z_chunk, torch.full_like(z_chunk, float("inf")))
+        z_min_out[i_start:i_end] = torch.minimum(
+            z_min_out[i_start:i_end], z_sig.min(dim=1).values
+        )
 
     F_out = sum_PG_out - s_out
-    F_in = sum_PG_in - s_in
-    F_current = torch.cat([F_out, F_in])
+    F_in_current = sum_PG_in_current - s_in
+    F_current = torch.cat([F_out, F_in_current])
 
-    # Unclamped (by z) Newton deltas — only max_step limits the magnitude.
     neg_H_out = sum_PGG1_out.clamp(min=1e-15)
     delta_out = (F_out / neg_H_out).clamp(-max_step, max_step)
 
-    neg_H_in = sum_PGG1_in.clamp(min=1e-15)
-    delta_in = (F_in / neg_H_in).clamp(-max_step, max_step)
+    # Per-node z-floor line-search for out-direction.
+    # Effective floor = max(z_min * _Z_NEWTON_FRAC, _Z_NEWTON_FLOOR).
+    # The relative term prevents z from jumping more than 50 % downward in one
+    # step (stops oscillation between z* and z_clamp); the hard floor enables
+    # the doubling self-escape at z = z_clamp.
+    z_floor_out = torch.clamp(z_min_out * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
+    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
+    needed_out = delta_out.abs().clamp(min=1e-30)
+    alpha_out = torch.where(
+        delta_out < 0,
+        (available_out / needed_out).clamp(max=1.0),
+        torch.ones(N, dtype=torch.float64),
+    )
 
-    # Pass 2 – exact O(N²) asymmetric line-search.
-    # For every significant pair (i,j) where z_ij > _Z_G_CLAMP and the combined
-    # step delta_out_i + delta_in_j < 0, find the maximum alpha ∈ (0,1] such that
-    #   z_ij + alpha*(delta_out_i + delta_in_j) ≥ _Z_G_CLAMP
-    # Then scale only the *negative* delta components by alpha_min, so that
-    # well-behaved nodes (positive delta) keep their full Newton step.
-    # Significance is detected via θ_out+θ_in < sig_log_thresh (no sigmoid).
-    alpha_min = 1.0
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-
-        # Fast significance mask: p_ij > sig_thresh ⟺ θ_out_i+θ_in_j < sig_log_thresh
-        theta_sum = theta_topo_out[i_start:i_end, None] + theta_topo_in[None, :]
-        sig_mask = theta_sum < sig_log_thresh  # (chunk, N)
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        sig_mask[local_i, global_j] = False  # zero diagonal
-
-        z_chunk = theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
-        combined = delta_out[i_start:i_end, None] + delta_in[None, :]
-        active = sig_mask & (z_chunk > _Z_G_CLAMP) & (combined < 0.0)
-
-        if active.any():
-            alpha_chunk = torch.where(
-                active,
-                (z_chunk - _Z_G_CLAMP) / (-combined).clamp(min=1e-300),
-                torch.full_like(z_chunk, float("inf")),
-            )
-            chunk_min = alpha_chunk.min().item()
-            if chunk_min < alpha_min:
-                alpha_min = chunk_min
-
-    if alpha_min < 1.0:
-        delta_out = torch.where(delta_out < 0.0, delta_out * alpha_min, delta_out)
-        delta_in  = torch.where(delta_in  < 0.0, delta_in  * alpha_min, delta_in)
-
-    theta_b_out_new = (theta_b_out + delta_out).clamp(-_ETA_MAX, _ETA_MAX)
+    theta_b_out_new = (theta_b_out + alpha_out * delta_out).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_out_new = torch.where(
         s_out == 0, torch.full_like(theta_b_out_new, _ETA_MAX), theta_b_out_new
     )
 
-    theta_b_in_new = (theta_b_in + delta_in).clamp(-_ETA_MAX, _ETA_MAX)
+    # ------------------------------------------------------------------
+    # Pass 2: in-direction Newton step (GS: uses theta_b_out_new).
+    # Accumulate col sums (F_in, neg_H_in) and z_min_in[j] for line-search.
+    # ------------------------------------------------------------------
+    sum_PG_in = torch.zeros(N, dtype=torch.float64)
+    sum_PGG1_in = torch.zeros(N, dtype=torch.float64)
+    z_min_in = torch.full((N,), float("inf"), dtype=torch.float64)
+
+    for i_start in range(0, N, chunk_size):
+        i_end = min(i_start + chunk_size, N)
+        chunk_len = i_end - i_start
+
+        log_xy = (
+            -theta_topo_out[i_start:i_end, None]
+            - theta_topo_in[None, :]
+        )
+        p_chunk = torch.sigmoid(log_xy)  # (chunk, N)
+        sig_mask = log_xy > sig_log_thresh
+
+        z2_chunk = theta_b_out_new[i_start:i_end, None] + theta_b_in[None, :]
+        z2_safe = z2_chunk.clamp(min=_Z_G_CLAMP)
+        G2_chunk = 1.0 / torch.expm1(z2_safe)
+
+        local_i = torch.arange(chunk_len, dtype=torch.long)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+        G2_chunk[local_i, global_j] = 0.0  # zero diagonal
+
+        PG2_chunk = p_chunk * G2_chunk
+        PGG12_chunk = PG2_chunk * (1.0 + G2_chunk)
+
+        sum_PG_in += PG2_chunk.sum(dim=0)    # col sums
+        sum_PGG1_in += PGG12_chunk.sum(dim=0)
+
+        # z_min_in[j]: min over significant i of (theta_b_out_new_i + theta_b_in_j)
+        z2_sig = torch.where(sig_mask, z2_chunk, torch.full_like(z2_chunk, float("inf")))
+        z_min_in = torch.minimum(z_min_in, z2_sig.min(dim=0).values)
+
+    F_in = sum_PG_in - s_in
+    neg_H_in = sum_PGG1_in.clamp(min=1e-15)
+    delta_in = (F_in / neg_H_in).clamp(-max_step, max_step)
+
+    # Per-node z-floor line-search for in-direction (same two-floor logic).
+    z_floor_in = torch.clamp(z_min_in * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
+    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
+    needed_in = delta_in.abs().clamp(min=1e-30)
+    alpha_in = torch.where(
+        delta_in < 0,
+        (available_in / needed_in).clamp(max=1.0),
+        torch.ones(N, dtype=torch.float64),
+    )
+
+    theta_b_in_new = (theta_b_in + alpha_in * delta_in).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_in_new = torch.where(
         s_in == 0, torch.full_like(theta_b_in_new, _ETA_MAX), theta_b_in_new
     )
@@ -812,8 +891,12 @@ def solve_fixed_point_daecm(
 
             # --- Apply Anderson acceleration or plain update ---
             if anderson_depth > 1:
-                # Blowup guard: clear history and reset to best_theta when
-                # the residual jumps catastrophically above the best seen.
+                # Blowup guard: when res_norm jumps > 100 × best_seen, Anderson
+                # history contains "blowup-phase" iterates that poison future
+                # mixes.  Clear the history but DO NOT revert to best_theta —
+                # instead continue from theta_fp (the current GS output) so the
+                # doubling recovery keeps advancing.  The next iteration starts
+                # with an empty history and pure-GS behaviour.
                 _blowup_recovered = False
                 if (
                     len(_and_g) >= 2
@@ -822,14 +905,13 @@ def solve_fixed_point_daecm(
                 ):
                     _and_g.clear()
                     _and_r.clear()
-                    theta = best_theta.clone()
                     _blowup_recovered = True
 
                 # Update the running best AFTER the blowup check
                 _best_res_for_anderson = min(_best_res_for_anderson, res_norm)
 
                 if _blowup_recovered:
-                    theta_next = theta  # = best_theta
+                    theta_next = theta_fp  # continue from current GS output
                 else:
                     r_k = theta_fp - theta
                     r_k_norm = r_k.abs().max().item()
@@ -853,6 +935,25 @@ def solve_fixed_point_daecm(
                         effective_floor = torch.minimum(theta_floor, theta_fp)
                         theta_next = torch.maximum(theta_next, effective_floor)
                         theta_next = theta_next.clamp(-_ETA_MAX, _ETA_MAX)
+
+                        # Feasibility guard: if Anderson extrapolated z_ij below
+                        # _Z_NEWTON_FLOOR (= _Z_G_CLAMP = 1e-8), apply a uniform
+                        # shift to both θ_out and θ_in so that z_min reaches
+                        # exactly _Z_NEWTON_FLOOR.  Unlike a hard revert+clear,
+                        # the projection keeps Anderson history intact — the
+                        # doubling recovery sequence (z doubles each GS step from
+                        # z_clamp to z*) can then be accelerated by Anderson
+                        # instead of being reset on every infeasible mix.
+                        _N2 = theta_next.shape[0] // 2
+                        _z_min_and = (
+                            theta_next[:_N2].min().item()
+                            + theta_next[_N2:].min().item()
+                        )
+                        if _z_min_and < _Z_NEWTON_FLOOR:
+                            _shift = (_Z_NEWTON_FLOOR - _z_min_and) * 0.5
+                            theta_next = theta_next.clone()
+                            theta_next[:_N2].add_(_shift)
+                            theta_next[_N2:].add_(_shift)
                     else:
                         theta_next = theta_fp
             else:

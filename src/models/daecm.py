@@ -36,6 +36,7 @@ Reference:
 """
 from __future__ import annotations
 
+import math
 from typing import Union
 
 import torch
@@ -564,6 +565,28 @@ class DaECMModel:
             s_in_safe = self.s_in.clamp(min=1e-15)
             beta_out = torch.sqrt(s_out_safe / (s_out_safe + k_out_safe))
             beta_in = torch.sqrt(s_in_safe / (s_in_safe + k_in_safe))
+        elif method == "balanced":
+            # Uniform z0 init: place ALL pairs at z_ij = z0 at start so that
+            # no pair is near the z=0 singularity (which freezes Newton steps).
+            # z0 = log(1 + 1/mean_weight) where mean_weight = sum(s_out)/sum(k_out).
+            # theta_b_out_i = theta_b_in_j = 0.5 * z0 for all non-zero nodes.
+            k_total = float(self.k_out.double()[~self.zero_s_out].sum().clamp(min=1.0))
+            s_total = float(self.s_out.double()[~self.zero_s_out].sum().clamp(min=1e-15))
+            mean_weight = max(s_total / k_total, 1e-15)
+            z0 = math.log(1.0 + 1.0 / mean_weight)
+            half_z0 = z0 * 0.5
+            theta_b_out = torch.full((N,), half_z0, dtype=torch.float64)
+            theta_b_in = torch.full((N,), half_z0, dtype=torch.float64)
+            theta_b_out = torch.where(
+                self.zero_s_out, torch.full_like(theta_b_out, _ETA_MAX), theta_b_out
+            )
+            theta_b_in = torch.where(
+                self.zero_s_in, torch.full_like(theta_b_in, _ETA_MAX), theta_b_in
+            )
+            return torch.cat([
+                theta_b_out.clamp(-_ETA_MAX, _ETA_MAX),
+                theta_b_in.clamp(-_ETA_MAX, _ETA_MAX),
+            ])
         elif method == "random":
             theta_b_out = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
             theta_b_in = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)

@@ -625,7 +625,7 @@ def run_comparison(
           f"iters={topo_res.iterations}, t={topo_res.elapsed_time:.3f}s")
     print()
 
-    theta_weight0 = model.initial_theta_weight(theta_topo, method="strengths")
+    theta_weight0 = model.initial_theta_weight(theta_topo, method="topology")
 
     col = [50, 8, 8, 14, 10, 12]
     header = (
@@ -709,7 +709,14 @@ def _run_single_network(
     # In fast mode, cap each individual solver to avoid runaway iterations.
     # At N=1000 the residual is ~25 ms; without a cap a single L-BFGS multistart
     # can take 4+ minutes even in fast mode.
-    per_solver_timeout = min(weight_timeout, FAST_SOLVER_TIMEOUT_S) if fast else weight_timeout
+    # NOTE: weight_timeout == 0 means "no outer timeout" — in fast mode we still
+    # apply the per-solver cap (FAST_SOLVER_TIMEOUT_S) so that --timeout 0 --fast
+    # does not accidentally disable all solver timeouts.
+    if fast:
+        per_solver_timeout = (FAST_SOLVER_TIMEOUT_S if weight_timeout <= 0
+                              else min(weight_timeout, FAST_SOLVER_TIMEOUT_S))
+    else:
+        per_solver_timeout = weight_timeout
 
     solvers = _make_solvers(model, theta_topo, theta_weight0, tol,
                             timeout=weight_timeout, fast=fast)

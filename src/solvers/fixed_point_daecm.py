@@ -184,19 +184,17 @@ def _fp_step_dense(
 
     xy = beta_out[:, None] * beta_in[None, :]
     denom = (1.0 - xy.clamp(max=_Q_MAX)).clamp(min=1e-8)
+    # G_new_ij = 1/(1 - β_out_i β_in_j) = 1/denom
+    PG_new = P / denom         # p_ij · G_new_ij (diagonal masked by P[i,i]=0)
 
-    # D_out[i] = Σ_{j≠i} P_ij · β_in_j / (1 - β_out_i · β_in_j)
-    D_out = (P * beta_in[None, :] / denom).sum(dim=1)
-    s_out_hat = beta_out * D_out
-
-    # D_in_orig uses ORIGINAL beta_out (for residual at current state).
-    # denom.T[m,j] = denom[j,m] = 1 - β_out_j * β_in_m ← correct denominator for D_in
-    D_in_orig = (P.T * beta_out[None, :] / denom.T).sum(dim=1)
-    s_in_hat_orig = beta_in * D_in_orig
+    # s_out_hat[i] = Σ_{j≠i} p_ij G_new_ij
+    s_out_hat = PG_new.sum(dim=1)
+    # s_in_hat_orig[j] = Σ_{i≠j} p_ij G_new_ij  (col sums, at current β_out)
+    s_in_hat_orig = PG_new.sum(dim=0)
 
     F_current = torch.cat([s_out_hat - s_out, s_in_hat_orig - s_in])
 
-    beta_out_new = torch.where(D_out > 0, s_out / D_out, beta_out)
+    beta_out_new = torch.where(s_out_hat > 0, beta_out * s_out / s_out_hat, beta_out)
 
     if theta is not None:
         theta_out = theta[:N]
@@ -216,10 +214,10 @@ def _fp_step_dense(
 
     xy2 = beta_out_upd[:, None] * beta_in[None, :]
     denom2 = (1.0 - xy2.clamp(max=_Q_MAX)).clamp(min=1e-8)
-    D_in = (P.T * beta_out_upd[None, :] / denom2.T).sum(dim=1)
-    s_in_hat = beta_in * D_in
+    PG_new2 = P / denom2
+    s_in_hat = PG_new2.sum(dim=0)
 
-    beta_in_new = torch.where(D_in > 0, s_in / D_in, beta_in)
+    beta_in_new = torch.where(s_in_hat > 0, beta_in * s_in / s_in_hat, beta_in)
 
     if theta is not None:
         theta_in = theta[N:]
@@ -272,7 +270,7 @@ def _fp_step_chunked(
         residual at the pre-update state, shape (2N,).
     """
     N = beta_out.shape[0]
-    D_out = torch.zeros(N, dtype=torch.float64)
+    D_out = torch.zeros(N, dtype=torch.float64)    # will hold s_out_hat = Σ p G_new
     s_in_hat_orig = torch.zeros(N, dtype=torch.float64)
 
     for i_start in range(0, N, chunk_size):
@@ -290,25 +288,23 @@ def _fp_step_chunked(
         xy_chunk = beta_out[i_start:i_end, None] * beta_in[None, :]
         denom_chunk = (1.0 - xy_chunk.clamp(max=_Q_MAX)).clamp(min=1e-8)
 
-        # D_out[i] = Σ_{j≠i} p[i,j] · β_in[j] / (1 - β_out[i] β_in[j])
-        d_chunk = p_chunk * beta_in[None, :] / denom_chunk  # (chunk, N)
+        # G_new_ij = 1/denom_ij; d_chunk = p_ij G_new_ij
+        d_chunk = p_chunk / denom_chunk   # (chunk, N)
         local_i = torch.arange(chunk_len, dtype=torch.long)
         global_j = torch.arange(i_start, i_end, dtype=torch.long)
         d_chunk[local_i, global_j] = 0.0    # zero diagonal
+
+        # D_out[i] = Σ_{j≠i} p_ij G_new_ij  (= s_out_hat[i])
         D_out[i_start:i_end] = d_chunk.sum(dim=1)
 
-        # Accumulate s_in_hat_orig[j] = β_in[j] * Σ_i p[i,j] * β_out[i] / (1-β_out[i]*β_in[j])
-        # = β_in[j] * Σ_i p[i,j] * β_out[i] / denom[i,j]
-        # d_chunk[i,j] = p[i,j] * β_in[j] / denom[i,j]
-        # so d_chunk.T[j,i] * β_out[i_chunk] sums to Σ_i p[i,j] * β_in[j] * β_out[i] / denom[i,j]
-        b_out_chunk = beta_out[i_start:i_end]
-        s_in_hat_orig += d_chunk.T @ b_out_chunk  # (N,)
+        # s_in_hat_orig[j] = Σ_{i≠j} p_ij G_new_ij  (col sums at current β_out)
+        s_in_hat_orig += d_chunk.sum(dim=0)
 
-    # Residual at current β
-    s_out_hat = beta_out * D_out
+    # Residual at current β (D_out = s_out_hat)
+    s_out_hat = D_out
     F_current = torch.cat([s_out_hat - s_out, s_in_hat_orig - s_in])
 
-    beta_out_new = torch.where(D_out > 0, s_out / D_out, beta_out)
+    beta_out_new = torch.where(D_out > 0, beta_out * s_out / D_out, beta_out)
 
     if theta is not None:
         _theta_out_fp = (
@@ -328,7 +324,7 @@ def _fp_step_chunked(
 
     beta_out_upd = beta_out_new if variant == "gauss-seidel" else beta_out
 
-    # D_in[i] = Σ_{j≠i} p[j,i] · β_out[j] / (1 - β_out[j] β_in[i])
+    # D_in[j] = Σ_{i≠j} p[i,j] · G_new_ij  (= s_in_hat[j])
     D_in = torch.zeros(N, dtype=torch.float64)
     for j_start in range(0, N, chunk_size):
         j_end = min(j_start + chunk_size, N)
@@ -343,14 +339,15 @@ def _fp_step_chunked(
         xy_chunk = beta_out_upd[j_start:j_end, None] * beta_in[None, :]  # (chunk, N)
         denom_chunk = (1.0 - xy_chunk.clamp(max=_Q_MAX)).clamp(min=1e-8)
 
-        d_chunk = p_chunk * beta_out_upd[j_start:j_end, None] / denom_chunk  # (chunk, N)
+        # d_chunk[j,i] = p_ji G_new_ji = p_ji / (1-β_out_j β_in_i)
+        d_chunk = p_chunk / denom_chunk   # (chunk, N)
         local_j = torch.arange(chunk_len, dtype=torch.long)
         global_i = torch.arange(j_start, j_end, dtype=torch.long)
         d_chunk[local_j, global_i] = 0.0    # zero diagonal (j==i)
         D_in += d_chunk.sum(dim=0)
 
-    s_in_hat = beta_in * D_in
-    beta_in_new = torch.where(D_in > 0, s_in / D_in, beta_in)
+    s_in_hat = D_in
+    beta_in_new = torch.where(D_in > 0, beta_in * s_in / D_in, beta_in)
 
     if theta is not None:
         _theta_in_fp = (
@@ -403,11 +400,11 @@ def _theta_newton_step_dense(
 
     z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
     z_safe = z.clamp(min=_Z_G_CLAMP)
-    G = 1.0 / torch.expm1(z_safe)   # G_ij = β_β / (1-β_β), diagonal irrelevant
+    G = -1.0 / torch.expm1(-z_safe)   # G_new = 1/(1-exp(-z))
     G.fill_diagonal_(0.0)
 
-    PG = P * G               # (N, N)  = p_ij G_ij
-    PGG1 = P * G * (1.0 + G)  # (N, N) = p_ij G_ij(1+G_ij)
+    PG = P * G               # (N, N)  = p_ij G_new_ij
+    PGG1 = P * G * (G - 1.0)  # (N, N) = p_ij G_new_ij(G_new_ij-1) = p_ij G_new G_old
 
     # Residual at current theta (before update)
     F_out = PG.sum(dim=1) - s_out    # shape (N,)
@@ -428,11 +425,11 @@ def _theta_newton_step_dense(
     # Recompute G with updated θ_β_out (Gauss-Seidel: use fresh θ_β_out)
     z2 = theta_b_out_new[:, None] + theta_b_in[None, :]
     z2_safe = z2.clamp(min=_Z_G_CLAMP)
-    G2 = 1.0 / torch.expm1(z2_safe)
+    G2 = -1.0 / torch.expm1(-z2_safe)
     G2.fill_diagonal_(0.0)
 
     PG2 = P * G2
-    PGG12 = P * G2 * (1.0 + G2)
+    PGG12 = P * G2 * (G2 - 1.0)
 
     # In-multiplier Newton steps
     F_in = PG2.sum(dim=0) - s_in                      # col sums of PG2
@@ -533,14 +530,14 @@ def _theta_newton_step_chunked(
 
         z_chunk = theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
         z_safe = z_chunk.clamp(min=_Z_G_CLAMP)
-        G_chunk = 1.0 / torch.expm1(z_safe)
+        G_chunk = -1.0 / torch.expm1(-z_safe)  # G_new = 1/(1-exp(-z))
 
         local_i = torch.arange(chunk_len, dtype=torch.long)
         global_j = torch.arange(i_start, i_end, dtype=torch.long)
         G_chunk[local_i, global_j] = 0.0  # zero diagonal
 
         PG_chunk = p_chunk * G_chunk
-        PGG1_chunk = PG_chunk * (1.0 + G_chunk)
+        PGG1_chunk = PG_chunk * (G_chunk - 1.0)  # p G_new (G_new-1) = p G_new G_old
 
         sum_PG_out[i_start:i_end] = PG_chunk.sum(dim=1)
         sum_PGG1_out[i_start:i_end] = PGG1_chunk.sum(dim=1)
@@ -599,14 +596,14 @@ def _theta_newton_step_chunked(
 
         z2_chunk = theta_b_out_new[i_start:i_end, None] + theta_b_in[None, :]
         z2_safe = z2_chunk.clamp(min=_Z_G_CLAMP)
-        G2_chunk = 1.0 / torch.expm1(z2_safe)
+        G2_chunk = -1.0 / torch.expm1(-z2_safe)  # G_new
 
         local_i = torch.arange(chunk_len, dtype=torch.long)
         global_j = torch.arange(i_start, i_end, dtype=torch.long)
         G2_chunk[local_i, global_j] = 0.0  # zero diagonal
 
         PG2_chunk = p_chunk * G2_chunk
-        PGG12_chunk = PG2_chunk * (1.0 + G2_chunk)
+        PGG12_chunk = PG2_chunk * (G2_chunk - 1.0)  # p G_new (G_new-1)
 
         sum_PG_in += PG2_chunk.sum(dim=0)    # col sums
         sum_PGG1_in += PGG12_chunk.sum(dim=0)

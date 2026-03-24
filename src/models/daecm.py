@@ -12,14 +12,16 @@ two sequential steps:
 
 2. **Weight step** — solve a DWCM conditioned on the DCM topology to find
    ``2N`` additional multipliers ``(β_out_i, β_in_i)`` reproducing the strength
-   sequences.  The expected weight of arc i→j in the approximated model is:
+   sequences.  The expected weight of arc i→j is the DCM connection probability
+   times the conditional expected weight given the link exists:
 
-       E[w_ij] = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
+       E[w_ij] = p_ij · E[w_ij | a_ij = 1]
+                = p_ij / (1 − β_out_i · β_in_j)
 
    leading to the strength equations:
 
-       s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
-       s_in_i  = Σ_{j≠i} p_ji · β_out_j · β_in_i / (1 − β_out_j · β_in_i)
+       s_out_i = Σ_{j≠i} p_ij / (1 − β_out_i · β_in_j)
+       s_in_i  = Σ_{j≠i} p_ji / (1 − β_out_j · β_in_i)
 
 This class encapsulates *only* the weight step (step 2).  The topology
 parameters ``theta_topo = [θ_out | θ_in]`` (from a DCM solver) are passed
@@ -149,10 +151,10 @@ class DaECMModel:
         theta_b_out = theta_weight[:N]
         theta_b_in = theta_weight[N:]
 
-        # G_ij = β_out_i β_in_j / (1 - β_out_i β_in_j) = 1/expm1(z_ij)
+        # G_ij = 1 / (1 - β_out_i β_in_j) = -1/expm1(-z_ij)
         z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
         z_safe = z.clamp(min=1e-8)
-        G = 1.0 / torch.expm1(z_safe)                   # (N, N)
+        G = -1.0 / torch.expm1(-z_safe)                 # (N, N)
         G.fill_diagonal_(0.0)
 
         # Apply zero-strength masks
@@ -203,7 +205,7 @@ class DaECMModel:
             tb_in = theta_weight[N:]
             z = tb_out[:, None] + tb_in[None, :]
             z_safe = z.clamp(min=1e-8)
-            G = 1.0 / torch.expm1(z_safe)
+            G = -1.0 / torch.expm1(-z_safe)
             G.fill_diagonal_(0.0)
             if self.zero_s_out.any():
                 G[self.zero_s_out] = 0.0
@@ -270,7 +272,7 @@ class DaECMModel:
                 theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
             )  # (chunk, N)
             z_safe = z_chunk.clamp(min=1e-8)
-            g_chunk = 1.0 / torch.expm1(z_safe)  # (chunk, N)
+            g_chunk = -1.0 / torch.expm1(-z_safe)  # (chunk, N): G_new = 1/(1-exp(-z))
 
             w_chunk = p_chunk * g_chunk           # (chunk, N)
 
@@ -308,8 +310,8 @@ class DaECMModel:
     ) -> torch.Tensor:
         """Return the Jacobian J_w = ∂F_w/∂θ_β, shape (2N, 2N).
 
-        Denoting H_ij = p_ij · G_ij · (1 + G_ij) (elementwise, diagonal zero),
-        where G_ij = β_out_i β_in_j / (1 − β_out_i β_in_j):
+        Denoting H_ij = p_ij · G_ij · (G_ij − 1) (elementwise, diagonal zero),
+        where G_ij = 1 / (1 − β_out_i β_in_j):
 
             J_out,out = −diag(Σ_{j≠i} H_ij)   [diagonal, negative]
             J_out,in  = −H                      [off-diagonal]
@@ -328,15 +330,15 @@ class DaECMModel:
         theta_b_out = theta_weight[:N]
         theta_b_in = theta_weight[N:]
 
-        # G matrix
+        # G_ij = 1/(1 - β_out_i β_in_j) = -1/expm1(-z_ij)
         z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
         z_safe = z.clamp(min=1e-8)
-        G = 1.0 / torch.expm1(z_safe)
+        G = -1.0 / torch.expm1(-z_safe)
         G.fill_diagonal_(0.0)
 
-        # H_ij = p_ij · G_ij · (1 + G_ij)
+        # H_ij = p_ij · G_ij · (G_ij − 1)  (= p_ij · G_new · G_old, diagonal zero)
         P = self.pij_matrix(theta_topo)
-        H = P * G * (1.0 + G)   # H[i,i] = 0 since G[i,i]=0
+        H = P * G * (G - 1.0)   # H[i,i] = 0 since G[i,i]=0
 
         idx = torch.arange(N)
         J = torch.zeros(2 * N, 2 * N, dtype=torch.float64)
@@ -359,8 +361,8 @@ class DaECMModel:
 
         The entries are:
 
-            ∂²L_w/∂θ_β_out_i² = −Σ_{j≠i} p_ij · G_ij · (1 + G_ij)
-            ∂²L_w/∂θ_β_in_i²  = −Σ_{j≠i} p_ji · G_ji · (1 + G_ji)
+            ∂²L_w/∂θ_β_out_i² = −Σ_{j≠i} p_ij · G_ij · (G_ij − 1)
+            ∂²L_w/∂θ_β_in_i²  = −Σ_{j≠i} p_ji · G_ji · (G_ji − 1)
 
         Args:
             theta_topo:   Topology parameters, shape (2N,).
@@ -376,11 +378,11 @@ class DaECMModel:
 
         z = theta_b_out[:, None] + theta_b_in[None, :]
         z_safe = z.clamp(min=1e-8)
-        G = 1.0 / torch.expm1(z_safe)
+        G = -1.0 / torch.expm1(-z_safe)
         G.fill_diagonal_(0.0)
 
         P = self.pij_matrix(theta_topo)
-        H = P * G * (1.0 + G)
+        H = P * G * (G - 1.0)
         h_out = -H.sum(dim=1)
         h_in = -H.sum(dim=0)
         return torch.cat([h_out, h_in])
@@ -425,18 +427,21 @@ class DaECMModel:
         theta_b_out = theta_weight[:N]
         theta_b_in = theta_weight[N:]
 
+        P = self.pij_matrix(theta_topo)  # (N, N), diagonal 0
+        k_out_exp = P.sum(dim=1)   # E[k_out_i] from DCM
+        k_in_exp = P.sum(dim=0)    # E[k_in_j]  from DCM
+
         z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
         z_safe = z.clamp(min=1e-8)
-        # −log(1 − exp(−z)) = −log1p(−exp(−z))
-        log_term = -torch.log1p(-torch.exp(-z_safe))  # (N, N)
-        log_term.fill_diagonal_(0.0)                   # exclude self-loops
+        # log G_new = −log(1 − exp(−z))
+        log_G_new = -torch.log1p(-torch.exp(-z_safe))   # (N, N), ≥ 0
+        log_G_new.fill_diagonal_(0.0)
 
-        # Weight by DCM probabilities
-        P = self.pij_matrix(theta_topo)
-        weighted_log = P * log_term
+        weighted_log = P * log_G_new
         weighted_log.fill_diagonal_(0.0)
 
-        dot_term = theta_b_out @ self.s_out + theta_b_in @ self.s_in
+        # NLL = θ·(s − k_exp) + Σ p·log G_new  →  d(NLL)/dθ = −F_new  ✓
+        dot_term = theta_b_out @ (self.s_out - k_out_exp) + theta_b_in @ (self.s_in - k_in_exp)
         return (dot_term + weighted_log.sum()).item()
 
     def _neg_log_likelihood_strength_chunked(
@@ -457,35 +462,42 @@ class DaECMModel:
         theta_b_out = theta_weight[:N]
         theta_b_in = theta_weight[N:]
 
-        dot_term = (theta_b_out @ self.s_out + theta_b_in @ self.s_in).item()
+        k_out_exp = torch.zeros(N, dtype=torch.float64)
+        k_in_exp = torch.zeros(N, dtype=torch.float64)
         log_total = 0.0
 
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
             chunk_len = i_end - i_start
 
-            # DCM probabilities for this chunk of rows
             log_xy = (
                 -theta_topo_out[i_start:i_end, None]
                 - theta_topo_in[None, :]
             )
             p_chunk = torch.sigmoid(log_xy)  # (chunk, N)
 
-            # Weight-step NLL term
             z_chunk = (
                 theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
             )  # (chunk, N)
             z_safe = z_chunk.clamp(min=1e-8)
-            log_chunk = -torch.log1p(-torch.exp(-z_safe))  # (chunk, N)
+            # log G_new = −log1p(−exp(−z))
+            log_G_chunk = -torch.log1p(-torch.exp(-z_safe))  # (chunk, N) ≥ 0
 
-            # Zero out diagonal
             local_idx = torch.arange(chunk_len, dtype=torch.long)
             global_idx = torch.arange(i_start, i_end, dtype=torch.long)
-            log_chunk[local_idx, global_idx] = 0.0
+            log_G_chunk[local_idx, global_idx] = 0.0
+            p_chunk_clean = p_chunk.clone()
+            p_chunk_clean[local_idx, global_idx] = 0.0
 
-            # Weight by DCM probabilities
-            log_total += (p_chunk * log_chunk).sum().item()
+            k_out_exp[i_start:i_end] = p_chunk_clean.sum(dim=1)
+            k_in_exp += p_chunk_clean.sum(dim=0)
+            log_total += (p_chunk_clean * log_G_chunk).sum().item()
 
+        # NLL = θ·(s − k_exp) + Σ p·log G_new
+        dot_term = (
+            theta_b_out @ (self.s_out - k_out_exp)
+            + theta_b_in @ (self.s_in - k_in_exp)
+        ).item()
         return dot_term + log_total
 
     # ------------------------------------------------------------------
@@ -556,24 +568,26 @@ class DaECMModel:
             beta_out = torch.full((N,), med_out, dtype=torch.float64)
             beta_in = torch.full((N,), med_in, dtype=torch.float64)
         elif method == "topology":
-            # Mean-field init β = sqrt(s/(s+k)).  For DaECM the weight sums
-            # are over connected neighbours (≈ k_out, k_in nodes) rather than
-            # all N nodes, so s/(s+k) is a better prior than s/(s+N−1).
+            # Mean-field init for the new formula: s/(k) = 1/(1-β²) → β = sqrt(1 - k/s).
+            # This is the correct prior for the DaECM weight step where
+            # E[w_ij] = p_ij/(1 - β_out_i β_in_j).
             k_out_safe = self.k_out.clamp(min=1.0)
             k_in_safe = self.k_in.clamp(min=1.0)
             s_out_safe = self.s_out.clamp(min=1e-15)
             s_in_safe = self.s_in.clamp(min=1e-15)
-            beta_out = torch.sqrt(s_out_safe / (s_out_safe + k_out_safe))
-            beta_in = torch.sqrt(s_in_safe / (s_in_safe + k_in_safe))
+            ratio_out = (k_out_safe / s_out_safe).clamp(max=1.0 - 1e-9)
+            ratio_in = (k_in_safe / s_in_safe).clamp(max=1.0 - 1e-9)
+            beta_out = torch.sqrt(1.0 - ratio_out)
+            beta_in = torch.sqrt(1.0 - ratio_in)
         elif method == "balanced":
             # Uniform z0 init: place ALL pairs at z_ij = z0 at start so that
             # no pair is near the z=0 singularity (which freezes Newton steps).
-            # z0 = log(1 + 1/mean_weight) where mean_weight = sum(s_out)/sum(k_out).
+            # For the new formula: G_new(z0) = mean_weight → z0 = -log(1 - 1/mw).
             # theta_b_out_i = theta_b_in_j = 0.5 * z0 for all non-zero nodes.
             k_total = float(self.k_out.double()[~self.zero_s_out].sum().clamp(min=1.0))
             s_total = float(self.s_out.double()[~self.zero_s_out].sum().clamp(min=1e-15))
-            mean_weight = max(s_total / k_total, 1e-15)
-            z0 = math.log(1.0 + 1.0 / mean_weight)
+            mean_weight = max(s_total / k_total, 1.0 + 1e-9)
+            z0 = -math.log(1.0 - 1.0 / mean_weight)  # G_new(z0) = mean_weight
             half_z0 = z0 * 0.5
             theta_b_out = torch.full((N,), half_z0, dtype=torch.float64)
             theta_b_in = torch.full((N,), half_z0, dtype=torch.float64)

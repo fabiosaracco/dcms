@@ -69,10 +69,10 @@ def make_daecm_model(N: int = 6, seed: int = 0) -> tuple[DaECMModel, np.ndarray,
     b_out = np.exp(-theta_weight_true[:N])
     b_in = np.exp(-theta_weight_true[N:])
 
-    # Conditioned weight matrix: W_ij = p_ij · β_out_i β_in_j / (1 - β_out_i β_in_j)
+    # Conditioned weight matrix: W_ij = p_ij / (1 - β_out_i β_in_j)  (new formula)
     beta_mat = b_out[:, None] * b_in[None, :]  # (N, N)
-    G = beta_mat / (1.0 - beta_mat)            # G_ij = β β / (1 - β β)
-    W = P * G                                   # W_ij = p_ij G_ij
+    G = 1.0 / (1.0 - beta_mat)                # G_new_ij = 1/(1-β_out β_in)
+    W = P * G                                   # W_ij = p_ij G_new_ij
     np.fill_diagonal(W, 0.0)
 
     s_out = W.sum(axis=1)
@@ -148,16 +148,16 @@ class TestWijMatrixConditioned:
         assert torch.all(W >= 0.0)
 
     def test_bounded_by_G(self) -> None:
-        """W_ij = p_ij * G_ij ≤ G_ij (since p_ij ≤ 1)."""
+        """W_ij = p_ij * G_new_ij ≤ G_new_ij (since p_ij ≤ 1)."""
         model, theta_topo, theta_weight = make_daecm_model(N=6)
         W = model.wij_matrix_conditioned(theta_topo, theta_weight)
-        # W must be ≤ the unconditional DWCM weight G (since p_ij ≤ 1)
+        # W must be ≤ the conditional expected weight G_new (since p_ij ≤ 1)
         N = model.N
         tb_out = torch.tensor(theta_weight[:N], dtype=torch.float64)
         tb_in = torch.tensor(theta_weight[N:], dtype=torch.float64)
         z = tb_out[:, None] + tb_in[None, :]
         z_safe = z.clamp(min=1e-15)
-        G = 1.0 / torch.expm1(z_safe)
+        G = -1.0 / torch.expm1(-z_safe)  # G_new = 1/(1-exp(-z))
         G.fill_diagonal_(0.0)
         assert torch.all(W <= G + 1e-9)
 
@@ -261,7 +261,7 @@ class TestNegLogLikelihoodStrength:
             dw[k] = eps
             nll_plus = model.neg_log_likelihood_strength(theta_topo, theta_w + dw)
             grad_fd[k] = (nll_plus - nll0) / eps
-        # ∇(−L_w) = −F_w
+        # ∇(NLL) = −F_w  (NLL = θ(s−k_exp) + Σp log G_new, d/dθ = −F_w)
         F = model.residual_strength(theta_topo, theta_w)
         assert torch.allclose(grad_fd, -F, atol=1e-4)
 

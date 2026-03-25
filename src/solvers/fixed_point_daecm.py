@@ -549,6 +549,15 @@ def _theta_newton_step_chunked(
             z_min_out[i_start:i_end], z_sig.min(dim=1).values
         )
 
+    # Global z-floor guard: significant-pair tracking misses insignificant pairs
+    # (p < 0.5/N) that can still blow up G when z < 0.  Use the global minimum
+    # of theta_b_in over non-zero-strength nodes to tighten z_min_out[i].
+    # z_min_out[i] = theta_b_out_i + min_j(theta_b_in_j) (all j with s_in_j > 0).
+    nz_in_mask = s_in > 0
+    if nz_in_mask.any():
+        min_theta_b_in_nz = theta_b_in[nz_in_mask].min()
+        z_min_out = torch.minimum(z_min_out, theta_b_out + min_theta_b_in_nz)
+
     F_out = sum_PG_out - s_out
     F_in_current = sum_PG_in_current - s_in
     F_current = torch.cat([F_out, F_in_current])
@@ -611,6 +620,12 @@ def _theta_newton_step_chunked(
         # z_min_in[j]: min over significant i of (theta_b_out_new_i + theta_b_in_j)
         z2_sig = torch.where(sig_mask, z2_chunk, torch.full_like(z2_chunk, float("inf")))
         z_min_in = torch.minimum(z_min_in, z2_sig.min(dim=0).values)
+
+    # Global z-floor guard for in-direction (mirrors out-direction guard above).
+    nz_out_mask = s_out > 0
+    if nz_out_mask.any():
+        min_theta_b_out_new_nz = theta_b_out_new[nz_out_mask].min()
+        z_min_in = torch.minimum(z_min_in, min_theta_b_out_new_nz + theta_b_in)
 
     F_in = sum_PG_in - s_in
     neg_H_in = sum_PGG1_in.clamp(min=1e-15)
@@ -933,24 +948,24 @@ def solve_fixed_point_daecm(
                         theta_next = torch.maximum(theta_next, effective_floor)
                         theta_next = theta_next.clamp(-_ETA_MAX, _ETA_MAX)
 
-                        # Feasibility guard: if Anderson extrapolated z_ij below
-                        # _Z_NEWTON_FLOOR (= _Z_G_CLAMP = 1e-8), apply a uniform
-                        # shift to both θ_out and θ_in so that z_min reaches
-                        # exactly _Z_NEWTON_FLOOR.  Unlike a hard revert+clear,
-                        # the projection keeps Anderson history intact — the
-                        # doubling recovery sequence (z doubles each GS step from
-                        # z_clamp to z*) can then be accelerated by Anderson
-                        # instead of being reset on every infeasible mix.
+                        # Feasibility guard: if Anderson extrapolated z_min =
+                        # min(θ_out) + min(θ_in) below 0, the mixed iterate is
+                        # infeasible (some z_ij < 0 → G → ∞ → immediate blow-up).
+                        # Reject the mix and fall back to the Newton proposal
+                        # theta_fp, which was computed under the z-floor guarantee.
+                        # This is safer than shifting (which distorts the mix) and
+                        # faster than the doubling recovery from z = 1e-8.
                         _N2 = theta_next.shape[0] // 2
                         _z_min_and = (
                             theta_next[:_N2].min().item()
                             + theta_next[_N2:].min().item()
                         )
                         if _z_min_and < _Z_NEWTON_FLOOR:
-                            _shift = (_Z_NEWTON_FLOOR - _z_min_and) * 0.5
-                            theta_next = theta_next.clone()
-                            theta_next[:_N2].add_(_shift)
-                            theta_next[_N2:].add_(_shift)
+                            # Reject infeasible mix; clear history to avoid
+                            # re-mixing infeasible iterates in future steps.
+                            theta_next = theta_fp
+                            _and_g.clear()
+                            _and_r.clear()
                     else:
                         theta_next = theta_fp
             else:

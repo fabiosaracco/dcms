@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
-import math
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -47,10 +46,6 @@ import torch
 from src.models.dwcm import DWCMModel, _ETA_MIN, _ETA_MAX
 from src.solvers.base import SolverResult
 from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-from src.solvers.quasi_newton import solve_lbfgs
-from src.solvers.newton import solve_newton
-from src.solvers.broyden import solve_broyden
-from src.solvers.levenberg_marquardt import solve_lm
 from src.utils.wng import k_s_generator_pl
 
 
@@ -96,22 +91,6 @@ def _call_with_timeout(fn: Callable, timeout_s: float):
 # Scaling thresholds
 # ---------------------------------------------------------------------------
 
-# Newton and Broyden need the full N×N Jacobian (O(N²) RAM).
-NEWTON_N_MAX: int = 500
-
-# Full-Jacobian LM shares the same RAM cost as Newton.
-FULL_JAC_LM_N_MAX: int = 500
-
-# L-BFGS is O(N) RAM per step but each step calls the residual (O(N²) cost).
-# For very large N the cost per gradient evaluation grows rapidly; for moderate
-# large N (up to 15k) L-BFGS is still practical within a generous timeout.
-LBFGS_N_MAX: int = 15_000
-
-# LM-diagonal (using hessian_diag, O(N) RAM) — applicable up to this N.
-# For N > DIAG_LM_N_MAX, the diagonal hessian LM is still O(N) but may
-# converge poorly due to ill-conditioning; we keep it for all sizes.
-DIAG_LM_N_MAX: int = 200_000
-
 # Default network sizes to benchmark
 DEFAULT_SIZES: list[int] = [1_000, 5_000, 10_000, 50_000]
 
@@ -137,133 +116,11 @@ DEFAULT_N_SEEDS: int = 10
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _solve_lm_diag_dwcm(
-    model: DWCMModel,
-    theta0: torch.Tensor,
-    tol: float = DEFAULT_TOL,
-    theta_bounds: tuple[float, float] = (_ETA_MIN, _ETA_MAX),
-    max_iter: int = 500,
-    lam0: float = 1e-3,
-    lam_up: float = 10.0,
-    lam_down: float = 0.1,
-    lam_max: float = 1e10,
-) -> SolverResult:
-    """LM with O(N) diagonal Hessian (no full Jacobian materialised).
-
-    Uses model.hessian_diag() and model.residual() only, avoiding the O(N²)
-    Jacobian allocation.  The normal equations reduce to:
-
-        (diag(H) + λ) δ = −F
-
-    where H = ∂F/∂θ = Hess(L) (negative semi-definite) and diag(H) ≤ 0.
-
-    We regularise as: (−diag(H) + λ) δ = F, so δ = F / (−diag(H) + λ).
-
-    Args:
-        model:        DWCMModel instance.
-        theta0:       Initial parameter vector, shape (2N,).
-        tol:          Convergence tolerance.
-        theta_bounds: (theta_lo, theta_hi) clamp applied at every step.
-        max_iter:     Maximum iterations.
-        lam0:         Initial damping λ.
-        lam_up:       λ increase factor on rejection.
-        lam_down:     λ decrease factor on acceptance.
-        lam_max:      Maximum λ before failure.
-
-    Returns:
-        :class:`~src.solvers.base.SolverResult` instance.
-    """
-    import tracemalloc as _tm
-    import time as _t
-    from src.solvers.base import SolverResult as _SR
-
-    _tm.start()
-    t0 = _t.perf_counter()
-
-    theta_lo, theta_hi = theta_bounds
-    theta = theta0.clone().to(dtype=torch.float64).clamp(theta_lo, theta_hi)
-
-    F = model.residual(theta.clamp(theta_lo, theta_hi))
-    cost = F.dot(F).item()
-    lam = lam0
-
-    residuals: list[float] = []
-    converged = False
-    n_iter = 0
-    message = "Maximum iterations reached without convergence."
-
-    try:
-        for _ in range(max_iter):
-            res_norm = F.abs().max().item()
-            if not math.isfinite(res_norm):
-                message = f"NaN/Inf at iteration {n_iter}."
-                break
-            if res_norm < tol:
-                converged = True
-                message = f"Converged in {n_iter} iteration(s)."
-                break
-
-            # Diagonal of Hess(L) = ∂F/∂θ — all entries ≤ 0
-            h_diag = model.hessian_diag(theta.clamp(theta_lo, theta_hi))
-            neg_h = -h_diag  # ≥ 0
-
-            # LM step: δ = F / (−diag(H) + λ)
-            delta = F / (neg_h + lam)
-
-            theta_new = (theta + delta).clamp(theta_lo, theta_hi)
-            F_new = model.residual(theta_new)
-            cost_new = F_new.dot(F_new).item()
-
-            if cost_new < cost:
-                theta = theta_new
-                F = F_new
-                cost = cost_new
-                lam = max(lam * lam_down, 1e-14)
-                n_iter += 1
-                residuals.append(F.abs().max().item())
-            else:
-                lam *= lam_up
-
-            if lam > lam_max:
-                message = f"Damping λ={lam:.2e} exceeded maximum."
-                break
-    finally:
-        elapsed = _t.perf_counter() - t0
-        _, peak_ram = _tm.get_traced_memory()
-        _tm.stop()
-
-    return _SR(
-        theta=theta.detach().numpy(),
-        converged=converged,
-        iterations=n_iter,
-        residuals=residuals,
-        elapsed_time=elapsed,
-        peak_ram_bytes=peak_ram,
-        message=message,
-    )
-
-
 def _make_clamped_residual(model: DWCMModel) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return a residual function that clamps θ to valid DWCM range before evaluating."""
     def fn(theta: torch.Tensor) -> torch.Tensor:
         theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
         return model.residual(theta_safe)
-    return fn
-
-
-def _make_clamped_nll(model: DWCMModel) -> Callable[[torch.Tensor], float]:
-    """Return a neg_log_likelihood function that clamps θ to valid DWCM range."""
-    def fn(theta: torch.Tensor) -> float:
-        theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-        return model.neg_log_likelihood(theta_safe)
-    return fn
-
-
-def _make_clamped_jacobian(model: DWCMModel) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Return a Jacobian function that clamps θ to valid DWCM range."""
-    def fn(theta: torch.Tensor) -> torch.Tensor:
-        theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-        return model.jacobian(theta_safe)
     return fn
 
 
@@ -282,102 +139,15 @@ def _check_strength_consistency(
     """
     if (s_out < 0).any() or (s_in < 0).any():
         return False
-    # Sum of out-strengths == sum of in-strengths (total weight is shared)
     total_out = s_out.sum()
     total_in = s_in.sum()
     if total_out == 0 and total_in == 0:
         return False
     if total_out > 0 and total_in > 0:
         rel_imbalance = abs(total_out - total_in) / max(total_out, total_in)
-        if rel_imbalance > 0.01:  # allow 1% imbalance from rounding
+        if rel_imbalance > 0.01:
             return False
     return True
-
-
-def _lbfgs_multistart(
-    model: DWCMModel,
-    theta0: torch.Tensor,
-    tol: float,
-    max_iter: int,
-    n_starts: int = 4,
-) -> SolverResult:
-    """L-BFGS with multiple initialisations if the default init fails.
-
-    Tries starting points in this order, stopping as soon as one converges:
-
-    1. ``theta0`` — the "strengths" mean-field approximation (default).
-    2. ``"normalized"`` — β_i = s_i / Σ_j s_j (Squartini & Garlaschelli 2011).
-    3. ``"uniform"``    — all betas equal to the median of the strengths init.
-    4. ``"random"``     — uniform random θ ∈ [0.1, 2.0] (with torch.manual_seed).
-
-    Extra random restarts fill up to ``n_starts`` total attempts.  Returns the
-    result with the lowest MaxRelError across all starts.
-
-    Args:
-        model:    DWCMModel instance.
-        theta0:   Default initial parameter vector (from model.initial_theta).
-        tol:      Convergence tolerance.
-        max_iter: Maximum iterations per L-BFGS run.
-        n_starts: Total number of starting points to try (including theta0).
-
-    Returns:
-        :class:`~src.solvers.base.SolverResult` with the best solution found.
-    """
-    import time as _t
-    from src.solvers.base import SolverResult as _SR
-
-    res_fn = _make_clamped_residual(model)
-
-    # Use combined residual+NLL to avoid double W materialisation in line search
-    def _combined_fn(theta: torch.Tensor) -> tuple[torch.Tensor, float]:
-        theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-        return model.residual_and_neg_log_likelihood(theta_safe)
-
-    best_result: Optional[SolverResult] = None
-    best_err = float("inf")
-    total_iters = 0
-    combined_ram = 0
-    t_start = _t.perf_counter()
-
-    # Build ordered list of starting points
-    starts: list[torch.Tensor] = [theta0]
-    for method in ("normalized", "uniform"):
-        starts.append(model.initial_theta(method))
-    # Fill remaining slots with random restarts
-    for i in range(max(0, n_starts - len(starts))):
-        torch.manual_seed(i)
-        starts.append(model.initial_theta("random"))
-
-    for i, t0 in enumerate(starts[:n_starts]):
-        torch.manual_seed(i)
-        # Divide budget equally among starts so all get a chance.
-        iter_per_start = max(30, max_iter // n_starts)
-        result = solve_lbfgs(
-            res_fn, t0, tol=tol, m=20, max_iter=iter_per_start,
-            theta_bounds=(_ETA_MIN, _ETA_MAX),
-            residual_and_nll_fn=_combined_fn,
-            stagnation_window=20,
-        )
-        total_iters += result.iterations
-        combined_ram = max(combined_ram, result.peak_ram_bytes)
-        err = model.max_relative_error(result.theta)
-        if err < best_err:
-            best_err = err
-            best_result = result
-        if result.converged:
-            break
-
-    elapsed = _t.perf_counter() - t_start
-    assert best_result is not None
-    return _SR(
-        theta=best_result.theta,
-        converged=best_result.converged,
-        iterations=total_iters,
-        residuals=best_result.residuals,
-        elapsed_time=elapsed,
-        peak_ram_bytes=combined_ram,
-        message=best_result.message,
-    )
 
 
 def _make_solvers(
@@ -389,60 +159,27 @@ def _make_solvers(
 ) -> list[tuple[str, Callable[[], SolverResult]]]:
     """Return a list of (name, callable) solver pairs for *model*.
 
-    Methods requiring O(N²) RAM are omitted for large N.
-
     Args:
         model:   The DWCMModel instance.
         theta0:  Initial parameter vector (all positive).
         tol:     Convergence tolerance.
         timeout: Per-solver hard timeout in seconds (used to set iteration budgets).
-        fast:    If True, skip plain FP/Jacobi and LM; only run Anderson and L-BFGS.
+        fast:    Unused; both methods always run.
 
     Returns:
         Ordered list of ``(name, solver_callable)`` pairs.
     """
     N = model.N
     res_fn = _make_clamped_residual(model)
-    nll_fn = _make_clamped_nll(model)
-    jac_fn = _make_clamped_jacobian(model)
 
-    # ---------------------------------------------------------------------------
-    # Per-method iteration budgets.
-    # The residual cost is O(N²) per evaluation (chunked for N > _LARGE_N_THRESHOLD).
-    # Empirical calibration (chunked, single CPU core):
-    #   N=100 →   0.3 ms,  N=1k →  8 ms,  N=5k → 200 ms,
-    #   N=10k → ~1.5  s,  N=50k → ~15 s
-    # The calibration formula uses a piecewise fit:
-    #   - for N ≤ 5k:  cost ≈ (N/1k)² × 8 ms  (GPU-friendly tensor ops)
-    #   - for N > 5k:  cost ≈ (N/1k)² × 15 ms  (chunked overhead dominates)
-    # Iteration budgets are set so that each method can use the full timeout.
-    # No artificial iteration cap is imposed beyond the budget derived from timeout.
-    # ---------------------------------------------------------------------------
+    # Per-method iteration budgets based on residual evaluation cost
     if N <= 5_000:
         residual_s = max(3e-4, (N / 1_000) ** 2 * 8e-3)
     else:
         residual_s = max(3e-4, (N / 1_000) ** 2 * 15e-3)
 
-    # Budget for methods that are expected to converge: full timeout
-    # timeout=0 means "no hard wall-clock limit" — use practical caps to avoid
-    # spending hours on non-converging methods.
-    if timeout > 0:
-        full_budget_s = timeout
-    else:
-        # No timeout: use a generous but finite per-method wall-time budget
-        # scaled to the cost per residual evaluation.
-        # Target: ~5 min per method at any scale.
-        full_budget_s = 300.0
+    full_budget_s = timeout if timeout > 0 else 300.0
 
-    # Plain FP-GS/Jacobi: give them 20% of the timeout budget so we can
-    # measure convergence rate, not just report "didn't converge in 1 s".
-    plain_budget_s = min(full_budget_s * 0.2, 30.0) if N <= 5_000 else min(full_budget_s * 0.1, 60.0)
-    # Plain FP-GS/Jacobi: cap at 500 iterations — enough to characterise
-    # convergence behaviour without wasting time on hopeless cases.
-    MAX_FP_PLAIN_ITER: int = max(50, min(500, int(plain_budget_s / residual_s)))
-
-    # Anderson-accelerated FP: full timeout budget, capped at reasonable values.
-    # Stagnation detection in the solver will stop non-converging runs early.
     if N > 5_000:
         max_anderson_cap = 500
     elif N >= 1_000:
@@ -451,78 +188,13 @@ def _make_solvers(
         max_anderson_cap = 5_000
     MAX_FP_ANDERSON_ITER: int = max(100, min(max_anderson_cap, int(full_budget_s / residual_s)))
 
-    # L-BFGS: each iter costs ~3-5 residuals (gradient + line search)
-    if N > 5_000:
-        max_lbfgs_cap = 200
-    elif N >= 1_000:
-        max_lbfgs_cap = 500
-    else:
-        max_lbfgs_cap = 2_000
-    MAX_LBFGS_ITER: int = max(50, min(max_lbfgs_cap, int(full_budget_s / (5 * residual_s))))
-
-    # Diagonal LM: cap at 500 iterations for large N
-    if N > 5_000:
-        max_lm_cap = 100
-    elif N >= 1_000:
-        max_lm_cap = 500
-    else:
-        max_lm_cap = 2_000
-    MAX_LM_ITER: int = max(50, min(max_lm_cap, int(full_budget_s / (3 * residual_s))))
+    _N_ANDERSON_INITS = 4
+    _ITER_PER_ANDERSON_INIT = max(50, MAX_FP_ANDERSON_ITER // _N_ANDERSON_INITS)
+    _TIME_PER_INIT: float = min(60.0, full_budget_s / _N_ANDERSON_INITS)
 
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
-    # ── Fixed-point GS α=1.0 (plain, fast) ─────────────────────────────────
-    if not fast:
-        solvers.append((
-            "FP-GS α=1.0",
-            lambda: solve_fixed_point_dwcm(
-                res_fn, theta0, model.s_out, model.s_in,
-                tol=tol, damping=1.0, variant="gauss-seidel",
-                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-            ),
-        ))
-
-    # ── Fixed-point GS α=0.5 (damped) ───────────────────────────────────────
-    if not fast:
-        solvers.append((
-            "FP-GS α=0.5",
-            lambda: solve_fixed_point_dwcm(
-                res_fn, theta0, model.s_out, model.s_in,
-                tol=tol, damping=0.5, variant="gauss-seidel",
-                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-            ),
-        ))
-
-    # ── Fixed-point GS α=0.3 (more damped) ──────────────────────────────────
-    if not fast:
-        solvers.append((
-            "FP-GS α=0.3",
-            lambda: solve_fixed_point_dwcm(
-                res_fn, theta0, model.s_out, model.s_in,
-                tol=tol, damping=0.3, variant="gauss-seidel",
-                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-            ),
-        ))
-
     # ── Fixed-point GS + Anderson depth=10, multi-start ─────────────────────
-    # Anderson depth=10 keeps more history than depth=5, better for heterogeneous
-    # networks where the plain FP oscillates with a period > 5 iterates.
-    # Budget is divided equally among 4 inits so all get a chance within timeout.
-    _N_ANDERSON_INITS = 4
-    _ITER_PER_ANDERSON_INIT = max(50, MAX_FP_ANDERSON_ITER // _N_ANDERSON_INITS)
-    # Per-init wall-clock limit: prevents non-converging inits from burning time.
-    # For N > 2000 in --fast mode, blowup recovery can take ~50 iterations
-    # (~40s at N=5000), so the old 15s cap was insufficient.  Use the full
-    # per-init share of the budget; warm starts (below) ensure later inits
-    # build on the best θ found rather than restarting from scratch.
-    if fast:
-        if N <= 2_000:
-            _TIME_PER_INIT: float = min(15.0, full_budget_s / _N_ANDERSON_INITS)
-        else:
-            _TIME_PER_INIT = full_budget_s / _N_ANDERSON_INITS
-    else:
-        _TIME_PER_INIT = min(60.0, full_budget_s / _N_ANDERSON_INITS)
-
     def _fp_anderson_multistart() -> SolverResult:
         import time as _t
         from src.solvers.base import SolverResult as _SR
@@ -536,11 +208,6 @@ def _make_solvers(
         peak_ram = 0
         t0_wall = _t.perf_counter()
         for t0_cand in inits:
-            # Warm start: after the first init, begin from the best θ found so
-            # far rather than a fresh initialisation.  This lets each successive
-            # init continue convergence from where the previous one left off,
-            # which is critical when a single init cannot finish within
-            # _TIME_PER_INIT (e.g. after an Anderson-blowup recovery at N=5k).
             if best is not None and not best.converged:
                 t0_cand = torch.tensor(best.theta, dtype=torch.float64)
             r = solve_fixed_point_dwcm(
@@ -570,10 +237,7 @@ def _make_solvers(
 
     solvers.append(("FP-GS Anderson(10) multi-init", _fp_anderson_multistart))
 
-    # ── θ-space coordinate Newton (robust to hub nodes) ─────────────────────
-    # Uses per-node Newton steps in θ-space which cannot produce β > 1,
-    # making it robust to high-strength hub nodes that cause β-space FP to
-    # oscillate.  Anderson acceleration is enabled for faster convergence.
+    # ── θ-space coordinate Newton + Anderson(10), multi-start ───────────────
     _ITER_PER_TN_INIT = max(50, MAX_FP_ANDERSON_ITER // _N_ANDERSON_INITS)
 
     def _theta_newton_multistart() -> SolverResult:
@@ -589,7 +253,6 @@ def _make_solvers(
         peak_ram = 0
         t0_wall = _t.perf_counter()
         for t0_cand in inits:
-            # Warm start: same rationale as _fp_anderson_multistart above.
             if best is not None and not best.converged:
                 t0_cand = torch.tensor(best.theta, dtype=torch.float64)
             r = solve_fixed_point_dwcm(
@@ -618,66 +281,6 @@ def _make_solvers(
         )
 
     solvers.append(("θ-Newton Anderson(10) multi-init", _theta_newton_multistart))
-
-    # ── Fixed-point Jacobi ──────────────────────────────────────────────────
-    if not fast:
-        solvers.append((
-            "FP-Jacobi",
-            lambda: solve_fixed_point_dwcm(
-                res_fn, theta0, model.s_out, model.s_in,
-                tol=tol, damping=1.0, variant="jacobi",
-                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-            ),
-        ))
-
-    # ── L-BFGS multi-start (skipped for N > LBFGS_N_MAX) ───────────────────
-    # At large N each gradient evaluation costs O(N²) = ~1.5s at N=10k.
-    # With 5 evals/iter, a 300s timeout allows only ~40 L-BFGS steps — often
-    # insufficient.  Skip for N > LBFGS_N_MAX and rely on Anderson FP instead.
-    # In --fast mode, skip L-BFGS for N >= 1000: FP methods converge in seconds,
-    # while L-BFGS takes 5+ minutes due to expensive line-search evaluations.
-    _skip_lbfgs = N > LBFGS_N_MAX or (fast and N >= 1000)
-    if not _skip_lbfgs:
-        solvers.append((
-            "L-BFGS (multi-start)",
-            lambda: _lbfgs_multistart(model, theta0, tol=tol,
-                                      max_iter=MAX_LBFGS_ITER, n_starts=4),
-        ))
-
-    # ── Diagonal LM (O(N) RAM, always applicable) ───────────────────────────
-    if not fast:
-        solvers.append((
-            "LM (diag Hessian)",
-            lambda: _solve_lm_diag_dwcm(model, theta0, tol=tol,
-                                         theta_bounds=(_ETA_MIN, _ETA_MAX),
-                                         max_iter=MAX_LM_ITER),
-        ))
-
-    # ── Newton, Broyden, full-Jacobian LM — only for small N (O(N²) RAM) ──
-    if N <= NEWTON_N_MAX:
-        solvers.append((
-            "Newton (exact J)",
-            lambda: solve_newton(
-                res_fn, jac_fn, theta0, tol=tol, max_iter=200,
-                theta_bounds=(_ETA_MIN, _ETA_MAX),
-            ),
-        ))
-        solvers.append((
-            "Broyden (rank-1 J)",
-            lambda: solve_broyden(
-                res_fn, jac_fn, theta0, tol=tol, max_iter=500,
-                theta_bounds=(_ETA_MIN, _ETA_MAX),
-            ),
-        ))
-
-    if N <= FULL_JAC_LM_N_MAX:
-        solvers.append((
-            "LM (full Jacobian)",
-            lambda: solve_lm(
-                res_fn, jac_fn, theta0, tol=tol, diagonal_only=False,
-                max_iter=500, theta_bounds=(_ETA_MIN, _ETA_MAX),
-            ),
-        ))
 
     return solvers
 

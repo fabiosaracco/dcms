@@ -5,13 +5,11 @@ The DWCM strength equations are
     s_out_i = Σ_{j≠i} β_out_i · β_in_j / (1 − β_out_i · β_in_j)
     s_in_i  = Σ_{j≠i} β_out_j · β_in_i / (1 − β_out_j · β_in_i)
 
-with β = exp(−θ).  Three variants are implemented:
+with β = exp(−θ).  Two variants are implemented:
 
 * **Gauss-Seidel** — β-space fixed-point; out-multipliers are updated
   first; the updated values are immediately used when computing new
   in-multipliers.  Update: β_out_i^{new} = s_out_i / D_out_i.
-* **Jacobi**       — β-space fixed-point; all multipliers are updated
-  simultaneously using values from the *previous* iteration.
 * **theta-newton** — θ-space coordinate Newton step.  For each node i
   the exact 1-D Newton step is computed directly in θ-space:
 
@@ -25,8 +23,7 @@ with β = exp(−θ).  Three variants are implemented:
   is robust to high-strength hub nodes that cause the β-space variants
   to oscillate.
 
-The Gauss-Seidel and Jacobi variants support an optional damping factor
-α ∈ (0, 1]:
+The Gauss-Seidel variant supports an optional damping factor α ∈ (0, 1]:
 
     θ_i^{t+1} = α · (−log β_i^{new}) + (1−α) · θ_i^{t}
 
@@ -197,12 +194,12 @@ def solve_fixed_point_dwcm(
         s_in:   Observed in-strength sequence, shape (N,).
         tol:    Convergence tolerance on the ℓ∞ residual norm.
         max_iter: Maximum number of iterations.
-        damping: Damping factor α ∈ (0, 1] for the ``"jacobi"`` and
-            ``"gauss-seidel"`` variants.  α=1 → no damping (pure FP update).
+        damping: Damping factor α ∈ (0, 1] for the ``"gauss-seidel"``
+            variant.  α=1 → no damping (pure FP update).
             Not used by the ``"theta-newton"`` variant; use ``max_step``
             instead to control the Newton step size for that variant.
-        variant: One of ``"jacobi"``, ``"gauss-seidel"``, or
-            ``"theta-newton"``.  The first two solve in β-space; the last
+        variant: One of ``"gauss-seidel"`` or ``"theta-newton"``.
+            ``"gauss-seidel"`` solves in β-space; ``"theta-newton"``
             performs coordinate Newton steps directly in θ-space, which avoids
             the β > 1 clamping oscillation that affects high-strength hub nodes.
         chunk_size: If > 0, process the N×N products in chunks of this size
@@ -215,8 +212,7 @@ def solve_fixed_point_dwcm(
             FP outputs to compute the next iterate via constrained
             least-squares mixing (Walker & Ni 2011).
         max_step: Maximum per-node Newton step |Δθ| allowed in the
-            ``"theta-newton"`` variant.  Ignored by ``"jacobi"`` and
-            ``"gauss-seidel"``.  Default 1.0 (one unit in log-space);
+            ``"theta-newton"`` variant.  Ignored by ``"gauss-seidel"``.  Default 1.0 (one unit in log-space);
             reduce to ~0.5 for very heterogeneous networks to improve
             robustness at the cost of slower convergence per iteration.
         max_time: Wall-clock time limit in seconds.  If > 0, the solver
@@ -226,9 +222,9 @@ def solve_fixed_point_dwcm(
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
     """
-    if variant not in ("jacobi", "gauss-seidel", "theta-newton"):
+    if variant not in ("gauss-seidel", "theta-newton"):
         raise ValueError(
-            f"Unknown variant {variant!r}. Choose 'jacobi', 'gauss-seidel', or 'theta-newton'."
+            f"Unknown variant {variant!r}. Choose 'gauss-seidel' or 'theta-newton'."
         )
     if not (0.0 < damping <= 1.0):
         raise ValueError(f"damping must be in (0, 1], got {damping}")
@@ -326,7 +322,7 @@ def solve_fixed_point_dwcm(
 
                 if effective_chunk > 0:
                     beta_out_new, beta_in_new, F_current = _fp_step_chunked_dwcm(
-                        beta_out, beta_in, s_out, s_in, effective_chunk, variant,
+                        beta_out, beta_in, s_out, s_in, effective_chunk,
                         theta=theta, max_step=max_step,
                     )
                 else:
@@ -384,10 +380,7 @@ def solve_fixed_point_dwcm(
                             _use_newton_out, torch.exp(-_theta_out_nt), beta_out_new
                         )
 
-                    if variant == "gauss-seidel":
-                        beta_out_upd = beta_out_new
-                    else:
-                        beta_out_upd = beta_out  # Jacobi: keep old values
+                    beta_out_upd = beta_out_new  # Gauss-Seidel: use updated values immediately
 
                     # D_in[i] = Σ_{j≠i} β_out_j / (1 - β_out_j * β_in_i)
                     xy2 = beta_out_upd[:, None] * beta_in[None, :]
@@ -669,11 +662,10 @@ def _fp_step_chunked_dwcm(
     s_out: torch.Tensor,
     s_in: torch.Tensor,
     chunk_size: int,
-    variant: str,
     theta: torch.Tensor | None = None,
     max_step: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One fixed-point update step for DWCM using chunked matrix products.
+    """One Gauss-Seidel fixed-point update step for DWCM using chunked matrix products.
 
     Computes the update denominators D_out and D_in without ever building
     the full N×N product matrix, using at most O(chunk_size × N) RAM per chunk.
@@ -693,7 +685,6 @@ def _fp_step_chunked_dwcm(
         s_out:      Observed out-strength sequence, shape (N,).
         s_in:       Observed in-strength sequence, shape (N,).
         chunk_size: Number of rows (or columns) per chunk.
-        variant:    ``"jacobi"`` or ``"gauss-seidel"``.
         theta:      Full parameter vector [θ_out | θ_in], shape (2N,), used
                     by the Newton fallback.  Pass ``None`` to disable.
         max_step:   Maximum |Δθ| per node for the Newton fallback step.
@@ -752,8 +743,8 @@ def _fp_step_chunked_dwcm(
                 _use_newton_out, torch.exp(-_theta_out_nt), beta_out_new
             )
 
-    # Gauss-Seidel: use updated β_out immediately; Jacobi: keep old values
-    beta_out_upd = beta_out_new if variant == "gauss-seidel" else beta_out
+    # Gauss-Seidel: use updated β_out immediately for the D_in computation
+    beta_out_upd = beta_out_new
 
     # -------------------------------------------------------------------
     # D_in[i] = Σ_{j≠i} β_out_j / (1 - β_out_j * β_in_i)

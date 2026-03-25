@@ -24,8 +24,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.daecm import DaECMModel, _ETA_MAX, _ETA_MIN
-from src.solvers.daecm_solver import DaECMResult, solve_daecm, solve_daecm_joint_lbfgs
+from src.models.dcm import DCMModel
 from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
 # ---------------------------------------------------------------------------
@@ -308,128 +309,74 @@ class TestConstraintErrors:
 # Two-step solver convergence (N=4 and N=10)
 # ---------------------------------------------------------------------------
 
+def _solve_two_step(
+    model: DaECMModel,
+    tol: float = 1e-5,
+    topo_max_iter: int = 5_000,
+    weight_max_iter: int = 10_000,
+    weight_variant: str = "theta-newton",
+    anderson_depth: int = 10,
+) -> tuple:
+    """Run the two-step DaECM solve and return (topo_result, weight_result)."""
+    dcm = DCMModel(model.k_out, model.k_in)
+    theta_topo0 = model.initial_theta_topo()
+    r_topo = solve_fixed_point_dcm(
+        dcm.residual, theta_topo0, dcm.k_out, dcm.k_in,
+        tol=tol, max_iter=topo_max_iter,
+        variant="theta-newton", anderson_depth=10,
+    )
+    theta_topo = r_topo.theta
+
+    theta_w0 = model.initial_theta_weight(
+        torch.tensor(theta_topo, dtype=torch.float64), "strengths"
+    )
+    res_fn = lambda tw: model.residual_strength(
+        torch.tensor(theta_topo, dtype=torch.float64),
+        tw.clamp(_ETA_MIN, _ETA_MAX),
+    )
+    r_weight = solve_fixed_point_daecm(
+        res_fn, theta_w0,
+        model.s_out, model.s_in,
+        theta_topo=torch.tensor(theta_topo, dtype=torch.float64),
+        tol=tol, max_iter=weight_max_iter,
+        variant=weight_variant, anderson_depth=anderson_depth,
+    )
+    return r_topo, r_weight
+
+
 class TestSolverConvergenceSmall:
     """Convergence tests for the two-step DaECM solver on small networks."""
 
-    @pytest.mark.parametrize("N,seed", [(4, 0), (4, 1), (10, 0), (10, 2)])
-    def test_fp_gs(self, N: int, seed: int) -> None:
-        """FP-GS does not always converge; only check error when it does."""
-        model, _, _ = make_daecm_model(N=N, seed=seed)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="fp-gs",
-            tol=CONV_TOL,
-            topo_max_iter=5_000,
-            weight_max_iter=10_000,
+    @pytest.mark.parametrize("N,seed", [(4, 0), (4, 1), (10, 0)])
+    def test_theta_newton_converges(self, N: int, seed: int) -> None:
+        """θ-Newton must converge on small networks."""
+        model, theta_topo_true, theta_weight_true = make_daecm_model(N=N, seed=seed)
+        r_topo, r_weight = _solve_two_step(
+            model, tol=CONV_TOL, weight_variant="theta-newton",
         )
-        assert result.topo_converged, f"N={N} seed={seed}: topology step failed"
-        if result.weight_converged:
-            err = model.constraint_error_strength(
-                result.theta_topo, result.theta_weight
-            )
-            assert err < CONV_TOL * 100, (
-                f"N={N} seed={seed}: strength error={err:.2e} after convergence"
-            )
+        assert r_topo.converged, f"N={N} seed={seed}: topology step failed"
+        assert r_weight.converged, f"N={N} seed={seed}: weight step failed"
+        err = model.max_relative_error(
+            torch.tensor(r_topo.theta, dtype=torch.float64),
+            torch.tensor(r_weight.theta, dtype=torch.float64),
+        )
+        assert err < CONV_TOL * 100, f"N={N} seed={seed}: MRE={err:.2e}"
 
     @pytest.mark.parametrize("N,seed", [(4, 0), (4, 1), (10, 0)])
-    def test_fp_gs_anderson(self, N: int, seed: int) -> None:
+    def test_fp_gs_no_crash(self, N: int, seed: int) -> None:
+        """FP-GS Anderson may not converge but must not crash."""
         model, _, _ = make_daecm_model(N=N, seed=seed)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="fp-gs-anderson",
-            tol=CONV_TOL,
-            weight_max_iter=5_000,
-            anderson_depth=5,
-        )
-        assert result.topo_converged, "Topology step did not converge"
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 0)])
-    def test_theta_newton(self, N: int, seed: int) -> None:
-        model, _, _ = make_daecm_model(N=N, seed=seed)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="theta-newton",
-            tol=CONV_TOL,
-            weight_max_iter=5_000,
-        )
-        assert result.topo_converged
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 0)])
-    def test_lbfgs(self, N: int, seed: int) -> None:
-        model, _, _ = make_daecm_model(N=N, seed=seed)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="lbfgs",
-            tol=CONV_TOL,
+        r_topo, r_weight = _solve_two_step(
+            model, tol=CONV_TOL, weight_variant="gauss-seidel",
             weight_max_iter=2_000,
         )
-        assert result.topo_converged
-        if result.weight_converged:
+        assert r_topo.converged, f"N={N} seed={seed}: topology step failed"
+        if r_weight.converged:
             err = model.constraint_error_strength(
-                result.theta_topo, result.theta_weight
+                torch.tensor(r_topo.theta, dtype=torch.float64),
+                torch.tensor(r_weight.theta, dtype=torch.float64),
             )
-            assert err < CONV_TOL * 10
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 0)])
-    def test_lm_diag(self, N: int, seed: int) -> None:
-        model, _, _ = make_daecm_model(N=N, seed=seed)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="lm-diag",
-            tol=CONV_TOL,
-            weight_max_iter=2_000,
-        )
-        assert result.topo_converged
-
-
-class TestSolverResult:
-    """Test that DaECMResult has the expected structure."""
-
-    def test_result_fields(self) -> None:
-        model, _, _ = make_daecm_model(N=4)
-        result = solve_daecm(model, topo_method="lbfgs", weight_method="lbfgs",
-                             tol=1e-4, weight_max_iter=200)
-        assert isinstance(result, DaECMResult)
-        assert result.theta_topo.shape == (8,)
-        assert result.theta_weight.shape == (8,)
-        assert isinstance(result.converged, bool)
-        assert result.elapsed_time >= 0.0
-        assert result.peak_ram_bytes >= 0
-
-    def test_solve_daecm_converges_n4(self) -> None:
-        """solve_daecm must converge on N=4 with L-BFGS."""
-        model, _, _ = make_daecm_model(N=4, seed=0)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="lbfgs",
-            tol=1e-8,
-            weight_max_iter=3_000,
-        )
-        assert result.topo_converged, "Topology step failed"
-        assert result.weight_converged, "Weight step failed"
-        err = model.constraint_error_strength(result.theta_topo, result.theta_weight)
-        assert err < 1e-6, f"Strength constraint error={err:.2e}"
-
-    def test_solve_daecm_converges_n10(self) -> None:
-        """solve_daecm must converge on N=10 with L-BFGS."""
-        model, _, _ = make_daecm_model(N=10, seed=0)
-        result = solve_daecm(
-            model,
-            topo_method="lbfgs",
-            weight_method="lbfgs",
-            tol=1e-8,
-            weight_max_iter=3_000,
-        )
-        assert result.topo_converged, "Topology step failed"
-        assert result.weight_converged, "Weight step failed"
-        err = model.constraint_error_strength(result.theta_topo, result.theta_weight)
-        assert err < 1e-6, f"Strength constraint error={err:.2e}"
+            assert err < CONV_TOL * 100, f"N={N} seed={seed}: strength error={err:.2e}"
 
 
 # ---------------------------------------------------------------------------
@@ -469,43 +416,3 @@ class TestFixedPointDaECM:
         assert result.converged or result.residuals[-1] < CONV_TOL * 10
 
 
-# ---------------------------------------------------------------------------
-# Joint L-BFGS tests
-# ---------------------------------------------------------------------------
-
-class TestJointLBFGS:
-    """Test the joint 4N L-BFGS solver."""
-
-    def test_joint_residual_shape(self) -> None:
-        """Joint residual must have length 4N."""
-        model, theta_topo_true, theta_weight_true = make_daecm_model(N=4, seed=0)
-        theta_full = np.concatenate([theta_topo_true, theta_weight_true])
-        F = model.residual_joint(theta_full)
-        assert F.shape == (16,)
-
-    def test_joint_nll_finite(self) -> None:
-        """Joint NLL must be a finite scalar."""
-        model, theta_topo_true, theta_weight_true = make_daecm_model(N=4, seed=0)
-        theta_full = np.concatenate([theta_topo_true, theta_weight_true])
-        nll = model.neg_log_likelihood_joint(theta_full)
-        assert np.isfinite(nll)
-
-    def test_joint_lbfgs_converges_n4(self) -> None:
-        """Joint L-BFGS must converge on N=4."""
-        model, _, _ = make_daecm_model(N=4, seed=0)
-        result = solve_daecm_joint_lbfgs(model, tol=1e-6, max_iter=5_000)
-        assert result.converged, f"Joint L-BFGS did not converge: {result.message}"
-        err = model.constraint_error_joint(
-            np.concatenate([result.theta_topo, result.theta_weight])
-        )
-        assert err < 1e-5, f"Joint error={err:.2e}"
-
-    def test_joint_lbfgs_converges_n10(self) -> None:
-        """Joint L-BFGS must converge on N=10."""
-        model, _, _ = make_daecm_model(N=10, seed=0)
-        result = solve_daecm_joint_lbfgs(model, tol=1e-6, max_iter=5_000)
-        assert result.converged, f"Joint L-BFGS did not converge: {result.message}"
-        err = model.constraint_error_joint(
-            np.concatenate([result.theta_topo, result.theta_weight])
-        )
-        assert err < 1e-5, f"Joint error={err:.2e}"

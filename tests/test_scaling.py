@@ -24,8 +24,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.dcm import DCMModel, _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
-from src.solvers.fixed_point import solve_fixed_point, _fp_step_chunked
-from src.solvers.quasi_newton import solve_lbfgs
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm, _fp_step_chunked_dcm
 from src.utils.wng import k_s_generator_pl
 
 
@@ -229,7 +228,7 @@ class TestChunkedFPStep:
         y_new = torch.where(D_in > 0, k_in / D_in, y)
         return x_new, y_new
 
-    @pytest.mark.parametrize("variant", ["gauss-seidel", "jacobi"])
+    @pytest.mark.parametrize("variant", ["gauss-seidel"])
     @pytest.mark.parametrize("N,seed", [(6, 0), (15, 1), (30, 2)])
     def test_chunked_matches_dense(self, variant: str, N: int, seed: int) -> None:
         """Chunked step must produce the same x_new and y_new as the dense step."""
@@ -240,7 +239,7 @@ class TestChunkedFPStep:
         k_in = torch.tensor(rng.uniform(1.0, N - 1, N), dtype=torch.float64)
 
         x_dense, y_dense = self._dense_step(x, y, k_out, k_in, variant)
-        x_chunk, y_chunk = _fp_step_chunked(x, y, k_out, k_in, chunk_size=3, variant=variant)
+        x_chunk, y_chunk, _ = _fp_step_chunked_dcm(x, y, k_out, k_in, chunk_size=3)
 
         assert torch.allclose(x_dense, x_chunk, atol=1e-12), (
             f"x_new mismatch ({variant}): max diff {(x_dense - x_chunk).abs().max():.3e}"
@@ -259,8 +258,8 @@ class TestChunkedFPStep:
         k_out = torch.tensor(rng.uniform(1.0, 5.0, N), dtype=torch.float64)
         k_in = torch.tensor(rng.uniform(1.0, 5.0, N), dtype=torch.float64)
 
-        x_ref, y_ref = _fp_step_chunked(x, y, k_out, k_in, chunk_size=1, variant="gauss-seidel")
-        x_c, y_c = _fp_step_chunked(x, y, k_out, k_in, chunk_size=chunk_size, variant="gauss-seidel")
+        x_ref, y_ref, _ = _fp_step_chunked_dcm(x, y, k_out, k_in, chunk_size=1)
+        x_c, y_c, _ = _fp_step_chunked_dcm(x, y, k_out, k_in, chunk_size=chunk_size)
         assert torch.allclose(x_ref, x_c, atol=1e-12)
         assert torch.allclose(y_ref, y_c, atol=1e-12)
 
@@ -282,24 +281,24 @@ class TestChunkedConvergenceSmall:
         return None
 
     def test_fixed_point_invalid_chunk_size_raises(self, model_100: DCMModel | None) -> None:
-        """solve_fixed_point must raise ValueError for negative chunk_size."""
+        """solve_fixed_point_dcm must raise ValueError for negative chunk_size."""
         if model_100 is None:
             pytest.skip("No feasible N=100 network found")
         theta0 = model_100.initial_theta("degrees")
         with pytest.raises(ValueError, match="chunk_size"):
-            solve_fixed_point(
+            solve_fixed_point_dcm(
                 model_100.residual, theta0, model_100.k_out, model_100.k_in,
                 chunk_size=-1,
             )
 
     def test_fixed_point_chunk_size_zero_accepted(self, model_100: DCMModel | None) -> None:
-        """solve_fixed_point must accept chunk_size=0 (auto-select) and converge."""
+        """solve_fixed_point_dcm must accept chunk_size=0 (auto-select) and converge."""
         if model_100 is None:
             pytest.skip("No feasible N=100 network found")
         theta0 = model_100.initial_theta("degrees")
-        result = solve_fixed_point(
+        result = solve_fixed_point_dcm(
             model_100.residual, theta0, model_100.k_out, model_100.k_in,
-            tol=1e-7, max_iter=5_000, damping=1.0, variant="gauss-seidel",
+            tol=1e-7, max_iter=5_000, variant="gauss-seidel",
             chunk_size=0,  # 0 means auto-select
         )
         err = model_100.constraint_error(result.theta)
@@ -312,29 +311,14 @@ class TestChunkedConvergenceSmall:
         if model_100 is None:
             pytest.skip("No feasible N=100 network found")
         theta0 = model_100.initial_theta("degrees")
-        result = solve_fixed_point(
+        result = solve_fixed_point_dcm(
             model_100.residual, theta0, model_100.k_out, model_100.k_in,
-            tol=1e-7, max_iter=5_000, damping=1.0, variant="gauss-seidel",
+            tol=1e-7, max_iter=5_000, variant="gauss-seidel",
             chunk_size=16,
         )
         err = model_100.constraint_error(result.theta)
         assert err < CONV_TOL, (
             f"Fixed-point GS (chunked) N=100: err={err:.3e} conv={result.converged}"
-        )
-
-    def test_lbfgs_chunked_residual_convergence(self, model_100: DCMModel | None) -> None:
-        """L-BFGS must converge when residual uses explicitly chunked computation."""
-        if model_100 is None:
-            pytest.skip("No feasible N=100 network found")
-        theta0 = model_100.initial_theta("degrees")
-        # Force chunked residual by using _residual_chunked directly
-        result = solve_lbfgs(
-            model_100._residual_chunked, theta0, tol=1e-7, m=20,
-            neg_loglik_fn=model_100._neg_log_likelihood_chunked,
-        )
-        err = model_100.constraint_error(result.theta)
-        assert err < CONV_TOL, (
-            f"L-BFGS (chunked residual) N=100: err={err:.3e} conv={result.converged}"
         )
 
 
@@ -364,9 +348,9 @@ class TestScalingN1000:
         if model_1k is None:
             pytest.skip("No feasible N=1000 network found")
         theta0 = model_1k.initial_theta("degrees")
-        result = solve_fixed_point(
+        result = solve_fixed_point_dcm(
             model_1k.residual, theta0, model_1k.k_out, model_1k.k_in,
-            tol=1e-6, max_iter=10_000, damping=1.0, variant="gauss-seidel",
+            tol=1e-6, max_iter=10_000, variant="gauss-seidel",
         )
         err = model_1k.constraint_error(result.theta)
         assert err < CONV_TOL, (
@@ -374,18 +358,18 @@ class TestScalingN1000:
             f"iters={result.iterations}"
         )
 
-    def test_lbfgs_n1000(self, model_1k: DCMModel | None) -> None:
-        """L-BFGS must converge for N=1000."""
+    def test_theta_newton_n1000(self, model_1k: DCMModel | None) -> None:
+        """θ-Newton must converge for N=1000."""
         if model_1k is None:
             pytest.skip("No feasible N=1000 network found")
         theta0 = model_1k.initial_theta("degrees")
-        result = solve_lbfgs(
-            model_1k.residual, theta0, tol=1e-6, m=20,
-            neg_loglik_fn=model_1k.neg_log_likelihood,
+        result = solve_fixed_point_dcm(
+            model_1k.residual, theta0, model_1k.k_out, model_1k.k_in,
+            tol=1e-6, max_iter=5_000, variant="theta-newton", anderson_depth=10,
         )
         err = model_1k.constraint_error(result.theta)
         assert err < CONV_TOL, (
-            f"L-BFGS N=1000: err={err:.3e} conv={result.converged} "
+            f"θ-Newton N=1000: err={err:.3e} conv={result.converged} "
             f"iters={result.iterations}"
         )
 

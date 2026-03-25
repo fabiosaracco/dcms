@@ -241,14 +241,15 @@ class TestZeroDegreeBehavior:
 
     def test_solver_converges_with_zero_degree_nodes(self) -> None:
         """Zero-degree nodes must not prevent solver convergence."""
-        from src.solvers.newton import solve_newton
+        from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
         model = self._make_zero_degree_model()
         theta0 = model.initial_theta("degrees")
-        result = solve_newton(
-            model.residual, model.jacobian, theta0, tol=1e-10, max_iter=100,
+        result = solve_fixed_point_dcm(
+            model.residual, theta0, model.k_out, model.k_in,
+            tol=1e-10, max_iter=5000, variant="theta-newton", anderson_depth=10,
         )
         err = model.constraint_error(result.theta)
-        assert err < 1e-5, f"Newton error with zero-degree nodes: {err:.3e}"
+        assert err < 1e-5, f"θ-Newton error with zero-degree nodes: {err:.3e}"
 
 
 class TestSaturatedNodeBehavior:
@@ -337,11 +338,12 @@ class TestSaturatedNodeBehavior:
 
     def test_solver_converges_with_saturated_nodes(self) -> None:
         """Saturated nodes must not prevent solver convergence."""
-        from src.solvers.newton import solve_newton
+        from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
         model = self._make_saturated_model()
         theta0 = model.initial_theta("degrees")
-        result = solve_newton(
-            model.residual, model.jacobian, theta0, tol=1e-10, max_iter=200,
+        result = solve_fixed_point_dcm(
+            model.residual, theta0, model.k_out, model.k_in,
+            tol=1e-10, max_iter=5000, variant="theta-newton", anderson_depth=10,
         )
         err = model.constraint_error(result.theta)
-        assert err < 1e-5, f"Newton error with saturated nodes: {err:.3e}"
+        assert err < 1e-5, f"θ-Newton error with saturated nodes: {err:.3e}"

@@ -26,10 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.models.dwcm import DWCMModel, _ETA_MAX, _ETA_MIN
 from src.solvers.base import SolverResult
 from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-from src.solvers.quasi_newton import solve_lbfgs
-from src.solvers.newton import solve_newton
-from src.solvers.broyden import solve_broyden
-from src.solvers.levenberg_marquardt import solve_lm
 
 
 # ---------------------------------------------------------------------------
@@ -375,17 +371,6 @@ class TestFixedPointDWCM:
         err = model.constraint_error(result.theta)
         assert err < CONV_TOL, f"N={N} GS error={err:.3e}"
 
-    @pytest.mark.parametrize("N,seed", [(4, 2), (10, 3)])
-    def test_jacobi_converges(self, N: int, seed: int) -> None:
-        model, _ = make_dwcm_model(N=N, seed=seed)
-        theta0 = model.initial_theta("strengths")
-        result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-10, max_iter=5000, damping=0.5, variant="jacobi",
-        )
-        err = model.constraint_error(result.theta)
-        assert err < CONV_TOL, f"N={N} Jacobi error={err:.3e}"
-
     def test_result_has_residual_history(self) -> None:
         model, _ = make_dwcm_model(N=4, seed=0)
         theta0 = model.initial_theta("strengths")
@@ -444,7 +429,7 @@ class TestFixedPointDWCM:
         beta_out_new_dense = torch.where(D_out > 0, model.s_out / D_out, beta_out)
 
         beta_out_new_chunked, _, _ = _fp_step_chunked_dwcm(
-            beta_out, beta_in, model.s_out, model.s_in, chunk_size=3, variant="gauss-seidel"
+            beta_out, beta_in, model.s_out, model.s_in, chunk_size=3
         )
         assert torch.allclose(beta_out_new_dense, beta_out_new_chunked, atol=1e-13), (
             f"Max diff: {(beta_out_new_dense - beta_out_new_chunked).abs().max().item():.3e}"
@@ -535,122 +520,3 @@ class TestThetaNewtonDWCM:
         assert result.elapsed_time >= 0.0
         assert result.peak_ram_bytes >= 0
         assert len(result.residuals) > 0
-
-
-class TestLBFGSDWCM:
-    """Tests for L-BFGS solver on DWCM problems."""
-
-    def _make_clamped_residual(self, model: DWCMModel):
-        """Wrap residual to clamp theta to valid DWCM range."""
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.residual(theta_safe)
-        return fn
-
-    def _make_clamped_nll(self, model: DWCMModel):
-        """Wrap neg_log_likelihood to clamp theta to valid DWCM range."""
-        def fn(theta: torch.Tensor) -> float:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.neg_log_likelihood(theta_safe)
-        return fn
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
-    def test_converges(self, N: int, seed: int) -> None:
-        model, _ = make_dwcm_model(N=N, seed=seed)
-        theta0 = model.initial_theta("strengths")
-        result = solve_lbfgs(
-            self._make_clamped_residual(model), theta0, tol=1e-10, max_iter=2000,
-            neg_loglik_fn=self._make_clamped_nll(model),
-            theta_bounds=(_ETA_MIN, _ETA_MAX),
-        )
-        err = model.constraint_error(result.theta)
-        assert err < CONV_TOL, f"N={N} LBFGS error={err:.3e}"
-
-
-class TestNewtonDWCM:
-    """Tests for full Newton solver on DWCM problems."""
-
-    def _make_clamped_residual(self, model: DWCMModel):
-        """Wrap residual to clamp theta to valid DWCM range."""
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.residual(theta_safe)
-        return fn
-
-    def _make_clamped_jacobian(self, model: DWCMModel):
-        """Wrap jacobian to clamp theta to valid DWCM range."""
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.jacobian(theta_safe)
-        return fn
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
-    def test_converges(self, N: int, seed: int) -> None:
-        model, _ = make_dwcm_model(N=N, seed=seed)
-        theta0 = model.initial_theta("strengths")
-        result = solve_newton(
-            self._make_clamped_residual(model),
-            self._make_clamped_jacobian(model),
-            theta0, tol=1e-10, max_iter=100,
-            theta_bounds=(_ETA_MIN, _ETA_MAX),
-        )
-        err = model.constraint_error(result.theta)
-        assert err < CONV_TOL, f"N={N} Newton error={err:.3e}"
-
-
-class TestBroydenDWCM:
-    """Tests for Broyden solver on DWCM problems."""
-
-    def _make_clamped_residual(self, model: DWCMModel):
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.residual(theta_safe)
-        return fn
-
-    def _make_clamped_jacobian(self, model: DWCMModel):
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.jacobian(theta_safe)
-        return fn
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
-    def test_converges(self, N: int, seed: int) -> None:
-        model, _ = make_dwcm_model(N=N, seed=seed)
-        theta0 = model.initial_theta("strengths")
-        result = solve_broyden(
-            self._make_clamped_residual(model),
-            self._make_clamped_jacobian(model),
-            theta0, tol=1e-10, max_iter=500,
-            theta_bounds=(_ETA_MIN, _ETA_MAX),
-        )
-        err = model.constraint_error(result.theta)
-        assert err < CONV_TOL, f"N={N} Broyden error={err:.3e}"
-
-
-class TestLevenbergMarquardtDWCM:
-    """Tests for LM solver on DWCM problems."""
-
-    def _make_clamped_residual(self, model: DWCMModel):
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.residual(theta_safe)
-        return fn
-
-    def _make_clamped_jacobian(self, model: DWCMModel):
-        def fn(theta: torch.Tensor) -> torch.Tensor:
-            theta_safe = theta.clamp(_ETA_MIN, _ETA_MAX)
-            return model.jacobian(theta_safe)
-        return fn
-
-    @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
-    def test_converges(self, N: int, seed: int) -> None:
-        model, _ = make_dwcm_model(N=N, seed=seed)
-        theta0 = model.initial_theta("strengths")
-        result = solve_lm(
-            self._make_clamped_residual(model),
-            self._make_clamped_jacobian(model),
-            theta0, tol=1e-10, max_iter=500,
-            theta_bounds=(_ETA_MIN, _ETA_MAX),
-        )
-        err = model.constraint_error(result.theta)
-        assert err < CONV_TOL, f"N={N} LM error={err:.3e}"

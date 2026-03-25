@@ -32,12 +32,7 @@ import torch
 
 from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
-from src.solvers.fixed_point import solve_fixed_point
 from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.quasi_newton import solve_lbfgs
-from src.solvers.newton import solve_newton
-from src.solvers.broyden import solve_broyden
-from src.solvers.levenberg_marquardt import solve_lm
 from src.utils.wng import k_s_generator_pl
 
 # ---------------------------------------------------------------------------
@@ -49,10 +44,6 @@ DEFAULT_RHO: float = 0.001
 DEFAULT_TOL: float = 1e-5
 SOLVER_TIMEOUT: float = 300.0
 DEFAULT_N_SEEDS: int = 10
-FAST_SOLVER_TIMEOUT_S: float = 60.0
-
-# Newton/Broyden/LM require O(N²) RAM — skip for large N.
-NEWTON_N_MAX: int = 2_000
 
 
 # ---------------------------------------------------------------------------
@@ -133,40 +124,10 @@ def _make_solvers(
         model:  Fitted DCMModel.
         theta0: Initial parameter vector.
         tol:    Convergence tolerance.
-        fast:   If True, skip plain FP variants, Broyden, and LM;
-                keep FP-GS(α=1), FP-GS Anderson(10), θ-Newton Anderson(10),
-                L-BFGS, and Newton (when N ≤ NEWTON_N_MAX).
+        fast:   Unused; both methods always run.
     """
-    N = model.N
-
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
-    # FP-GS α=1.0 — always included (fastest baseline)
-    solvers.append((
-        "FP-GS (α=1.0)",
-        lambda: solve_fixed_point(
-            model.residual, theta0, model.k_out, model.k_in,
-            tol=tol, damping=1.0, variant="gauss-seidel",
-        ),
-    ))
-
-    if not fast:
-        solvers.append((
-            "FP-GS (α=0.5)",
-            lambda: solve_fixed_point(
-                model.residual, theta0, model.k_out, model.k_in,
-                tol=tol, damping=0.5, variant="gauss-seidel",
-            ),
-        ))
-        solvers.append((
-            "FP-Jacobi (α=1.0)",
-            lambda: solve_fixed_point(
-                model.residual, theta0, model.k_out, model.k_in,
-                tol=tol, damping=1.0, variant="jacobi",
-            ),
-        ))
-
-    # FP-GS Anderson(10) — always included
     solvers.append((
         "FP-GS Anderson(10)",
         lambda: solve_fixed_point_dcm(
@@ -175,7 +136,6 @@ def _make_solvers(
         ),
     ))
 
-    # θ-Newton Anderson(10) — always included
     solvers.append((
         "θ-Newton Anderson(10)",
         lambda: solve_fixed_point_dcm(
@@ -183,37 +143,6 @@ def _make_solvers(
             tol=tol, variant="theta-newton", anderson_depth=10,
         ),
     ))
-
-    # L-BFGS — always included
-    solvers.append((
-        "L-BFGS (m=20)",
-        lambda: solve_lbfgs(
-            model.residual, theta0, tol=tol, m=20,
-            neg_loglik_fn=model.neg_log_likelihood,
-        ),
-    ))
-
-    # Newton / Broyden / LM — O(N²) RAM, skip for large N
-    if N <= NEWTON_N_MAX:
-        solvers.append((
-            "Newton (exact J)",
-            lambda: solve_newton(
-                model.residual, model.jacobian, theta0, tol=tol,
-            ),
-        ))
-        if not fast:
-            solvers.append((
-                "Broyden (rank-1 J)",
-                lambda: solve_broyden(
-                    model.residual, model.jacobian, theta0, tol=tol,
-                ),
-            ))
-            solvers.append((
-                "Levenberg-Marquardt",
-                lambda: solve_lm(
-                    model.residual, model.jacobian, theta0, tol=tol,
-                ),
-            ))
 
     return solvers
 
@@ -304,11 +233,8 @@ def _run_single_network(
     model = DCMModel(k_out, k_in)
     theta0 = model.initial_theta("degrees")
 
-    # In fast mode apply a shorter per-solver cap so the benchmark finishes quickly.
-    effective_timeout = (
-        min(timeout, FAST_SOLVER_TIMEOUT_S) if fast and timeout > 0
-        else timeout
-    )
+    # Apply the timeout limit.
+    effective_timeout = timeout
 
     results: dict[str, dict] = {}
     for name, fn in _make_solvers(model, theta0, tol, fast=fast):

@@ -10,15 +10,12 @@ leading to the degree constraints:
     k_out_i = Σ_{j≠i} p_ij
     k_in_i  = Σ_{j≠i} p_ji
 
-Three variants are implemented:
+Two variants are implemented:
 
 * **Gauss-Seidel** — x-space fixed-point; out-multipliers are updated first
   using x_i^{new} = k_out_i / D_out_i where
   D_out_i = Σ_{j≠i} y_j / (1 + x_i y_j).  Fresh x values are immediately
   used when computing the in-multiplier update.
-
-* **Jacobi** — all multipliers updated simultaneously using values from
-  the *previous* iteration.
 
 * **theta-newton** — θ-space coordinate Newton step.  For each node i:
 
@@ -118,11 +115,10 @@ def _fp_step_chunked_dcm(
     k_out: torch.Tensor,
     k_in: torch.Tensor,
     chunk_size: int,
-    variant: str,
     theta: torch.Tensor | None = None,
     max_step: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One chunked fixed-point update step for the DCM degree equations.
+    """One chunked Gauss-Seidel fixed-point update step for the DCM degree equations.
 
     Computes D_out and D_in without materialising the full N×N p matrix.
     Also computes the residual F(θ_current) at the pre-update state.
@@ -136,7 +132,6 @@ def _fp_step_chunked_dcm(
         k_out:      Observed out-degree sequence, shape (N,).
         k_in:       Observed in-degree sequence, shape (N,).
         chunk_size: Number of rows (or columns) per chunk.
-        variant:    ``"jacobi"`` or ``"gauss-seidel"``.
         theta:      Full parameter vector [θ_out | θ_in], shape (2N,), used
                     by the Newton fallback.  Pass ``None`` to disable.
         max_step:   Maximum |Δθ| per node for the Newton fallback step.
@@ -189,7 +184,7 @@ def _fp_step_chunked_dcm(
             _theta_out_nt = (theta[:N] + _delta_out).clamp(-_ETA_MAX, _ETA_MAX)
             x_new = torch.where(_use_newton_out, torch.exp(-_theta_out_nt), x_new)
 
-    x_upd = x_new if variant == "gauss-seidel" else x
+    x_upd = x_new  # Gauss-Seidel: use updated x immediately
 
     # --- D_in pass: Σ_{j≠i} x_j / (1 + x_j y_i), iterate over chunks of j ---
     D_in = torch.zeros(N, dtype=torch.float64)
@@ -344,10 +339,9 @@ def solve_fixed_point_dcm(
         k_in:       Observed in-degree sequence, shape (N,).
         tol:        Convergence tolerance on the ℓ∞ residual norm.
         max_iter:   Maximum number of iterations.
-        damping:    Damping factor α ∈ (0, 1] for the ``"jacobi"`` and
-                    ``"gauss-seidel"`` variants.  α=1 → no damping.
-        variant:    One of ``"jacobi"``, ``"gauss-seidel"``, or
-                    ``"theta-newton"``.
+        damping:    Damping factor α ∈ (0, 1] for the ``"gauss-seidel"``
+                    variant.  α=1 → no damping.
+        variant:    One of ``"gauss-seidel"`` or ``"theta-newton"``.
         chunk_size: If > 0, process the N×N products in chunks of this size.
                     If 0, auto-select based on ``_LARGE_N_THRESHOLD``.
         anderson_depth: Anderson acceleration depth.  0 = plain FP.
@@ -357,10 +351,10 @@ def solve_fixed_point_dcm(
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
     """
-    if variant not in ("jacobi", "gauss-seidel", "theta-newton"):
+    if variant not in ("gauss-seidel", "theta-newton"):
         raise ValueError(
             f"Unknown variant {variant!r}. "
-            "Choose 'jacobi', 'gauss-seidel', or 'theta-newton'."
+            "Choose 'gauss-seidel' or 'theta-newton'."
         )
     if not (0.0 < damping <= 1.0):
         raise ValueError(f"damping must be in (0, 1], got {damping}")
@@ -430,7 +424,7 @@ def solve_fixed_point_dcm(
                 y = torch.exp(-theta[N:])
 
                 x_new, y_new, F_current = _fp_step_chunked_dcm(
-                    x, y, k_out, k_in, effective_chunk, variant,
+                    x, y, k_out, k_in, effective_chunk,
                     theta=None, max_step=max_step,
                 )
 

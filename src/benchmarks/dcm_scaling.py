@@ -1,8 +1,7 @@
 """Phase 3 — DCM Scaling Benchmark.
 
 Tests all applicable DCM solvers across network sizes from N=1 000 to N=50 000
-and prints a comparison table.  Methods that require O(N²) RAM (Newton,
-Broyden, full-Jacobian LM) are automatically skipped for large N.
+and prints a comparison table.
 
 Usage::
 
@@ -10,12 +9,6 @@ Usage::
     python -m src.benchmarks.dcm_scaling --sizes 1000 5000
     python -m src.benchmarks.dcm_scaling --sizes 10000 --seed 7
     python -m src.benchmarks.dcm_scaling --rho 0.05    # sparser networks
-
-Memory thresholds (conservative defaults)
-------------------------------------------
-* N > ``NEWTON_N_MAX`` → skip Newton and Broyden (O(N²) Jacobian).
-* N > ``FULL_JAC_LM_N_MAX`` → use diagonal-only LM instead of full-Jacobian LM.
-* N > ``_LARGE_N_THRESHOLD`` (from DCMModel) → chunked residual / fixed-point.
 
 Reference: AGENTS.md, Phase 3.
 """
@@ -34,25 +27,12 @@ import torch
 
 from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
-from src.solvers.fixed_point import solve_fixed_point
-from src.solvers.quasi_newton import solve_lbfgs
-from src.solvers.newton import solve_newton
-from src.solvers.broyden import solve_broyden
-from src.solvers.levenberg_marquardt import solve_lm
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from src.utils.wng import k_s_generator_pl
 
 # ---------------------------------------------------------------------------
 # Scaling thresholds
 # ---------------------------------------------------------------------------
-
-# Newton and Broyden need the full N×N Jacobian (O(N²) RAM).
-# At N=2 000: 2000²×8 bytes = 32 MB — acceptable.
-# At N=5 000: 5000²×8 bytes = 200 MB — expensive.
-# At N=10 000: 10 000²×8 bytes = 800 MB — impractical on most systems.
-NEWTON_N_MAX: int = 2_000
-
-# Full-Jacobian LM shares the same RAM cost as Newton.
-FULL_JAC_LM_N_MAX: int = 2_000
 
 # Default network sizes to benchmark
 DEFAULT_SIZES: list[int] = [1_000, 5_000, 10_000, 50_000]
@@ -117,10 +97,7 @@ def _make_solvers(
     theta0: torch.Tensor,
     tol: float,
 ) -> list[tuple[str, Callable[[], SolverResult]]]:
-    """Return a list of (name, callable) pairs for methods applicable to *model*.
-
-    Methods that would require more RAM than is practical for ``model.N``
-    are omitted from the list.
+    """Return a list of (name, callable) pairs for the two kept methods.
 
     Args:
         model:  The DCMModel instance for this network.
@@ -130,73 +107,23 @@ def _make_solvers(
     Returns:
         Ordered list of ``(name, solver_callable)`` pairs.
     """
-    N = model.N
     solvers: list[tuple[str, Callable[[], SolverResult]]] = []
 
-    # Fixed-point (always applicable; chunked for large N)
     solvers.append((
-        "Fixed-point GS α=1.0",
-        lambda: solve_fixed_point(
+        "FP-GS Anderson(10)",
+        lambda: solve_fixed_point_dcm(
             model.residual, theta0, model.k_out, model.k_in,
-            tol=tol, damping=1.0, variant="gauss-seidel",
+            tol=tol, variant="gauss-seidel", anderson_depth=10,
         ),
     ))
+
     solvers.append((
-        "Fixed-point GS α=0.5",
-        lambda: solve_fixed_point(
+        "θ-Newton Anderson(10)",
+        lambda: solve_fixed_point_dcm(
             model.residual, theta0, model.k_out, model.k_in,
-            tol=tol, damping=0.5, variant="gauss-seidel",
+            tol=tol, variant="theta-newton", anderson_depth=10,
         ),
     ))
-    solvers.append((
-        "Fixed-point Jacobi",
-        lambda: solve_fixed_point(
-            model.residual, theta0, model.k_out, model.k_in,
-            tol=tol, damping=1.0, variant="jacobi",
-        ),
-    ))
-
-    # L-BFGS (always applicable; chunked residual for large N)
-    solvers.append((
-        "L-BFGS (m=20)",
-        lambda: solve_lbfgs(
-            model.residual, theta0, tol=tol, m=20,
-            neg_loglik_fn=model.neg_log_likelihood,
-        ),
-    ))
-
-    # LM diagonal-only (always applicable — O(N) RAM)
-    solvers.append((
-        "LM (diag Hessian)",
-        lambda: solve_lm(
-            model.residual, model.jacobian, theta0, tol=tol,
-            diagonal_only=True,
-        ),
-    ))
-
-    # Newton, Broyden, full-Jacobian LM — only for small N
-    if N <= NEWTON_N_MAX:
-        solvers.append((
-            "Newton (exact J)",
-            lambda: solve_newton(
-                model.residual, model.jacobian, theta0, tol=tol,
-            ),
-        ))
-        solvers.append((
-            "Broyden (rank-1 J)",
-            lambda: solve_broyden(
-                model.residual, model.jacobian, theta0, tol=tol,
-            ),
-        ))
-
-    if N <= FULL_JAC_LM_N_MAX:
-        solvers.append((
-            "LM (full Jacobian)",
-            lambda: solve_lm(
-                model.residual, model.jacobian, theta0, tol=tol,
-                diagonal_only=False,
-            ),
-        ))
 
     return solvers
 
@@ -258,8 +185,6 @@ def run_scaling_benchmark(
               f"mean={k_out.mean():.1f}")
         print(f"  k_in   min={k_in.min():.0f}  max={k_in.max():.0f}  "
               f"mean={k_in.mean():.1f}")
-        if N > 2_000:
-            print(f"  (Newton, Broyden, full-Jacobian LM skipped — N > {NEWTON_N_MAX:,})")
         print()
         col = [26, 8, 8, 12, 10, 12]
         header = (

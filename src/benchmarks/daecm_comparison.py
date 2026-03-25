@@ -52,12 +52,8 @@ import torch
 from src.models.daecm import DaECMModel, _ETA_MIN, _ETA_MAX, _LARGE_N_THRESHOLD as _DAECM_LARGE_N
 from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
-from src.solvers.daecm_solver import DaECMResult, solve_daecm, _solve_lm_diag_daecm, solve_daecm_joint_lbfgs
 from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
 from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.quasi_newton import solve_lbfgs
-from src.solvers.newton import solve_newton
-from src.solvers.broyden import solve_broyden
 from src.utils.wng import k_s_generator_pl
 
 
@@ -86,13 +82,6 @@ def _call_with_timeout(fn: Callable, timeout_s: float):
 # ---------------------------------------------------------------------------
 # Scaling thresholds
 # ---------------------------------------------------------------------------
-
-# Weight Newton/Broyden need a 2N×2N Jacobian (O(N²) RAM, ~32 MB at N=1k, ~128 MB at N=2k).
-NEWTON_N_MAX: int = 2_000
-
-# L-BFGS weight step is O(N²) cost per iteration (residual evaluation).
-# Practical for small-medium N; skip for large N.
-LBFGS_N_MAX: int = 10_000
 
 # Default benchmark sizes
 DEFAULT_SIZES: list[int] = [1_000, 5_000]
@@ -134,28 +123,6 @@ def _make_strength_residual_fn(
     def fn(theta_w: torch.Tensor) -> torch.Tensor:
         theta_w_safe = theta_w.clamp(_ETA_MIN, _ETA_MAX)
         return model.residual_strength(theta_topo, theta_w_safe, P=P)
-    return fn
-
-
-def _make_strength_nll_fn(
-    model: DaECMModel,
-    theta_topo: torch.Tensor,
-) -> Callable[[torch.Tensor], float]:
-    """Return a clamped neg_log_likelihood function for the weight step."""
-    def fn(theta_w: torch.Tensor) -> float:
-        theta_w_safe = theta_w.clamp(_ETA_MIN, _ETA_MAX)
-        return model.neg_log_likelihood_strength(theta_topo, theta_w_safe)
-    return fn
-
-
-def _make_strength_jacobian_fn(
-    model: DaECMModel,
-    theta_topo: torch.Tensor,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Return a clamped Jacobian function for the weight step."""
-    def fn(theta_w: torch.Tensor) -> torch.Tensor:
-        theta_w_safe = theta_w.clamp(_ETA_MIN, _ETA_MAX)
-        return model.jacobian_strength(theta_topo, theta_w_safe)
     return fn
 
 
@@ -230,75 +197,6 @@ def _run_topo_step(
         message=best.message,
     )
     return torch.tensor(best.theta, dtype=torch.float64), result
-
-
-def _lbfgs_weight_multistart(
-    model: DaECMModel,
-    theta_topo: torch.Tensor,
-    theta_weight0: torch.Tensor,
-    tol: float,
-    max_iter: int,
-    n_starts: int = 4,
-) -> SolverResult:
-    """L-BFGS weight solver with multiple initialisations.
-
-    Args:
-        model:         DaECMModel instance.
-        theta_topo:    Fixed topology parameters.
-        theta_weight0: Default initial weight parameters.
-        tol:           Convergence tolerance.
-        max_iter:      Maximum iterations per start.
-        n_starts:      Total starting points to try.
-
-    Returns:
-        :class:`~src.solvers.base.SolverResult` with the best solution found.
-    """
-    import time as _t
-    from src.solvers.base import SolverResult as _SR
-
-    res_fn = _make_strength_residual_fn(model, theta_topo)
-    nll_fn = _make_strength_nll_fn(model, theta_topo)
-
-    best_result: Optional[SolverResult] = None
-    best_err = float("inf")
-    total_iters = 0
-    combined_ram = 0
-    t_start = _t.perf_counter()
-
-    starts = [theta_weight0]
-    for method in ("topology", "normalized", "uniform"):
-        starts.append(model.initial_theta_weight(theta_topo, method))
-    for i in range(max(0, n_starts - len(starts))):
-        torch.manual_seed(i)
-        starts.append(model.initial_theta_weight(theta_topo, "random"))
-
-    iter_per_start = max(30, max_iter // n_starts)
-    for t0 in starts[:n_starts]:
-        torch.manual_seed(0)
-        result = solve_lbfgs(
-            res_fn, t0, tol=tol, m=20, max_iter=iter_per_start,
-            neg_loglik_fn=nll_fn, theta_bounds=(-_ETA_MAX, _ETA_MAX),
-        )
-        total_iters += result.iterations
-        combined_ram = max(combined_ram, result.peak_ram_bytes)
-        err = model.constraint_error_strength(theta_topo, result.theta)
-        if err < best_err:
-            best_err = err
-            best_result = result
-        if result.converged:
-            break
-
-    assert best_result is not None
-    elapsed = _t.perf_counter() - t_start
-    return _SR(
-        theta=best_result.theta,
-        converged=best_result.converged,
-        iterations=total_iters,
-        residuals=best_result.residuals,
-        elapsed_time=elapsed,
-        peak_ram_bytes=combined_ram,
-        message=best_result.message,
-    )
 
 
 def _fp_weight_multistart(
@@ -421,8 +319,7 @@ def _make_solvers(
         theta_weight0:  Default initial weight parameters.
         tol:            Convergence tolerance.
         timeout:        Per-solver time limit in seconds.
-        fast:           If True, skip FP-GS/θ-Newton (which do not converge for DaECM)
-                        and plain FP/LM; keep Newton/Broyden (N ≤ 500) and L-BFGS (N < 2000).
+        fast:           Unused; both methods always run.
 
     Returns:
         Ordered list of ``(name, solver_callable)`` pairs.
@@ -439,8 +336,6 @@ def _make_solvers(
         P_mat = None
 
     res_fn = _make_strength_residual_fn(model, theta_topo, P=P_mat)
-    nll_fn = _make_strength_nll_fn(model, theta_topo)
-    jac_fn = _make_strength_jacobian_fn(model, theta_topo)
 
     # Per-method iteration budgets based on residual evaluation cost
     if N <= _DAECM_LARGE_N:
@@ -448,135 +343,38 @@ def _make_solvers(
     else:
         residual_s = max(3e-4, (N / 1_000) ** 2 * 15e-3)
 
-    full_budget_s = timeout if timeout > 0 else 1e9
-    plain_budget_s = min(full_budget_s * 0.2, 30.0)
-    MAX_FP_PLAIN_ITER: int = max(50, min(500, int(plain_budget_s / residual_s)))
-    # Cap Anderson at 500 per init to avoid extremely long non-converging runs
+    full_budget_s = timeout if timeout > 0 else 300.0
     MAX_FP_ANDERSON_ITER: int = max(100, min(2_000, int(full_budget_s / residual_s)))
-    MAX_LBFGS_ITER: int = max(50, min(1_000, int(full_budget_s / (10 * residual_s))))
-    MAX_LM_ITER: int = max(50, min(1_000, int(full_budget_s / (3 * residual_s))))
 
     _N_INITS = 4
     _ITER_PER_INIT_ANDERSON = max(50, MAX_FP_ANDERSON_ITER // _N_INITS)
-    _ITER_PER_INIT_LBFGS = max(30, MAX_LBFGS_ITER // _N_INITS)
-
-    # Per-init wall-clock cap: prevents non-converging inits from burning time.
-    # Caps are based on O(N²) residual cost (empirical at N=1k: ~9ms, N=5k: ~370ms).
-    # In fast mode, tight caps ensure the benchmark stays tractable at any N.
-    # In full mode, cap at 60s (generous enough for convergence characterisation).
-    if fast:
-        if N <= 1_000:
-            _TIME_PER_INIT: float = min(15.0, full_budget_s / _N_INITS)
-        elif N <= 5_000:
-            _TIME_PER_INIT = min(30.0, full_budget_s / _N_INITS)
-        else:
-            _TIME_PER_INIT = min(60.0, full_budget_s / _N_INITS)
-    else:
-        _TIME_PER_INIT = min(60.0, full_budget_s / _N_INITS)
+    _TIME_PER_INIT: float = min(60.0, full_budget_s / _N_INITS)
 
     solvers: list[tuple[str, Callable]] = []
 
-    # ── FP-GS α=1.0 (plain) ────────────────────────────────────────────────
-    if not fast:
-        solvers.append((
-            "FP-GS α=1.0",
-            lambda: solve_fixed_point_daecm(
-                res_fn, theta_weight0, model.s_out, model.s_in,
-                theta_topo=theta_topo, P=P_mat,
-                tol=tol, damping=1.0, variant="gauss-seidel",
-                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-            ),
-        ))
-
-    # ── FP-GS α=0.5 ────────────────────────────────────────────────────────
-    if not fast:
-        solvers.append((
-            "FP-GS α=0.5",
-            lambda: solve_fixed_point_daecm(
-                res_fn, theta_weight0, model.s_out, model.s_in,
-                theta_topo=theta_topo, P=P_mat,
-                tol=tol, damping=0.5, variant="gauss-seidel",
-                max_iter=MAX_FP_PLAIN_ITER, anderson_depth=0,
-            ),
-        ))
-
     # ── FP-GS + Anderson(10) multi-init ─────────────────────────────────────
-    # NOTE: in fast mode this is skipped for small N — empirically the FP-GS
-    # fixed-point for DaECM is not a contraction mapping.  For N≥2000 the PR#12
-    # fixes (weighted Anderson, θ-floor, blowup reset, Newton fallback) make the
-    # solver viable and it is included in fast mode to cover the N=5000 case.
-    if not fast or N >= 2_000:
-        def _fp_anderson_multistart() -> SolverResult:
-            return _fp_weight_multistart(
-                model, theta_topo, theta_weight0, tol=tol,
-                max_iter=_ITER_PER_INIT_ANDERSON * _N_INITS,
-                variant="gauss-seidel", anderson_depth=10,
-                n_starts=_N_INITS,
-                max_time_per_init=_TIME_PER_INIT,
-            )
+    def _fp_anderson_multistart() -> SolverResult:
+        return _fp_weight_multistart(
+            model, theta_topo, theta_weight0, tol=tol,
+            max_iter=_ITER_PER_INIT_ANDERSON * _N_INITS,
+            variant="gauss-seidel", anderson_depth=10,
+            n_starts=_N_INITS,
+            max_time_per_init=_TIME_PER_INIT,
+        )
 
-        solvers.append(("FP-GS Anderson(10) multi-init", _fp_anderson_multistart))
+    solvers.append(("FP-GS Anderson(10) multi-init", _fp_anderson_multistart))
 
     # ── θ-Newton + Anderson(10) multi-init ──────────────────────────────────
-    # Same rationale as FP-GS: excluded in fast mode for small N; included for
-    # N≥2000 because PR#12 fixes make it viable for N=5000 bad seeds.
-    if not fast or N >= 2_000:
-        def _theta_newton_multistart() -> SolverResult:
-            return _fp_weight_multistart(
-                model, theta_topo, theta_weight0, tol=tol,
-                max_iter=_ITER_PER_INIT_ANDERSON * _N_INITS,
-                variant="theta-newton", anderson_depth=10, max_step=1.0,
-                n_starts=_N_INITS,
-                max_time_per_init=_TIME_PER_INIT,
-            )
+    def _theta_newton_multistart() -> SolverResult:
+        return _fp_weight_multistart(
+            model, theta_topo, theta_weight0, tol=tol,
+            max_iter=_ITER_PER_INIT_ANDERSON * _N_INITS,
+            variant="theta-newton", anderson_depth=10, max_step=1.0,
+            n_starts=_N_INITS,
+            max_time_per_init=_TIME_PER_INIT,
+        )
 
-        solvers.append(("θ-Newton Anderson(10) multi-init", _theta_newton_multistart))
-
-    # ── L-BFGS multi-start ──────────────────────────────────────────────────
-    # Skip for very large N (O(N²) residual cost per step).
-    # In fast mode, include L-BFGS up to N=5000 as the guaranteed fallback
-    # for seeds where the FP map spectral radius > 1 (e.g. high-s/k hub nodes).
-    _skip_lbfgs = N > LBFGS_N_MAX or (fast and N > 5_000)
-    if not _skip_lbfgs:
-        def _lbfgs_ms() -> SolverResult:
-            return _lbfgs_weight_multistart(
-                model, theta_topo, theta_weight0, tol=tol,
-                max_iter=_ITER_PER_INIT_LBFGS * _N_INITS, n_starts=_N_INITS,
-            )
-
-        solvers.append(("L-BFGS (multi-start)", _lbfgs_ms))
-
-    # ── Diagonal LM (O(N) RAM) ──────────────────────────────────────────────
-    if not fast:
-        solvers.append((
-            "LM (diag Hessian)",
-            lambda: _solve_lm_diag_daecm(
-                model, theta_topo, theta_weight0,
-                tol=tol, theta_bounds=(_ETA_MIN, _ETA_MAX),
-                max_iter=MAX_LM_ITER,
-            ),
-        ))
-
-    # ── Newton / Broyden (only for small N) ──────────────────────────────────
-    # In full mode: allow up to NEWTON_N_MAX=2000 (2N×2N Jacobian, ~128 MB at N=2k).
-    # In fast mode: cap at 500 — at N=1000 Newton's O(N³) linear solve takes
-    # ~5s/iter and with 100+ iters can exceed 10 minutes; L-BFGS is safer.
-    _newton_n_limit = 500 if fast else NEWTON_N_MAX
-    if N <= _newton_n_limit:
-        solvers.append((
-            "Newton (exact J)",
-            lambda: solve_newton(
-                res_fn, jac_fn, theta_weight0, tol=tol, max_iter=500,
-                theta_bounds=(_ETA_MIN, _ETA_MAX),
-            ),
-        ))
-        solvers.append((
-            "Broyden (rank-1 J)",
-            lambda: solve_broyden(
-                res_fn, jac_fn, theta_weight0, tol=tol, max_iter=500,
-                theta_bounds=(_ETA_MIN, _ETA_MAX),
-            ),
-        ))
+    solvers.append(("θ-Newton Anderson(10) multi-init", _theta_newton_multistart))
 
     return solvers
 
@@ -645,16 +443,6 @@ def run_comparison(
             f"{mre:>{col[3]}.3e} {result.elapsed_time:>{col[4]}.3f} "
             f"{result.peak_ram_bytes/1024:>{col[5]}.1f}"
         )
-
-    # Joint L-BFGS (full 4N)
-    jr = solve_daecm_joint_lbfgs(model, tol=tol, max_iter=2_000, m=20)
-    mre_j = model.max_relative_error(jr.theta_topo, jr.theta_weight)
-    conv_j = "YES" if jr.converged else "NO"
-    print(
-        f"{'L-BFGS joint (4N)':<{col[0]}} {conv_j:>{col[1]}} {jr.topo_iterations:>{col[2]}} "
-        f"{mre_j:>{col[3]}.3e} {jr.elapsed_time:>{col[4]}.3f} "
-        f"{jr.peak_ram_bytes/1024:>{col[5]}.1f}"
-    )
     print()
 
 
@@ -758,38 +546,6 @@ def _run_single_network(
             )
         except Exception:
             results[name] = dict(
-                converged=False, iterations=0, max_rel_err=float("nan"),
-                elapsed=time.perf_counter() - t_start,
-                peak_ram_mb=float("nan"), status="ERR",
-            )
-
-    # ── Joint L-BFGS (full 4N optimisation) — skipped in fast mode ──────────
-    if not fast:
-        t_start = time.perf_counter()
-        try:
-            jr: DaECMResult = _call_with_timeout(
-                lambda: solve_daecm_joint_lbfgs(
-                    model, tol=tol, max_iter=2_000, m=20,
-                ),
-                timeout,
-            )
-            mre = model.max_relative_error(jr.theta_topo, jr.theta_weight)
-            results["L-BFGS joint (4N)"] = dict(
-                converged=jr.converged,
-                iterations=jr.topo_iterations,
-                max_rel_err=mre,
-                elapsed=jr.elapsed_time,
-                peak_ram_mb=jr.peak_ram_bytes / 1024 / 1024,
-                status="OK" if jr.converged else "NO-CONV",
-            )
-        except _TimeoutError:
-            results["L-BFGS joint (4N)"] = dict(
-                converged=False, iterations=0, max_rel_err=float("nan"),
-                elapsed=time.perf_counter() - t_start,
-                peak_ram_mb=float("nan"), status="TIMEOUT",
-            )
-        except Exception:
-            results["L-BFGS joint (4N)"] = dict(
                 converged=False, iterations=0, max_rel_err=float("nan"),
                 elapsed=time.perf_counter() - t_start,
                 peak_ram_mb=float("nan"), status="ERR",

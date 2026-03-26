@@ -44,7 +44,8 @@ from typing import Callable
 
 import torch
 
-from src.models.dcm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
+from src.models.parameters import DCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import _DEFAULT_CHUNK
 from src.solvers.base import SolverResult
 
 _ETA_MIN: float = 1e-10

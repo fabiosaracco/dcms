@@ -51,7 +51,8 @@ from typing import Callable
 
 import torch
 
-from src.models.daecm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
+from src.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 from src.solvers.base import SolverResult
 
 _ANDERSON_MAX_NORM: float = 1e6

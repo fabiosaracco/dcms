@@ -44,8 +44,8 @@ from typing import Callable
 import torch
 
 from .base import SolverResult
-from src.models.dwcm import _LARGE_N_THRESHOLD, _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
-
+from src.models.parameters import DWCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 # Maximum ℓ∞ norm of the Anderson FP-residual r_k = g(θ_k) − θ_k accepted
 # into the mixing history.  Iterates beyond this threshold are skipped to
 # prevent Anderson mixing from being contaminated by extreme values.  The

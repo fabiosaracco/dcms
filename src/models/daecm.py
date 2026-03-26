@@ -43,24 +43,22 @@ from typing import Union
 
 import torch
 
+from src.solvers.base import SolverResult
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+
 from src.models.dcm import DCMModel, _THETA_MAX
 
 # Type alias for inputs: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
 
-# θ_β lower bound: ensures β = exp(−θ) < 1 and avoids div-by-zero in w_ij.
-_ETA_MIN: float = 1e-10
-# θ_β upper bound: exp(−50) ≈ 2e-22, essentially zero weight contribution.
-_ETA_MAX: float = 50.0
+from src.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
+
 # Maximum allowed β_out * β_in product; individual β may exceed 1 as long
 # as the pairwise product stays below this threshold.
 _Q_MAX: float = 0.9999
 
-# For N > this threshold, use chunked computation to avoid N×N materialisation.
-_LARGE_N_THRESHOLD: int = 2_000
-
-# Number of rows processed per chunk when using memory-efficient mode.
-_DEFAULT_CHUNK: int = 512
 
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
@@ -764,3 +762,41 @@ class DaECMModel:
             mre_str = 0.0
 
         return max(mre_topo, mre_str)
+
+    # ------------------------------------------------------------------
+    # Using the solve function
+    # ------------------------------------------------------------------
+
+    def solve_tool(self, ic_topo:str='degrees', ic_wei:str='strengths', tol:float=1e-6, max_iter:int=2000, variant:str='theta-newton', anderson_depth:int=10)-> SolverResult:
+        """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
+
+        Args:
+            ic_topo (str): the initial condition on theta for the topology. Default="degrees", another possible choice is "random".
+            ic_wei (str): the initial condition on theta for the weights. Default="strengths", another possible choice is "random".
+            tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
+            max_iter (int): the maximum number of iterations. Default=2000.
+            variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
+            anderson_depth (int): Anderson acceleration depth. Default=10.
+
+        Returns:
+            :class:`~src.solvers.base.SolverResult` instance.
+        """
+        # Step 1: solve the DCM topology
+        self.ic_topo=self.initial_theta_topo(ic)
+        self.topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter,variant=variant, anderson_depth=anderson_depth)
+        
+        if len(self.topo.message)>0:
+            print(f'Topology: {self.topo.message}')
+
+            setattr(self.topo, k, v)
+
+        # Step 2: solve the conditioned weight equations
+        self.ic_weig = model_da.initial_theta_weight(theta_topo = _solve_topo.theta, method='topology')
+
+        # Build the residual function that fixes theta_topo
+        res_weight = functools.partial(self.residual_strength, theta_topo=_solve_topo.theta)
+
+        self.weig = solve_fixed_point_daecm(res_weight, self.ic_weig, model_da.s_out, model_da.s_in, theta_topo=theta_topo, P=None, tol=tol, max_iter=max_iter,variant=variant, anderson_depth=anderson_depth)
+
+        return self.topo.converged and self.weig.converged
+

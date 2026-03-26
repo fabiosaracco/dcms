@@ -30,6 +30,10 @@ from typing import Union
 
 import torch
 
+from src.solvers.base import SolverResult
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+
+
 
 # Type alias for inputs: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
@@ -39,10 +43,10 @@ _THETA_MAX: float = 50.0
 
 # For N > this threshold, residual() and neg_log_likelihood() automatically
 # use chunked computation to avoid materialising the full N×N matrix.
-_LARGE_N_THRESHOLD: int = 5_000
+from src.models.parameters import DCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 
 # Number of rows processed per chunk when using memory-efficient mode.
-_DEFAULT_CHUNK: int = 512
+from src.models.parameters import _DEFAULT_CHUNK
 
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
@@ -418,3 +422,29 @@ class DCMModel:
             Max-abs constraint error (scalar).
         """
         return self.residual(theta).abs().max().item()
+
+    # ------------------------------------------------------------------
+    # Using the solve function
+    # ------------------------------------------------------------------
+
+    def solve_tool(self, ic:str='degrees', tol:float=1e-6, max_iter:int=2000, variant:str='theta-newton', anderson_depth:int=10)-> SolverResult:
+        """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
+
+        Args:
+            ic (str): the initial condition on theta. Default="degrees", another possible choice is "random".
+            tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
+            max_iter (int): the maximum number of iterations. Default=2000.
+            variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
+            anderson_depth (int): Anderson acceleration depth. Default=10.
+
+        Returns:
+            :class:`~src.solvers.base.SolverResult` instance.
+        """
+        self.ic=self.initial_theta(ic)
+        _solve = solve_fixed_point_dcm(self.residual, self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, variant=variant, anderson_depth=anderson_depth)
+        if len(_solve.message)>0:
+            print(_solve.message)
+            
+        # move all the attributes of _solve to self
+        self.__dict__.update(vars(_solve))
+        return _solve.converged

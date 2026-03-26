@@ -14,6 +14,9 @@ Squartini, T. & Garlaschelli, D. (2011). Analytical maximum-likelihood method to
 Mastrandrea, R., Squartini, T., Fagiolo G., and Garlaschelli, D. (2014). Enhanced reconstruction of weighted networks from strengths and degrees. *New Journal of Physics*, 16 043022
 https://iopscience.iop.org/article/10.1088/1367-2630/16/4/043022
 
+Gabrielli, A, Mastrandrea, R., Caldarelli, G. and Cimini, G. (2019) Grand canonical ensemble of weighted networks. *Phys. Rev. E* 99, 030301(R) 
+https://journals.aps.org/pre/abstract/10.1103/PhysRevE.99.030301
+
 Parisi, F., Squartini, T. and Garlaschelli, D. (2020). A faster horse on a safer trail: generalized inference for the efficient reconstruction of weighted networks. *New Journal of Physics*, 22 053053
 https://iopscience.iop.org/article/10.1088/1367-2630/ab74a7
 

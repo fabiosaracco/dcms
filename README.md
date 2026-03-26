@@ -11,9 +11,12 @@ Two solvers are provided for every model, both proven to scale reliably to N = 5
 
 Squartini, T. & Garlaschelli, D. (2011). Analytical maximum-likelihood method to detect patterns in real networks. *New Journal of Physics*, 13, 083001. https://doi.org/10.1088/1367-2630/13/8/083001
 
-
 Mastrandrea, R., Squartini, T., Fagiolo G., and Garlaschelli, D. (2014). Enhanced reconstruction of weighted networks from strengths and degrees. *New Journal of Physics*, 16 043022
 https://iopscience.iop.org/article/10.1088/1367-2630/16/4/043022
+
+Parisi, F., Squartini, T. and Garlaschelli, D. (2020). A faster horse on a safer trail: generalized inference for the efficient reconstruction of weighted networks. *New Journal of Physics*, 22 053053
+https://iopscience.iop.org/article/10.1088/1367-2630/ab74a7
+
 
 ---
 

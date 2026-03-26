@@ -9,6 +9,12 @@ Two solvers are provided for every model, both proven to scale reliably to N = 5
 | **FP-GS Anderson(10)** | Gauss-Seidel fixed-point + Anderson(10) acceleration | DWCM/DaECM where the contraction condition holds (mild heterogeneity) |
 | **θ-Newton Anderson(10)** | Coordinate-wise Newton in log-space + Anderson(10) acceleration | Default choice — most robust, fastest at large N |
 
+Squartini, T. & Garlaschelli, D. (2011). Analytical maximum-likelihood method to detect patterns in real networks. *New Journal of Physics*, 13, 083001. https://doi.org/10.1088/1367-2630/13/8/083001
+
+
+Mastrandrea, R., Squartini, T., Fagiolo G., and Garlaschelli, D. (2014). Enhanced reconstruction of weighted networks from strengths and degrees. *New Journal of Physics*, 16 043022
+https://iopscience.iop.org/article/10.1088/1367-2630/16/4/043022
+
 ---
 
 ## 1. Models
@@ -41,7 +47,7 @@ where `β = exp(-θ)`.  **Feasibility constraint:** `β_out_i · β_in_j < 1` fo
 
 ### 1.3 DaECM — Directed approximated Enhanced Configuration Model (binary + weighted)
 
-The DaECM constrains *four* sequences per node: **out-degree**, **in-degree**, **out-strength** and **in-strength** simultaneously.  It is solved in two sequential steps:
+The DaECM constrains *four* sequences per node: **out-degree**, **in-degree**, **out-strength** and **in-strength**.  It is solved in two sequential steps:
 
 1. **Topology step** — solve the DCM to find `2N` multipliers `(x_i, y_i)` reproducing the degree sequences.  The resulting link probability is `p_ij = x_i · y_j / (1 + x_i · y_j)`.
 
@@ -56,10 +62,10 @@ The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight mu
 
 **Feasibility constraint:** `β_out_i · β_in_j < 1` for all `i ≠ j`.
 
-**Implementation:** `src/models/daecm.py` — `DaECMModel`; `src/solvers/fixed_point_daecm.py` — `solve_fixed_point_daecm`
+**Implementation:** `src/models/daecm.py` — `DaECMModel`<!-- ; `src/solvers/fixed_point_daecm.py` — `solve_fixed_point_daecm`-->
 
-**Reference:**
-Vallarano, N. et al. (2021). Fast and scalable likelihood maximisation for exponential random graph models with local constraints.  *Scientific Reports*, 11, 15227.
+<!-- **Reference:**
+Vallarano, N. et al. (2021). Fast and scalable likelihood maximisation for exponential random graph models with local constraints.  *Scientific Reports*, 11, 15227.-->
 
 ---
 
@@ -127,8 +133,6 @@ All three files share the same algorithmic skeleton:
 
 **Literature:**
 Walker, H.F. & Ni, P. (2011). Anderson acceleration for fixed-point iterations. *SIAM Journal on Numerical Analysis*, 49(4), 1715–1735. https://doi.org/10.1137/10078356X
-
-Squartini, T. & Garlaschelli, D. (2011). Analytical maximum-likelihood method to detect patterns in real networks. *New Journal of Physics*, 13, 083001. https://doi.org/10.1088/1367-2630/13/8/083001
 
 ---
 

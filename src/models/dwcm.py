@@ -567,7 +567,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic:str='strengths', tol:float=1e-6, max_iter:int=2000, variant:str='theta-newton', anderson_depth:int=10)-> SolverResult:
+    def solve_tool(self, ic:str='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -581,7 +581,7 @@ class DWCMModel:
             :class:`~src.solvers.base.SolverResult` instance.
         """
         self.ic=self.initial_theta(ic)
-        _solve = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, variant=variant, anderson_depth=anderson_depth)
+        _solve = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         if len(_solve.message)>0:
             print(_solve.message)
             

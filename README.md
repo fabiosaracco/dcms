@@ -70,10 +70,7 @@ The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight mu
 
 **Feasibility constraint:** `β_out_i · β_in_j < 1` for all `i ≠ j`.
 
-**Implementation:** `src/models/daecm.py` — `DaECMModel`<!-- ; `src/solvers/fixed_point_daecm.py` — `solve_fixed_point_daecm`-->
-
-<!-- **Reference:**
-Vallarano, N. et al. (2021). Fast and scalable likelihood maximisation for exponential random graph models with local constraints.  *Scientific Reports*, 11, 15227.-->
+**Implementation:** `src/models/daecm.py` — `DaECMModel`
 
 ---
 
@@ -203,115 +200,151 @@ Walker, H.F. & Ni, P. (2011). Anderson acceleration for fixed-point iterations. 
 
 ## 3. API Reference
 
-### 3.1 DCM model (`src/models/dcm.py`)
+All three models expose a unified `solve_tool()` method.  Instantiate with the observed sequences, call `solve_tool()`, and inspect the stored result.
+
+### 3.1 DCM — `DCMModel`
 
 ```python
 from src.models.dcm import DCMModel
 
 model = DCMModel(k_out, k_in)
+converged = model.solve_tool(
+    ic="degrees",           # initial condition: "degrees" (default) or "random"
+    tol=1e-6,               # convergence tolerance (ℓ∞ residual)
+    max_iter=2000,
+    max_time=0,             # wall-clock timeout in seconds (0 = no limit)
+    variant="theta-newton", # "theta-newton" (default) or "gauss-seidel"
+    anderson_depth=10,
+)
+theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
+
+Additional model methods:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `model.pij_matrix(theta)` | `(N, N)` tensor | Link-probability matrix `p_ij = x_i y_j / (1 + x_i y_j)` |
 | `model.residual(theta)` | `(2N,)` tensor | Constraint violation `F(θ)` |
-| `model.jacobian(theta)` | `(2N, 2N)` tensor | Exact Jacobian `∂F/∂θ` |
-| `model.hessian_diag(theta)` | `(2N,)` tensor | Diagonal of the Hessian |
-| `model.neg_log_likelihood(theta)` | float | `−L(θ)` for minimisation |
-| `model.constraint_error(theta)` | float | `max|F(θ)|` (convergence metric) |
+| `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
+| `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess: `"degrees"` (default) or `"random"` |
 
-### 3.2 DWCM model (`src/models/dwcm.py`)
+### 3.2 DWCM — `DWCMModel`
 
 ```python
 from src.models.dwcm import DWCMModel
 
 model = DWCMModel(s_out, s_in)
+converged = model.solve_tool(
+    ic="strengths",         # initial condition (see below)
+    tol=1e-6,
+    max_iter=2000,
+    max_time=0,
+    variant="theta-newton",
+    anderson_depth=10,
+)
+theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
 
-Same interface as `DCMModel`.  `initial_theta` additionally supports `"strengths"`, `"normalized"`, and `"uniform"`.
-
-### 3.3 DaECM model (`src/models/daecm.py`)
-
-```python
-from src.models.daecm import DaECMModel
-
-model = DaECMModel(k_out, k_in, s_out, s_in)
-```
+Additional model methods:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `model.residual_topo(theta_topo)` | `(2N,)` | DCM constraint violation |
-| `model.residual_strength(theta_weight, theta_topo)` | `(2N,)` | Weight constraint violation given topology `θ_topo` |
-| `model.initial_theta_topo()` | `(2N,)` | Initial topology guess (degree-based) |
-| `model.initial_theta_weight(theta_topo, method)` | `(2N,)` | Initial weight guess: `"balanced"` or `"topology"` |
-| `model.constraint_error(theta_topo, theta_weight)` | float | Max constraint violation over all 4N equations |
-| `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative constraint error |
+| `model.wij_matrix(theta)` | `(N, N)` tensor | Expected weight matrix `w_ij = β_i β_j / (1 − β_i β_j)` |
+| `model.residual(theta)` | `(2N,)` tensor | Constraint violation `F(θ)` |
+| `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
+| `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
+| `model.max_relative_error(theta)` | float | `max‖F_i‖ / s_i` |
+| `model.initial_theta(method)` | `(2N,)` tensor | Initial guess (see below) |
 
-### 3.4 DCM solver
+`initial_theta` methods for DWCM:
 
-```python
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+| Method | Description |
+|--------|-------------|
+| `"strengths"` (default) | `β ≈ sqrt(s / (s + N − 1))`, mean-field approximation |
+| `"normalized"` | `β_out_i ∝ s_out_i / Σ_j s_out_j` (fractional share of total weight) |
+| `"uniform"` | All β equal to the median of the `"strengths"` approximation |
+| `"random"` | Uniform random `θ ∈ [0.1, 2.0]` |
 
-result = solve_fixed_point_dcm(
-    residual_fn,        # F(θ) callable → (2N,) tensor
-    theta0,             # initial guess (2N,)
-    k_out, k_in,        # observed degree sequences
-    tol=1e-8,           # convergence tolerance (ℓ∞ residual)
-    max_iter=10_000,
-    variant="gauss-seidel",  # "gauss-seidel" or "theta-newton"
-    anderson_depth=10,  # Anderson history depth; 0 = plain FP
-    max_step=1.0,       # max |Δθ| per step ("theta-newton" only)
-    max_time=None,      # wall-clock timeout in seconds
-)
-```
-
-### 3.5 DWCM solver
+### 3.3 DaECM — `DaECMModel`
 
 ```python
-from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-
-result = solve_fixed_point_dwcm(
-    residual_fn,
-    theta0,
-    s_out, s_in,        # observed strength sequences
-    tol=1e-8,
-    max_iter=10_000,
-    variant="gauss-seidel",  # "gauss-seidel" or "theta-newton"
-    anderson_depth=10,
-    max_step=1.0,
-    max_time=None,
-)
-```
-
-### 3.6 DaECM solver (two-step)
-
-```python
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
 from src.models.daecm import DaECMModel
 
 model = DaECMModel(k_out, k_in, s_out, s_in)
-
-# Step 1: solve DCM topology
-theta_topo0 = model.initial_theta_topo()
-res_topo = lambda th: torch.tensor(model.residual_topo(th))
-sr_topo = solve_fixed_point_dcm(
-    res_topo, theta_topo0, model.k_out, model.k_in,
-    tol=1e-6, variant="theta-newton", anderson_depth=10,
+converged = model.solve_tool(
+    ic_topo="degrees",      # topology init: "degrees" (default) or "random"
+    ic_weights="topology",  # weight init: "topology" (default) or "topology_node"
+    tol=1e-6,
+    max_iter=2000,
+    max_time=0,
+    variant="theta-newton",
+    anderson_depth=10,
 )
-theta_topo = sr_topo.theta
+# solve_tool returns True if *both* topology and weight steps converged
+theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
+theta_weight = model.sol_weights.theta # weight parameters, shape (2N,)
+```
 
-# Step 2: solve conditioned weight equations
-theta_w0 = model.initial_theta_weight(theta_topo, method="topology")
-res_weight = lambda th: torch.tensor(model.residual_strength(th, theta_topo))
-sr_weight = solve_fixed_point_daecm(
-    res_weight, theta_w0, model.s_out, model.s_in,
-    theta_topo=theta_topo, P=None,
-    tol=1e-5, variant="theta-newton", anderson_depth=10,
+Additional model methods:
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `model.pij_matrix(theta_topo)` | `(N, N)` tensor | DCM link-probability matrix |
+| `model.wij_matrix_conditioned(theta_topo, theta_weight)` | `(N, N)` tensor | Expected weight matrix |
+| `model.residual_strength(theta_topo, theta_weight)` | `(2N,)` tensor | Strength constraint violation `F_w(θ)` |
+| `model.neg_log_likelihood_strength(theta_topo, theta_weight)` | float | Negative log-likelihood of the weight model |
+| `model.constraint_error_topology(theta_topo)` | float | Max-abs degree constraint error |
+| `model.constraint_error_strength(theta_topo, theta_weight)` | float | Max-abs strength constraint error |
+| `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative error over all 4N constraints |
+| `model.initial_theta_topo(method)` | `(2N,)` tensor | Topology initial guess (`"degrees"` or `"random"`) |
+| `model.initial_theta_weight(theta_topo, method)` | `(2N,)` tensor | Weight initial guess (see below) |
+
+`initial_theta_weight` methods for DaECM:
+
+| Method | Description |
+|--------|-------------|
+| `"topology"` (default) | `β = sqrt(1 − k/s)`, mean-field inversion of `s = k / (1 − β²)` |
+| `"topology_node"` | Per-node Newton solve (5 iterations, chunked); uses p_ij from DCM to give the most accurate starting point |
+
+### 3.4 SolverResult
+
+`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM, `model.sol_topo` / `model.sol_weights` for DaECM.  The `SolverResult` dataclass fields are:
+
+```python
+result.theta           # np.ndarray, shape (2N,) — parameters in log-space (θ = −log β)
+result.converged       # bool
+result.iterations      # int
+result.residuals       # list[float] — ℓ∞ residual norm per accepted step
+result.elapsed_time    # float — wall-clock seconds
+result.peak_ram_bytes  # int
+result.message         # str — warnings or error description
+```
+
+### 3.5 Standalone solvers (advanced)
+
+The underlying solvers can be called directly without the model wrapper, e.g. to pass a custom residual function or to interleave topology and weight steps manually:
+
+```python
+from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
+from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+
+result = solve_fixed_point_dcm(
+    residual_fn,             # callable F(θ) → (2N,) tensor
+    theta0,                  # initial guess (2N,)
+    k_out, k_in,             # observed degree sequences
+    tol=1e-6,
+    max_iter=2000,
+    variant="theta-newton",  # "theta-newton" (default) or "gauss-seidel"
+    anderson_depth=10,
+    max_time=0,
 )
 ```
 
-### 3.7 Network generator (`src/utils/wng.py`)
+`solve_fixed_point_dwcm` and `solve_fixed_point_daecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; DaECM additionally requires `theta_topo`).
+
+### 3.6 Network generator (`src/utils/wng.py`)
 
 ```python
 from src.utils.wng import k_s_generator_pl

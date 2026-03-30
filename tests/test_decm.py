@@ -406,7 +406,6 @@ class TestDECMSolverConvergence:
         """SolverResult attributes should have all expected fields after solve_tool."""
         model, _ = make_decm_model(N=4)
         converged = model.solve_tool(tol=CONV_TOL, max_iter=3000)
-        # Full 4N result
         assert hasattr(model, "sol")
         assert hasattr(model.sol, "theta")
         assert hasattr(model.sol, "converged")
@@ -417,18 +416,6 @@ class TestDECMSolverConvergence:
         assert model.sol.theta.shape == (16,)  # 4 * N with N=4
         assert isinstance(model.sol.residuals, list)
         assert model.sol.elapsed_time > 0
-        # Topology sub-result: [θ_out | θ_in], shape (2N,)
-        assert hasattr(model, "sol_topo")
-        assert model.sol_topo.theta.shape == (8,)   # 2 * N
-        # Weight sub-result: [η_out | η_in], shape (2N,)
-        assert hasattr(model, "sol_weights")
-        assert model.sol_weights.theta.shape == (8,)  # 2 * N
-        # Consistency: sol_topo + sol_weights reconstitute sol
-        import numpy as np
-        np.testing.assert_array_equal(
-            model.sol.theta,
-            np.concatenate([model.sol_topo.theta, model.sol_weights.theta]),
-        )
 
     def test_solver_returns_best_iterate(self):
         """Even for a very tight tolerance, the returned theta should be near-optimal."""

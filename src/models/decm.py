@@ -71,13 +71,11 @@ class DECMModel:
     The 4N unknowns are stored as a single vector:
     ``theta = [θ_out | θ_in | η_out | η_in]``
 
-    After calling :meth:`solve_tool`, the following result attributes are set:
+    where ``θ_out, θ_in`` are the topology (degree) multipliers and
+    ``η_out, η_in`` are the weight (strength) multipliers.
 
-    * ``sol`` — :class:`~src.solvers.base.SolverResult` for the full 4N problem.
-    * ``sol_topo`` — :class:`~src.solvers.base.SolverResult` with
-      ``theta = [θ_out | θ_in]`` (topology / degree multipliers, shape 2N).
-    * ``sol_weights`` — :class:`~src.solvers.base.SolverResult` with
-      ``theta = [η_out | η_in]`` (weight multipliers, shape 2N).
+    After calling :meth:`solve_tool`, the result is stored as ``self.sol``
+    (:class:`~src.solvers.base.SolverResult`, ``theta`` shape 4N).
 
     Attributes:
         N:          Number of nodes.
@@ -564,13 +562,9 @@ class DECMModel:
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
-        Results are stored on the model instance:
-
-        * ``self.sol`` — full 4N :class:`~src.solvers.base.SolverResult`.
-        * ``self.sol_topo`` — :class:`~src.solvers.base.SolverResult` carrying
-          only the topology parameters ``theta = [θ_out | θ_in]``, shape (2N,).
-        * ``self.sol_weights`` — :class:`~src.solvers.base.SolverResult` carrying
-          only the weight parameters ``theta = [η_out | η_in]``, shape (2N,).
+        Results are stored on the model instance as ``self.sol``
+        (:class:`~src.solvers.base.SolverResult`, full 4N parameter vector
+        ``theta = [θ_out | θ_in | η_out | η_in]``).
 
         Args:
             ic:            Initial condition method (``"degrees"``, ``"random"``,
@@ -603,28 +597,4 @@ class DECMModel:
         )
         if self.sol.message:
             print(self.sol.message)
-
-        # Split the 4N result into topology (θ_out, θ_in) and weight (η_out, η_in)
-        # sub-results so callers can access each part with the same interface used
-        # by DaECM (model.sol_topo.theta and model.sol_weights.theta).
-        N = self.N
-        theta_full = self.sol.theta  # numpy array, shape (4N,)
-        self.sol_topo = SolverResult(
-            theta=theta_full[: 2 * N],
-            converged=self.sol.converged,
-            iterations=self.sol.iterations,
-            residuals=self.sol.residuals,
-            elapsed_time=self.sol.elapsed_time,
-            peak_ram_bytes=self.sol.peak_ram_bytes,
-            message=self.sol.message,
-        )
-        self.sol_weights = SolverResult(
-            theta=theta_full[2 * N :],
-            converged=self.sol.converged,
-            iterations=self.sol.iterations,
-            residuals=self.sol.residuals,
-            elapsed_time=self.sol.elapsed_time,
-            peak_ram_bytes=self.sol.peak_ram_bytes,
-            message=self.sol.message,
-        )
         return self.sol.converged

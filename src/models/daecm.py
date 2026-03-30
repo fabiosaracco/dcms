@@ -445,13 +445,6 @@ class DaECMModel:
 
         * ``"topology"`` (default): β = sqrt(1 − k/s) per node, derived from the
           mean-field identity s_i/k_i ≈ 1/(1−β²).
-        * ``"topology_geo"``: geometric mean of the out and in estimates,
-          β_out_i = β_in_i = (z_out_i · z_in_i)^{1/4} where z_out = 1 − k_out/s_out.
-          Symmetrises the init when out and in ratios differ.
-        * ``"topology_scale"``: one GS rescaling step from ``"topology"``.
-          Computes the expected strength Ŝ at the topology β₀ via
-          ``residual_strength``, then rescales β₀ ← β₀ · s/Ŝ.  More expensive
-          than ``"topology"`` (one O(N²) pass) but starts closer to the solution.
         * ``"topology_node"``: per-node Newton solve.  For each node i, solves
           D_i(β_out_i) = s_out_i exactly (given β_in fixed at ``"topology"``
           values) via 5 Newton iterations.  O(N²) total; gives the most accurate
@@ -481,31 +474,6 @@ class DaECMModel:
             # β = sqrt(1 - k/s): mean-field inversion of s = k/(1-β²)
             beta_out = torch.sqrt(1.0 - ratio_out)
             beta_in = torch.sqrt(1.0 - ratio_in)
-
-        elif method == "topology_geo":
-            # Geometric mean of out and in estimates → symmetric β.
-            # β_out_i = β_in_i = (z_out_i · z_in_i)^{1/4}
-            z_out = (1.0 - ratio_out).clamp(min=0.0)
-            z_in = (1.0 - ratio_in).clamp(min=0.0)
-            z = torch.sqrt(z_out * z_in).clamp(min=0.0, max=1.0 - 1e-9)
-            beta_out = torch.sqrt(z)
-            beta_in = beta_out.clone()
-
-        elif method == "topology_scale":
-            # Step 1: compute "topology" θ_β₀
-            beta_out_0 = torch.sqrt(1.0 - ratio_out)
-            beta_in_0 = torch.sqrt(1.0 - ratio_in)
-            theta_b_out_0 = (-torch.log(beta_out_0.clamp(min=1e-15))).clamp(-_ETA_MAX, _ETA_MAX)
-            theta_b_in_0 = (-torch.log(beta_in_0.clamp(min=1e-15))).clamp(-_ETA_MAX, _ETA_MAX)
-            theta_b_out_0 = torch.where(self.zero_s_out, torch.full_like(theta_b_out_0, _ETA_MAX), theta_b_out_0)
-            theta_b_in_0 = torch.where(self.zero_s_in, torch.full_like(theta_b_in_0, _ETA_MAX), theta_b_in_0)
-            theta_w0 = torch.cat([theta_b_out_0, theta_b_in_0])
-            # Step 2: one GS rescaling step — uses residual_strength (handles chunking)
-            F0 = self.residual_strength(theta_topo, theta_w0)
-            s_out_hat = (s_out_safe + F0[:N]).clamp(min=1e-15)
-            s_in_hat = (s_in_safe + F0[N:]).clamp(min=1e-15)
-            beta_out = (beta_out_0 * s_out_safe / s_out_hat).clamp(min=1e-15)
-            beta_in = (beta_in_0 * s_in_safe / s_in_hat).clamp(min=1e-15)
 
         elif method == "topology_node":
             # Per-node Newton solve: for each i, solve Σ_j p_ij/(1-β_out_i·b_j) = s_out_i
@@ -560,7 +528,23 @@ class DaECMModel:
         return torch.cat([theta_b_out, theta_b_in])
 
     # ------------------------------------------------------------------
-    # Constraint evaluation
+    # Evaluation of constraint satisfaction: topology
+    # ------------------------------------------------------------------
+
+    def constraint_error_topology(self, theta: _ArrayLike) -> float:
+        """Return the maximum absolute error on all topology constraints.
+
+        Args:
+            theta: Parameter vector, shape (2N,).
+
+        Returns:
+            Max-abs constraint error (scalar).
+        """
+        return self._dcm.constraint_error(theta)
+
+
+    # ------------------------------------------------------------------
+    # Constraint evaluation: strength
     # ------------------------------------------------------------------
 
     def constraint_error_strength(

@@ -520,17 +520,17 @@ class DaECMModel:
     def initial_theta_weight(
         self,
         theta_topo: _ArrayLike,
-        method: str = "strengths",
+        method: str = "topology",
     ) -> torch.Tensor:
         """Return a sensible starting point θ_weight₀ for the weight solvers.
 
         Several initialisation strategies are supported:
 
-        * ``"strengths"`` (default): β_i ≈ sqrt(s_i / (s_i + N − 1))
-          (same mean-field as DWCM, ignoring the p_ij factor).
-        * ``"topology"``: mean-field init β = sqrt(s/(s+k)) where k is the
+        * ``"topology"`` (default): mean-field init β = sqrt(s/(s+k)) where k is the
           observed degree.  Uses k_out/k_in rather than N-1 so the prior
           is correct for sparse networks where hubs connect to k << N nodes.
+        * ``"strengths"``: β_i ≈ sqrt(s_i / (s_i + N − 1))
+          (same mean-field as DWCM, ignoring the p_ij factor).
         * ``"normalized"``: β_i^{out} = s_i^{out} / Σ_j s_j^{out}.
         * ``"uniform"``: all betas set to the median of the strengths init.
         * ``"random"``: uniform θ_β ∈ [0.1, 2.0].

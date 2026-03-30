@@ -72,6 +72,40 @@ The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight mu
 
 **Implementation:** `src/models/daecm.py` — `DaECMModel`
 
+### 1.4 DECM — Directed Enhanced Configuration Model (binary + weighted, fully coupled)
+
+The DECM constrains the same four sequences as the DaECM but is the **exact** maximum-entropy model: the weight multipliers `(β_out_i, β_in_i)` enter directly into the connection probability, making all four constraint equations **coupled**.
+
+For each directed pair `(i,j)`, `i ≠ j`, the partition function is:
+
+```
+Z_ij = 1 + x_i · y_j · q_ij      where  q_ij = z_ij / (1 − z_ij),  z_ij = β_out_i · β_in_j
+```
+
+**Connection probability (coupled to weight parameters):**
+```
+p_ij = x_i · y_j · q_ij / (1 + x_i · y_j · q_ij)
+     = sigmoid(−θ_out_i − θ_in_j − log(expm1(η_out_i + η_in_j)))
+```
+
+where `x_i = exp(−θ_out_i)`, `y_j = exp(−θ_in_j)`, `β_out_i = exp(−η_out_i)`, `β_in_j = exp(−η_in_j)`.
+
+**Expected weight:** `E[w_ij] = p_ij · G_ij` where `G_ij = 1/(1 − z_ij)`.
+
+**4N coupled equations:**
+```
+k_out_i = Σ_{j≠i} p_ij
+k_in_i  = Σ_{j≠i} p_ji
+s_out_i = Σ_{j≠i} p_ij · G_ij
+s_in_i  = Σ_{j≠i} p_ji · G_ji
+```
+
+**Feasibility constraint:** `η_out_i + η_in_j > 0` for all `i ≠ j`.
+
+**Key difference from DaECM:** in the DaECM approximation, `p_ij = x_i y_j/(1+x_i y_j)` is decoupled from `β`; in the exact DECM, `p_ij` depends on both `(θ, η)` simultaneously.
+
+**Implementation:** `src/models/decm.py` — `DECMModel`
+
 ---
 
 
@@ -128,8 +162,9 @@ The coefficients `c` are found by a small `m×m` least-squares system (O(m²) pe
 - `src/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="gauss-seidel", anderson_depth=10)`
 - `src/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="gauss-seidel", anderson_depth=10)`
 - `src/solvers/fixed_point_daecm.py` — `solve_fixed_point_daecm(..., variant="gauss-seidel", anderson_depth=10)`
+- `src/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (DECM only uses θ-Newton; see §2.2)
 
-All three files share the same algorithmic skeleton:
+All four files share the same algorithmic skeleton:
 
 1. **Dense path** (N ≤ 2 000): materialise the N×N probability/weight matrix once per iteration.
 2. **Chunked path** (N > 2 000): process rows in blocks of 512 to keep peak RAM at O(chunk × N) rather than O(N²).
@@ -164,10 +199,18 @@ This is equivalent to a **Gauss-Seidel Newton** step: update `θ_out_i` node by 
 For the DWCM/DaECM weight step, the coordinate Newton formula becomes:
 
 ```
-Δθ_out_i = (s_hat_out_i - s_out_i) / Σ_{j≠i} p_ij · G_ij · (G_ij - 1)
+Δη_out_i = (s_hat_out_i - s_out_i) / Σ_{j≠i} p_ij · G_ij · (G_ij - 1)
 ```
 
 where `G_ij = 1/(1 - β_i · β_j)` is the geometric-distribution correction factor and `p_ij` is the topology probability from the DCM step.  The denominator is always negative (the Jacobian diagonal is negative-definite), so the step is in the correct descent direction.
+
+For the DECM, the coupling between degree and strength equations modifies the strength Jacobian diagonal:
+
+```
+∂F_s_out_i / ∂η_out_i = −Σ_{j≠i} p_ij · G_ij² · (1 − p_ij + z_ij)
+```
+
+which equals the DaECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`.  The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously within each group.
 
 **The z-floor mechanism:** define `z_ij = θ_out_i + θ_in_j`.  When `z_ij → 0`, `G_ij → ∞` and the residual blows up.  The solver maintains per-node floors `z_min_out[i]` and `z_min_in[j]` (computed from significant pairs with `p_ij > 0.5/N`) and applies a global floor from `min(θ_in)` over non-zero-strength nodes.  This guarantees `z_ij > _Z_G_CLAMP = 1e-8` for all pairs after every Newton step.
 
@@ -178,6 +221,7 @@ where `G_ij = 1/(1 - β_i · β_j)` is the geometric-distribution correction fac
 - `src/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="theta-newton", anderson_depth=10)`
 - `src/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="theta-newton", anderson_depth=10)`
 - `src/solvers/fixed_point_daecm.py` — `solve_fixed_point_daecm(..., variant="theta-newton", anderson_depth=10)`
+- `src/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., anderson_depth=10)` (alternating out/in GS-Newton on 4N vector)
 
 Internally, each file has a `_theta_newton_step_chunked` (and optionally `_theta_newton_step_dense`) function that computes the diagonal Jacobian and applies the clipped step without materialising the full Jacobian matrix (O(N) RAM).
 
@@ -307,12 +351,51 @@ Additional model methods:
 | `"topology"` (default) | `β = sqrt(1 − k/s)`, mean-field inversion of `s = k / (1 − β²)` |
 | `"topology_node"` | Per-node Newton solve (5 iterations, chunked); uses p_ij from DCM to give the most accurate starting point |
 
-### 3.4 SolverResult
-
-`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM, `model.sol_topo` / `model.sol_weights` for DaECM.  The `SolverResult` dataclass fields are:
+### 3.4 DECM — `DECMModel`
 
 ```python
-result.theta           # np.ndarray, shape (2N,) — parameters in log-space (θ = −log β)
+from src.models.decm import DECMModel
+
+model = DECMModel(k_out, k_in, s_out, s_in)
+converged = model.solve_tool(
+    ic="degrees",           # initial condition: "degrees" (default) or "random"
+    tol=1e-6,               # convergence tolerance (ℓ∞ residual)
+    max_iter=5000,
+    max_time=0,             # wall-clock timeout in seconds (0 = no limit)
+    anderson_depth=10,
+)
+# solve_tool returns True if converged and stores the full result:
+theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
+# topology multipliers (θ_out, θ_in) are model.sol.theta[:2*N]
+# weight multipliers  (η_out, η_in) are model.sol.theta[2*N:]
+```
+
+Additional model methods:
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `model.pij_matrix(theta)` | `(N, N)` tensor | DECM link-probability matrix (coupled to η) |
+| `model.wij_matrix(theta)` | `(N, N)` tensor | Expected weight matrix `W_ij = p_ij · G_ij` |
+| `model.residual(theta)` | `(4N,)` tensor | Constraint violation `[F_k_out\|F_k_in\|F_s_out\|F_s_in]` |
+| `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ,η)` |
+| `model.hessian_diag(theta)` | `(4N,)` tensor | Diagonal Jacobian elements (all ≤ 0) |
+| `model.constraint_error(theta)` | float | `max‖F(θ,η)‖` |
+| `model.max_relative_error(theta)` | float | Max relative error over all 4N non-zero constraints |
+| `model.initial_theta(method)` | `(4N,)` tensor | Initial guess (see below) |
+
+`initial_theta` methods for DECM:
+
+| Method | Description |
+|--------|-------------|
+| `"degrees"` (default) | θ from `k/(N-1)` heuristic; η from `β = sqrt(1 − k/s)` mean-field |
+| `"random"` | Uniform random `θ ∈ [0.1, 2.0]`, `η ∈ [0.1, 2.0]` |
+
+### 3.5 SolverResult
+
+`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM/DECM, `model.sol_topo` / `model.sol_weights` for DaECM.  The `SolverResult` dataclass fields are:
+
+```python
+result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM, (4N,) for DECM
 result.converged       # bool
 result.iterations      # int
 result.residuals       # list[float] — ℓ∞ residual norm per accepted step
@@ -321,7 +404,7 @@ result.peak_ram_bytes  # int
 result.message         # str — warnings or error description
 ```
 
-### 3.5 Standalone solvers (advanced)
+### 3.6 Standalone solvers (advanced)
 
 The underlying solvers can be called directly without the model wrapper, e.g. to pass a custom residual function or to interleave topology and weight steps manually:
 
@@ -329,6 +412,7 @@ The underlying solvers can be called directly without the model wrapper, e.g. to
 from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
 from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from src.solvers.fixed_point_decm import solve_fixed_point_decm
 
 result = solve_fixed_point_dcm(
     residual_fn,             # callable F(θ) → (2N,) tensor
@@ -343,6 +427,8 @@ result = solve_fixed_point_dcm(
 ```
 
 `solve_fixed_point_dwcm` and `solve_fixed_point_daecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; DaECM additionally requires `theta_topo`).
+
+`solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 
 ### 3.6 Network generator (`src/utils/wng.py`)
 
@@ -396,16 +482,31 @@ Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per 
 
 > FP-GS Anderson(10) fails for DaECM at N = 5 000 because the conditioned weight equations have spectral radius > 1 for power-law hubs: each `p_ij < 1` factor forces `β_i β_j` closer to 1 to satisfy the strength constraint, amplifying the fixed-point Jacobian.  The θ-Newton approach bypasses this limitation by working in log-space where the diagonal Hessian always stabilises the step.
 
+### DECM — N = 1 000
+
+Benchmark over 10 seeds (`k_s_generator_pl(N=1000, rho=1e-3)`), `tol=1e-5`.
+
+The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.
+
+| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MRE (mean±2σ) |
+|--------|------:|----------------:|-----------------:|---------------:|
+| **θ-Newton Anderson(10)** | **100%** | **52.9 ± 6.1** | **1.9 ± 0.2** | **5.00e-07 ± 2.87e-07** |
+
+> The coupling between degree and strength equations makes the DECM more expensive per iteration than the DaECM (two passes over the N×N grid instead of one), but the alternating GS-Newton strategy achieves 100% convergence on all 10 test networks with modest iteration counts.
+
 ---
 
 ## 5. Complexity
 
-| Method | Convergence | RAM per iteration | Scales to large N? |
-|--------|-------------|-------------------|--------------------|
-| FP-GS Anderson(10) | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 2 000) |
-| θ-Newton Anderson(10) | superlinear | O(chunk × N) | ✓ (same chunked path) |
+| Method | Model | Convergence | RAM per iteration | Scales to large N? |
+|--------|-------|-------------|-------------------|--------------------|
+| FP-GS Anderson(10) | DCM, DWCM, DaECM | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 2 000) |
+| θ-Newton Anderson(10) | DCM, DWCM, DaECM | superlinear | O(chunk × N) | ✓ (same chunked path) |
+| Alternating GS-Newton Anderson(10) | DECM | superlinear | O(chunk × N) | ✓ (2 passes per iteration) |
 
-Both methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path (N ≤ 2 000) materialises the full N×N matrix once per step; for N > 2 000 rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
+All methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path (N ≤ 2 000) materialises the full N×N matrix once per step; for N > 2 000 rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
+
+The DECM solver performs 2 passes per iteration (out-group and in-group), compared to 1 pass for DCM/DWCM and 2 passes for DaECM.  This makes the per-iteration cost approximately equal to DaECM.
 
 ---
 
@@ -435,6 +536,12 @@ python -m src.benchmarks.daecm_comparison --sizes 1000 --n_seeds 10 --fast
 
 # DaECM at N=5000 (θ-Newton only reliable method)
 python -m src.benchmarks.daecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
+
+# DECM comparison (N=1000, 10 seeds)
+python -m src.benchmarks.decm_comparison --phase6
+
+# DECM at custom size/seeds
+python -m src.benchmarks.decm_comparison --n 500 --n_seeds 5
 ```
 
 ## References

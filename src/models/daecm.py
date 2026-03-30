@@ -38,7 +38,6 @@ Reference:
 """
 from __future__ import annotations
 
-import math
 from typing import Union
 
 import torch
@@ -303,92 +302,8 @@ class DaECMModel:
     # Jacobian of the strength residual
     # ------------------------------------------------------------------
 
-    def jacobian_strength(
-        self,
-        theta_topo: _ArrayLike,
-        theta_weight: _ArrayLike,
-    ) -> torch.Tensor:
-        """Return the Jacobian J_w = ∂F_w/∂θ_β, shape (2N, 2N).
-
-        Denoting H_ij = p_ij · G_ij · (G_ij − 1) (elementwise, diagonal zero),
-        where G_ij = 1 / (1 − β_out_i β_in_j):
-
-            J_out,out = −diag(Σ_{j≠i} H_ij)   [diagonal, negative]
-            J_out,in  = −H                      [off-diagonal]
-            J_in,out  = −Hᵀ                    [off-diagonal]
-            J_in,in   = −diag(Σ_{j≠i} H_ji)   [diagonal, negative]
-
-        Args:
-            theta_topo:   Topology parameters, shape (2N,).
-            theta_weight: Weight parameters, shape (2N,).
-
-        Returns:
-            Jacobian matrix, shape (2N, 2N), dtype torch.float64.
-        """
-        N = self.N
-        theta_weight = _to_tensor(theta_weight)
-        theta_b_out = theta_weight[:N]
-        theta_b_in = theta_weight[N:]
-
-        # G_ij = 1/(1 - β_out_i β_in_j) = -1/expm1(-z_ij)
-        z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
-        z_safe = z.clamp(min=1e-8)
-        G = -1.0 / torch.expm1(-z_safe)
-        G.fill_diagonal_(0.0)
-
-        # H_ij = p_ij · G_ij · (G_ij − 1)  (= p_ij · G_new · G_old, diagonal zero)
-        P = self.pij_matrix(theta_topo)
-        H = P * G * (G - 1.0)   # H[i,i] = 0 since G[i,i]=0
-
-        idx = torch.arange(N)
-        J = torch.zeros(2 * N, 2 * N, dtype=torch.float64)
-        J[idx, idx] = -H.sum(dim=1)        # top-left diagonal
-        J[:N, N:] = -H                     # top-right off-diagonal
-        J[N:, :N] = -H.T                  # bottom-left off-diagonal
-        J[N + idx, N + idx] = -H.sum(dim=0)  # bottom-right diagonal
-        return J
-
     # ------------------------------------------------------------------
-    # Diagonal Hessian of the strength log-likelihood
-    # ------------------------------------------------------------------
-
-    def hessian_diag_strength(
-        self,
-        theta_topo: _ArrayLike,
-        theta_weight: _ArrayLike,
-    ) -> torch.Tensor:
-        """Return the diagonal of Hess_w(L) = ∂²L_w/∂θ_β², shape (2N,).
-
-        The entries are:
-
-            ∂²L_w/∂θ_β_out_i² = −Σ_{j≠i} p_ij · G_ij · (G_ij − 1)
-            ∂²L_w/∂θ_β_in_i²  = −Σ_{j≠i} p_ji · G_ji · (G_ji − 1)
-
-        Args:
-            theta_topo:   Topology parameters, shape (2N,).
-            theta_weight: Weight parameters, shape (2N,).
-
-        Returns:
-            Diagonal of Hess_w, shape (2N,), all entries ≤ 0.
-        """
-        N = self.N
-        theta_weight = _to_tensor(theta_weight)
-        theta_b_out = theta_weight[:N]
-        theta_b_in = theta_weight[N:]
-
-        z = theta_b_out[:, None] + theta_b_in[None, :]
-        z_safe = z.clamp(min=1e-8)
-        G = -1.0 / torch.expm1(-z_safe)
-        G.fill_diagonal_(0.0)
-
-        P = self.pij_matrix(theta_topo)
-        H = P * G * (G - 1.0)
-        h_out = -H.sum(dim=1)
-        h_in = -H.sum(dim=0)
-        return torch.cat([h_out, h_in])
-
-    # ------------------------------------------------------------------
-    # Negative log-likelihood for the weight step (for L-BFGS)
+    # Negative log-likelihood for the weight step
     # ------------------------------------------------------------------
 
     def neg_log_likelihood_strength(
@@ -524,189 +439,129 @@ class DaECMModel:
     ) -> torch.Tensor:
         """Return a sensible starting point θ_weight₀ for the weight solvers.
 
-        Several initialisation strategies are supported:
+        All strategies are topology-aware: they use the observed degree sequences
+        (and optionally the DCM probability matrix p_ij) to estimate β values
+        consistent with the DaECM weight equation E[w_ij] = p_ij/(1−β_out_i β_in_j).
 
-        * ``"topology"`` (default): mean-field init β = sqrt(s/(s+k)) where k is the
-          observed degree.  Uses k_out/k_in rather than N-1 so the prior
-          is correct for sparse networks where hubs connect to k << N nodes.
-        * ``"strengths"``: β_i ≈ sqrt(s_i / (s_i + N − 1))
-          (same mean-field as DWCM, ignoring the p_ij factor).
-        * ``"normalized"``: β_i^{out} = s_i^{out} / Σ_j s_j^{out}.
-        * ``"uniform"``: all betas set to the median of the strengths init.
-        * ``"random"``: uniform θ_β ∈ [0.1, 2.0].
+        * ``"topology"`` (default): β = sqrt(1 − k/s) per node, derived from the
+          mean-field identity s_i/k_i ≈ 1/(1−β²).
+        * ``"topology_geo"``: geometric mean of the out and in estimates,
+          β_out_i = β_in_i = (z_out_i · z_in_i)^{1/4} where z_out = 1 − k_out/s_out.
+          Symmetrises the init when out and in ratios differ.
+        * ``"topology_scale"``: one GS rescaling step from ``"topology"``.
+          Computes the expected strength Ŝ at the topology β₀ via
+          ``residual_strength``, then rescales β₀ ← β₀ · s/Ŝ.  More expensive
+          than ``"topology"`` (one O(N²) pass) but starts closer to the solution.
+        * ``"topology_node"``: per-node Newton solve.  For each node i, solves
+          D_i(β_out_i) = s_out_i exactly (given β_in fixed at ``"topology"``
+          values) via 5 Newton iterations.  O(N²) total; gives the most accurate
+          starting point.
 
         Zero-strength nodes always have θ_β = +_ETA_MAX (β = 0 exactly).
 
         Args:
-            theta_topo: Current (or initial) topology parameters — used when
-                        method relies on the DCM probability scale.
-            method: Initialisation method name.
+            theta_topo: Current (or initial) topology parameters [θ_out|θ_in],
+                        shape (2N,).  Used by ``"topology_scale"`` and
+                        ``"topology_node"`` to evaluate p_ij.
+            method: Initialisation method name (see above).
 
         Returns:
             Initial weight parameter vector θ_weight₀, shape (2N,).
         """
+        theta_topo = _to_tensor(theta_topo)
         N = self.N
-        if method == "strengths":
-            s_out_safe = self.s_out.clamp(min=1e-15)
-            s_in_safe = self.s_in.clamp(min=1e-15)
-            beta_out = torch.sqrt(s_out_safe / (s_out_safe + (N - 1)))
-            beta_in = torch.sqrt(s_in_safe / (s_in_safe + (N - 1)))
-        elif method == "normalized":
-            S_out = self.s_out.sum().clamp(min=1e-15)
-            S_in = self.s_in.sum().clamp(min=1e-15)
-            beta_out = self.s_out.clamp(min=1e-15) / S_out
-            beta_in = self.s_in.clamp(min=1e-15) / S_in
-        elif method == "uniform":
-            s_out_safe = self.s_out.clamp(min=1e-15)
-            s_in_safe = self.s_in.clamp(min=1e-15)
-            beta_ref_out = torch.sqrt(s_out_safe / (s_out_safe + (N - 1)))
-            beta_ref_in = torch.sqrt(s_in_safe / (s_in_safe + (N - 1)))
-            pos_out = beta_ref_out[~self.zero_s_out]
-            pos_in = beta_ref_in[~self.zero_s_in]
-            med_out = pos_out.median().item() if pos_out.numel() > 0 else 0.5
-            med_in = pos_in.median().item() if pos_in.numel() > 0 else 0.5
-            beta_out = torch.full((N,), med_out, dtype=torch.float64)
-            beta_in = torch.full((N,), med_in, dtype=torch.float64)
-        elif method == "topology":
-            # Mean-field init for the new formula: s/(k) = 1/(1-β²) → β = sqrt(1 - k/s).
-            # This is the correct prior for the DaECM weight step where
-            # E[w_ij] = p_ij/(1 - β_out_i β_in_j).
-            k_out_safe = self.k_out.clamp(min=1.0)
-            k_in_safe = self.k_in.clamp(min=1.0)
-            s_out_safe = self.s_out.clamp(min=1e-15)
-            s_in_safe = self.s_in.clamp(min=1e-15)
-            ratio_out = (k_out_safe / s_out_safe).clamp(max=1.0 - 1e-9)
-            ratio_in = (k_in_safe / s_in_safe).clamp(max=1.0 - 1e-9)
+        k_out_safe = self.k_out.clamp(min=1.0)
+        k_in_safe = self.k_in.clamp(min=1.0)
+        s_out_safe = self.s_out.clamp(min=1e-15)
+        s_in_safe = self.s_in.clamp(min=1e-15)
+        ratio_out = (k_out_safe / s_out_safe).clamp(max=1.0 - 1e-9)
+        ratio_in = (k_in_safe / s_in_safe).clamp(max=1.0 - 1e-9)
+
+        if method == "topology":
+            # β = sqrt(1 - k/s): mean-field inversion of s = k/(1-β²)
             beta_out = torch.sqrt(1.0 - ratio_out)
             beta_in = torch.sqrt(1.0 - ratio_in)
-        elif method == "balanced":
-            # Uniform z0 init: place ALL pairs at z_ij = z0 at start so that
-            # no pair is near the z=0 singularity (which freezes Newton steps).
-            # For the new formula: G_new(z0) = mean_weight → z0 = -log(1 - 1/mw).
-            # theta_b_out_i = theta_b_in_j = 0.5 * z0 for all non-zero nodes.
-            k_total = float(self.k_out.double()[~self.zero_s_out].sum().clamp(min=1.0))
-            s_total = float(self.s_out.double()[~self.zero_s_out].sum().clamp(min=1e-15))
-            mean_weight = max(s_total / k_total, 1.0 + 1e-9)
-            z0 = -math.log(1.0 - 1.0 / mean_weight)  # G_new(z0) = mean_weight
-            half_z0 = z0 * 0.5
-            theta_b_out = torch.full((N,), half_z0, dtype=torch.float64)
-            theta_b_in = torch.full((N,), half_z0, dtype=torch.float64)
-            theta_b_out = torch.where(
-                self.zero_s_out, torch.full_like(theta_b_out, _ETA_MAX), theta_b_out
-            )
-            theta_b_in = torch.where(
-                self.zero_s_in, torch.full_like(theta_b_in, _ETA_MAX), theta_b_in
-            )
-            return torch.cat([
-                theta_b_out.clamp(-_ETA_MAX, _ETA_MAX),
-                theta_b_in.clamp(-_ETA_MAX, _ETA_MAX),
-            ])
-        elif method == "random":
-            theta_b_out = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
-            theta_b_in = torch.empty(N, dtype=torch.float64).uniform_(0.1, 2.0)
-            theta_b_out = torch.where(
-                self.zero_s_out,
-                torch.full_like(theta_b_out, _ETA_MAX),
-                theta_b_out,
-            )
-            theta_b_in = torch.where(
-                self.zero_s_in,
-                torch.full_like(theta_b_in, _ETA_MAX),
-                theta_b_in,
-            )
-            return torch.cat([
-                theta_b_out.clamp(_ETA_MIN, _ETA_MAX),
-                theta_b_in.clamp(_ETA_MIN, _ETA_MAX),
-            ])
+
+        elif method == "topology_geo":
+            # Geometric mean of out and in estimates → symmetric β.
+            # β_out_i = β_in_i = (z_out_i · z_in_i)^{1/4}
+            z_out = (1.0 - ratio_out).clamp(min=0.0)
+            z_in = (1.0 - ratio_in).clamp(min=0.0)
+            z = torch.sqrt(z_out * z_in).clamp(min=0.0, max=1.0 - 1e-9)
+            beta_out = torch.sqrt(z)
+            beta_in = beta_out.clone()
+
+        elif method == "topology_scale":
+            # Step 1: compute "topology" θ_β₀
+            beta_out_0 = torch.sqrt(1.0 - ratio_out)
+            beta_in_0 = torch.sqrt(1.0 - ratio_in)
+            theta_b_out_0 = (-torch.log(beta_out_0.clamp(min=1e-15))).clamp(-_ETA_MAX, _ETA_MAX)
+            theta_b_in_0 = (-torch.log(beta_in_0.clamp(min=1e-15))).clamp(-_ETA_MAX, _ETA_MAX)
+            theta_b_out_0 = torch.where(self.zero_s_out, torch.full_like(theta_b_out_0, _ETA_MAX), theta_b_out_0)
+            theta_b_in_0 = torch.where(self.zero_s_in, torch.full_like(theta_b_in_0, _ETA_MAX), theta_b_in_0)
+            theta_w0 = torch.cat([theta_b_out_0, theta_b_in_0])
+            # Step 2: one GS rescaling step — uses residual_strength (handles chunking)
+            F0 = self.residual_strength(theta_topo, theta_w0)
+            s_out_hat = (s_out_safe + F0[:N]).clamp(min=1e-15)
+            s_in_hat = (s_in_safe + F0[N:]).clamp(min=1e-15)
+            beta_out = (beta_out_0 * s_out_safe / s_out_hat).clamp(min=1e-15)
+            beta_in = (beta_in_0 * s_in_safe / s_in_hat).clamp(min=1e-15)
+
+        elif method == "topology_node":
+            # Per-node Newton solve: for each i, solve Σ_j p_ij/(1-β_out_i·b_j) = s_out_i
+            # given b_j = β_in_j^0 from "topology".  5 Newton steps per node.
+            b_in = torch.sqrt(1.0 - ratio_in).clamp(min=1e-15, max=1.0 - 1e-9)
+            b_out = torch.sqrt(1.0 - ratio_out).clamp(min=1e-15, max=1.0 - 1e-9)
+            beta_out = b_out.clone()
+            beta_in = b_in.clone()  # β_in solved symmetrically using p_ji and b_out
+            theta_out_t = theta_topo[:N]
+            theta_in_t = theta_topo[N:]
+            for _ in range(5):
+                # Solve for β_out given b_in fixed (chunked to avoid N×N alloc at large N)
+                F_i = torch.zeros(N, dtype=torch.float64)
+                Fp_i = torch.zeros(N, dtype=torch.float64)
+                D_in = torch.zeros(N, dtype=torch.float64)
+                Dp_in = torch.zeros(N, dtype=torch.float64)
+                for i_start in range(0, N, _DEFAULT_CHUNK):
+                    i_end = min(i_start + _DEFAULT_CHUNK, N)
+                    chunk_len = i_end - i_start
+                    local_idx = torch.arange(chunk_len, dtype=torch.long)
+                    global_idx = torch.arange(i_start, i_end, dtype=torch.long)
+                    p_chunk = torch.sigmoid(-theta_out_t[i_start:i_end, None] - theta_in_t[None, :])
+                    p_chunk[local_idx, global_idx] = 0.0
+                    z_chunk = (beta_out[i_start:i_end, None] * b_in[None, :]).clamp(max=_Q_MAX)
+                    G_chunk = 1.0 / (1.0 - z_chunk)
+                    G_chunk[local_idx, global_idx] = 0.0
+                    F_i[i_start:i_end] = (p_chunk * G_chunk).sum(1) - s_out_safe[i_start:i_end]
+                    dG_chunk = G_chunk ** 2 * b_in[None, :]
+                    dG_chunk[local_idx, global_idx] = 0.0
+                    Fp_i[i_start:i_end] = (p_chunk * dG_chunk).sum(1)
+                    # Accumulate D_in for β_in solve (same pass)
+                    z_in_chunk = (b_out[i_start:i_end, None] * beta_in[None, :]).clamp(max=_Q_MAX)
+                    Gi_chunk = 1.0 / (1.0 - z_in_chunk)
+                    Gi_chunk[local_idx, global_idx] = 0.0
+                    D_in += (p_chunk * Gi_chunk).sum(0)
+                    Dp_in += (p_chunk * Gi_chunk ** 2 * b_out[i_start:i_end, None]).sum(0)
+                beta_out = (beta_out - F_i / Fp_i.clamp(min=1e-15)).clamp(min=1e-15, max=1.0 - 1e-9)
+                F_in = D_in - s_in_safe
+                beta_in = (beta_in - F_in / Dp_in.clamp(min=1e-15)).clamp(min=1e-15, max=1.0 - 1e-9)
+
         else:
             raise ValueError(f"Unknown initial-guess method: {method!r}")
 
-        # Convert β → θ_β; allow β > 1 (θ_β < 0) for nodes whose solution
-        # requires it (e.g. high s/k where the coupled β is small).
+        # Convert β → θ_β
         beta_out = beta_out.clamp(min=1e-15)
         beta_in = beta_in.clamp(min=1e-15)
         theta_b_out = (-torch.log(beta_out)).clamp(-_ETA_MAX, _ETA_MAX)
         theta_b_in = (-torch.log(beta_in)).clamp(-_ETA_MAX, _ETA_MAX)
-
         # Zero-strength nodes: β = 0 exactly ↔ θ_β → +∞
-        theta_b_out = torch.where(
-            self.zero_s_out, torch.full_like(theta_b_out, _ETA_MAX), theta_b_out
-        )
-        theta_b_in = torch.where(
-            self.zero_s_in, torch.full_like(theta_b_in, _ETA_MAX), theta_b_in
-        )
+        theta_b_out = torch.where(self.zero_s_out, torch.full_like(theta_b_out, _ETA_MAX), theta_b_out)
+        theta_b_in = torch.where(self.zero_s_in, torch.full_like(theta_b_in, _ETA_MAX), theta_b_in)
         return torch.cat([theta_b_out, theta_b_in])
-
-    # ------------------------------------------------------------------
-    # Joint 4N residual and NLL (for full L-BFGS over all parameters)
-    # ------------------------------------------------------------------
-
-    def residual_joint(self, theta_full: _ArrayLike) -> torch.Tensor:
-        """Return the full 4N residual [F_topo | F_strength].
-
-        The parameter vector is ``theta_full = [θ_out | θ_in | θ_β_out | θ_β_in]``
-        of length 4N.
-
-        Args:
-            theta_full: Joint parameter vector, shape (4N,).
-
-        Returns:
-            Residual vector, shape (4N,).
-        """
-        theta_full = _to_tensor(theta_full)
-        N = self.N
-        theta_topo = theta_full[:2 * N]
-        theta_weight = theta_full[2 * N:]
-        F_topo = self._dcm.residual(theta_topo)
-        F_str = self.residual_strength(theta_topo, theta_weight)
-        return torch.cat([F_topo, F_str])
-
-    def neg_log_likelihood_joint(self, theta_full: _ArrayLike) -> float:
-        """Return the joint negative log-likelihood −L_topo − L_weight.
-
-        The topology NLL is the standard DCM NLL; the weight NLL is the
-        conditioned DWCM NLL.  The parameter vector is
-        ``theta_full = [θ_out | θ_in | θ_β_out | θ_β_in]`` of length 4N.
-
-        Args:
-            theta_full: Joint parameter vector, shape (4N,).
-
-        Returns:
-            Scalar −L(θ) to be minimised.
-        """
-        theta_full = _to_tensor(theta_full)
-        N = self.N
-        theta_topo = theta_full[:2 * N]
-        theta_weight = theta_full[2 * N:]
-        nll_topo = self._dcm.neg_log_likelihood(theta_topo)
-        nll_str = self.neg_log_likelihood_strength(theta_topo, theta_weight)
-        return nll_topo + nll_str
-
-    def constraint_error_joint(self, theta_full: _ArrayLike) -> float:
-        """Return max-abs residual over all 4N constraints.
-
-        Args:
-            theta_full: Joint parameter vector, shape (4N,).
-
-        Returns:
-            max|F(θ)| (scalar).
-        """
-        return self.residual_joint(theta_full).abs().max().item()
 
     # ------------------------------------------------------------------
     # Constraint evaluation
     # ------------------------------------------------------------------
-
-    def constraint_error_topo(self, theta_topo: _ArrayLike) -> float:
-        """Return the max-abs error on the topology (degree) constraints.
-
-        Args:
-            theta_topo: Topology parameters, shape (2N,).
-
-        Returns:
-            max|F_topo(θ)| (scalar).
-        """
-        return self._dcm.constraint_error(theta_topo)
 
     def constraint_error_strength(
         self,

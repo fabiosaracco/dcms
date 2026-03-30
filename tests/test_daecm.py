@@ -190,55 +190,6 @@ class TestResidualStrength:
 
 
 # ---------------------------------------------------------------------------
-# jacobian_strength
-# ---------------------------------------------------------------------------
-
-class TestJacobianStrength:
-    def test_shape(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
-        J = model.jacobian_strength(theta_topo, theta_weight)
-        assert J.shape == (12, 12)
-
-    def test_negative_diagonal(self) -> None:
-        """Diagonal of J_w must be ≤ 0."""
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
-        J = model.jacobian_strength(theta_topo, theta_weight)
-        assert torch.all(J.diagonal() <= 0.0)
-
-    def test_finite_difference_consistency(self) -> None:
-        """Jacobian should match finite differences."""
-        model, theta_topo, theta_weight = make_daecm_model(N=6, seed=3)
-        theta_w = torch.tensor(theta_weight, dtype=torch.float64)
-        J = model.jacobian_strength(theta_topo, theta_w)
-        eps = 1e-5
-        n = 2 * model.N
-        J_fd = torch.zeros(n, n, dtype=torch.float64)
-        for k in range(n):
-            dw = torch.zeros(n, dtype=torch.float64)
-            dw[k] = eps
-            F_plus = model.residual_strength(theta_topo, theta_w + dw)
-            F_minus = model.residual_strength(theta_topo, theta_w - dw)
-            J_fd[:, k] = (F_plus - F_minus) / (2 * eps)
-        assert torch.allclose(J, J_fd, atol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# hessian_diag_strength
-# ---------------------------------------------------------------------------
-
-class TestHessianDiagStrength:
-    def test_all_non_positive(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
-        h = model.hessian_diag_strength(theta_topo, theta_weight)
-        assert torch.all(h <= 0.0)
-
-    def test_matches_jacobian_diagonal(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6, seed=1)
-        J = model.jacobian_strength(theta_topo, theta_weight)
-        h = model.hessian_diag_strength(theta_topo, theta_weight)
-        assert torch.allclose(J.diagonal(), h, atol=1e-12)
-
-
 # ---------------------------------------------------------------------------
 # neg_log_likelihood_strength
 # ---------------------------------------------------------------------------
@@ -274,12 +225,12 @@ class TestNegLogLikelihoodStrength:
 class TestInitialThetaWeight:
     def test_shape(self) -> None:
         model, theta_topo, _ = make_daecm_model(N=6)
-        theta0 = model.initial_theta_weight(theta_topo, method="strengths")
+        theta0 = model.initial_theta_weight(theta_topo, method="topology")
         assert theta0.shape == (12,)
 
     def test_all_positive(self) -> None:
         model, theta_topo, _ = make_daecm_model(N=6)
-        for method in ("strengths", "normalized", "uniform", "random"):
+        for method in ("topology", "topology_geo", "topology_scale", "topology_node"):
             theta0 = model.initial_theta_weight(theta_topo, method=method)
             assert torch.all(theta0 > 0), f"method={method!r} produced non-positive θ"
 
@@ -328,7 +279,7 @@ def _solve_two_step(
     theta_topo = r_topo.theta
 
     theta_w0 = model.initial_theta_weight(
-        torch.tensor(theta_topo, dtype=torch.float64), "strengths"
+        torch.tensor(theta_topo, dtype=torch.float64), "topology"
     )
     res_fn = lambda tw: model.residual_strength(
         torch.tensor(theta_topo, dtype=torch.float64),
@@ -389,7 +340,7 @@ class TestFixedPointDaECM:
     def test_fp_gs_converges_n4(self) -> None:
         model, theta_topo_true, _ = make_daecm_model(N=4, seed=0)
         theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
-        theta_weight0 = model.initial_theta_weight(theta_topo, "strengths")
+        theta_weight0 = model.initial_theta_weight(theta_topo, "topology")
         res_fn = lambda tw: model.residual_strength(theta_topo, tw.clamp(_ETA_MIN, _ETA_MAX))
         result = solve_fixed_point_daecm(
             res_fn, theta_weight0,
@@ -404,7 +355,7 @@ class TestFixedPointDaECM:
     def test_theta_newton_converges_n4(self) -> None:
         model, theta_topo_true, _ = make_daecm_model(N=4, seed=0)
         theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
-        theta_weight0 = model.initial_theta_weight(theta_topo, "strengths")
+        theta_weight0 = model.initial_theta_weight(theta_topo, "topology")
         res_fn = lambda tw: model.residual_strength(theta_topo, tw.clamp(_ETA_MIN, _ETA_MAX))
         result = solve_fixed_point_daecm(
             res_fn, theta_weight0,

@@ -250,11 +250,8 @@ def _fp_weight_multistart(
     res_fn = _make_strength_residual_fn(model, theta_topo, P=P_mat)
 
     starts = [theta_weight0]
-    for method in ("topology", "normalized", "uniform"):
+    for method in ("topology", "topology_geo", "topology_scale", "topology_node"):
         starts.append(model.initial_theta_weight(theta_topo, method))
-    for i in range(max(0, n_starts - len(starts))):
-        torch.manual_seed(i)
-        starts.append(model.initial_theta_weight(theta_topo, "random"))
 
     iter_per_start = max(50, max_iter // n_starts)
     best_result: Optional[SolverResult] = None

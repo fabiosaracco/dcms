@@ -21,8 +21,6 @@ if k_in_i = 0 then y_i = 0 (θ_in_i → +∞) and p_ji = 0 for all j.  These
 nodes are identified in ``__init__`` and handled explicitly so that the
 residual is *exactly* zero and the Jacobian columns/rows are zero.
 
-Reference:
-    Squartini & Garlaschelli, New J. Phys. 13 (2011) 083001.
 """
 from __future__ import annotations
 
@@ -196,90 +194,6 @@ class DCMModel:
         return F
 
     # ------------------------------------------------------------------
-    # Gradient of the log-likelihood (= +F(θ))
-    # ------------------------------------------------------------------
-
-    def gradient(self, theta: _ArrayLike) -> torch.Tensor:
-        """Return ∇L(θ) = +F(θ), i.e., the residual vector.
-
-        The log-likelihood of the DCM is
-
-            L(θ) = −Σ_i θ_out_i·k_out_i − Σ_i θ_in_i·k_in_i
-                   − Σ_{i≠j} log(1 + exp(−θ_out_i − θ_in_j))
-
-        so ∂L/∂θ_out_i = −k_out_i + Σ_{j≠i} p_ij = F_i(θ).
-
-        The gradient of −L is −F(θ).
-
-        Args:
-            theta: Parameter vector, shape (2N,).
-
-        Returns:
-            Gradient vector ∇L = F(θ), shape (2N,).
-        """
-        return self.residual(theta)
-
-    # ------------------------------------------------------------------
-    # Diagonal Hessian of the log-likelihood (≈ Newton step denominator)
-    # ------------------------------------------------------------------
-
-    def hessian_diag(self, theta: _ArrayLike) -> torch.Tensor:
-        """Return the diagonal of the Hessian of L(θ).
-
-        The second derivatives are:
-
-            ∂²L/∂θ_out_i² = −Σ_{j≠i} p_ij(1 − p_ij)
-            ∂²L/∂θ_in_i²  = −Σ_{j≠i} p_ji(1 − p_ji)
-
-        Args:
-            theta: Parameter vector, shape (2N,).
-
-        Returns:
-            Diagonal of the Hessian, shape (2N,).
-        """
-        P = self.pij_matrix(theta)
-        Q = P * (1.0 - P)           # elementwise q_ij = p_ij(1−p_ij)
-        h_out = -Q.sum(dim=1)       # row sums (out-degree contributions)
-        h_in = -Q.sum(dim=0)        # col sums (in-degree contributions)
-        return torch.cat([h_out, h_in])
-
-    # ------------------------------------------------------------------
-    # Full Jacobian of F(θ) (= Hessian of L, used by Newton solvers)
-    # ------------------------------------------------------------------
-
-    def jacobian(self, theta: _ArrayLike) -> torch.Tensor:
-        """Return the full Jacobian matrix J = ∂F/∂θ = Hess(L), shape (2N, 2N).
-
-        L is concave so J is negative semi-definite.  Denoting Q = P⊙(1−P):
-
-            J_out,out = −diag(Σ_{j≠i} Q_ij)   [diagonal, negative]
-            J_out,in  = −Q                      [zero on diagonal]
-            J_in,out  = −Qᵀ                    [zero on diagonal]
-            J_in,in   = −diag(Σ_{j≠i} Q_ji)   [diagonal, negative]
-
-        Args:
-            theta: Parameter vector, shape (2N,).
-
-        Returns:
-            Jacobian matrix, shape (2N, 2N), dtype torch.float64.
-        """
-        N = self.N
-        P = self.pij_matrix(theta)
-        Q = P * (1.0 - P)  # Q[i,i] = 0 since P[i,i] = 0
-        idx = torch.arange(N)
-
-        J = torch.zeros(2 * N, 2 * N, dtype=torch.float64)
-        # Top-left block: ∂F_out_i / ∂θ_out_i (diagonal, negative)
-        J[idx, idx] = -Q.sum(dim=1)
-        # Top-right block: ∂F_out_i / ∂θ_in_j = −Q_ij  (diagonal zero since Q[i,i]=0)
-        J[:N, N:] = -Q
-        # Bottom-left block: ∂F_in_i / ∂θ_out_j = −Q_ji
-        J[N:, :N] = -Q.T
-        # Bottom-right block: ∂F_in_i / ∂θ_in_i (diagonal, negative)
-        J[N + idx, N + idx] = -Q.sum(dim=0)
-        return J
-
-    # ------------------------------------------------------------------
     # Initial-guess utilities
     # ------------------------------------------------------------------
 
@@ -332,7 +246,7 @@ class DCMModel:
     def neg_log_likelihood(self, theta: _ArrayLike) -> float:
         """Return −L(θ), the convex quantity to be *minimised* by L-BFGS.
 
-        The DCM log-likelihood (Squartini & Garlaschelli 2011, eq. 13) is:
+        The DCM log-likelihood is:
 
             L(θ) = −Σ_i θ_out_i·k_out_i − Σ_i θ_in_i·k_in_i
                    − Σ_{i≠j} log(1 + exp(−θ_out_i − θ_in_j))

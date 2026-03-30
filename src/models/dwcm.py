@@ -19,8 +19,6 @@ The system of equations to solve is F(θ) = 0, where
 **Zero-strength nodes**: if s_out_i = 0 then β_out_i = 0 exactly
 (θ_out_i → +∞), so w_ij = 0 for all j.  Analogously for s_in_i = 0.
 
-Reference:
-    Squartini & Garlaschelli, New J. Phys. 13 (2011) 083001.
 """
 from __future__ import annotations
 
@@ -181,85 +179,6 @@ class DWCMModel:
         return F
 
     # ------------------------------------------------------------------
-    # Gradient of the log-likelihood (= +F(θ))
-    # ------------------------------------------------------------------
-
-    def gradient(self, theta: _ArrayLike) -> torch.Tensor:
-        """Return ∇L(θ) = +F(θ).
-
-        The DWCM log-likelihood is L(θ) = −Σ_i θ_out_i·s_out_i
-        − Σ_i θ_in_i·s_in_i + Σ_{i≠j} log(1 − exp(−θ_out_i − θ_in_j)),
-        so ∂L/∂θ_out_i = −s_out_i + Σ_{j≠i} w_ij = F_i(θ).
-
-        Args:
-            theta: Parameter vector, shape (2N,).
-
-        Returns:
-            Gradient vector ∇L = F(θ), shape (2N,).
-        """
-        return self.residual(theta)
-
-    # ------------------------------------------------------------------
-    # Diagonal Hessian of the log-likelihood
-    # ------------------------------------------------------------------
-
-    def hessian_diag(self, theta: _ArrayLike) -> torch.Tensor:
-        """Return the diagonal of the Hessian of L(θ).
-
-        The second derivatives are:
-
-            ∂²L/∂θ_out_i² = −Σ_{j≠i} W_ij(1 + W_ij)
-            ∂²L/∂θ_in_i²  = −Σ_{j≠i} W_ji(1 + W_ji)
-
-        Args:
-            theta: Parameter vector, shape (2N,).
-
-        Returns:
-            Diagonal of the Hessian, shape (2N,).
-        """
-        W = self.wij_matrix(theta)
-        G = W * (1.0 + W)    # G_ij = W_ij(1 + W_ij); G_ii = 0
-        h_out = -G.sum(dim=1)
-        h_in = -G.sum(dim=0)
-        return torch.cat([h_out, h_in])
-
-    # ------------------------------------------------------------------
-    # Full Jacobian of F(θ) (= Hessian of L, used by Newton solvers)
-    # ------------------------------------------------------------------
-
-    def jacobian(self, theta: _ArrayLike) -> torch.Tensor:
-        """Return the full Jacobian matrix J = ∂F/∂θ = Hess(L), shape (2N, 2N).
-
-        Denoting G = W ⊙ (1 + W) (elementwise, diagonal zero):
-
-            J_out,out = −diag(Σ_{j≠i} G_ij)   [diagonal, negative]
-            J_out,in  = −G                      [off-diagonal]
-            J_in,out  = −Gᵀ                    [off-diagonal]
-            J_in,in   = −diag(Σ_{j≠i} G_ji)   [diagonal, negative]
-
-        Args:
-            theta: Parameter vector, shape (2N,).
-
-        Returns:
-            Jacobian matrix, shape (2N, 2N), dtype torch.float64.
-        """
-        N = self.N
-        W = self.wij_matrix(theta)
-        G = W * (1.0 + W)   # G[i,i] = 0 since W[i,i] = 0
-        idx = torch.arange(N)
-
-        J = torch.zeros(2 * N, 2 * N, dtype=torch.float64)
-        # Top-left block: ∂F_out_i / ∂θ_out_i (diagonal, negative)
-        J[idx, idx] = -G.sum(dim=1)
-        # Top-right block: ∂F_out_i / ∂θ_in_j = −G_ij
-        J[:N, N:] = -G
-        # Bottom-left block: ∂F_in_i / ∂θ_out_j = −G_ji
-        J[N:, :N] = -G.T
-        # Bottom-right block: ∂F_in_i / ∂θ_in_i (diagonal, negative)
-        J[N + idx, N + idx] = -G.sum(dim=0)
-        return J
-
-    # ------------------------------------------------------------------
     # Initial-guess utilities
     # ------------------------------------------------------------------
 
@@ -272,7 +191,7 @@ class DWCMModel:
           by inverting the symmetric mean-field estimate s ≈ (N−1)β²/(1−β²).
           Works well when the strength distribution is not too heterogeneous.
 
-        * ``"normalized"`` (Squartini & Garlaschelli 2011, analytical approx.):
+        * ``"normalized"``: β_i^{out} = s_i^{out} / Σ_j s_j^{out}.
           β_i^{out} = s_i^{out} / Σ_j s_j^{out}, β_i^{in} = s_i^{in} / Σ_j s_j^{in}.
           Each β is proportional to the node's fractional share of total weight.
 
@@ -360,7 +279,7 @@ class DWCMModel:
     def neg_log_likelihood(self, theta: _ArrayLike) -> float:
         """Return −L(θ), the convex quantity to be *minimised* by L-BFGS.
 
-        The DWCM log-likelihood (Squartini & Garlaschelli 2011) is:
+        The DWCM log-likelihood is:
 
             L(θ) = −Σ_i θ_out_i·s_out_i − Σ_i θ_in_i·s_in_i
                    + Σ_{i≠j} log(1 − exp(−θ_out_i − θ_in_j))
@@ -435,100 +354,6 @@ class DWCMModel:
         return dot_term + log_total
 
     # ------------------------------------------------------------------
-    # Combined residual + neg_log_likelihood (avoids double W computation)
-    # ------------------------------------------------------------------
-
-    def residual_and_neg_log_likelihood(
-        self, theta: _ArrayLike
-    ) -> tuple[torch.Tensor, float]:
-        """Compute both F(θ) and −L(θ) from a single pass over the W matrix.
-
-        This is ~2× faster than calling ``residual()`` and
-        ``neg_log_likelihood()`` separately, since both share the same
-        z = θ_out[:,None] + θ_in[None,:] computation.
-
-        Args:
-            theta: Parameter vector [θ_out | θ_in], shape (2N,).
-
-        Returns:
-            ``(F, nll)`` where F is the residual (shape (2N,)) and nll is
-            the scalar −L(θ).
-        """
-        if self.N > _LARGE_N_THRESHOLD:
-            return self._residual_and_nll_chunked(theta)
-
-        theta = _to_tensor(theta)
-        N = self.N
-        theta_out = theta[:N]
-        theta_in = theta[N:]
-
-        z = theta_out[:, None] + theta_in[None, :]  # (N, N)
-        z_safe = z.clamp(min=1e-15)
-
-        # Residual from W = 1/expm1(z)
-        W = 1.0 / torch.expm1(z_safe)
-        W.fill_diagonal_(0.0)
-        if self.zero_out.any():
-            W[self.zero_out, :] = 0.0
-        if self.zero_in.any():
-            W[:, self.zero_in] = 0.0
-
-        F = torch.empty(2 * N, dtype=torch.float64)
-        F[:N] = W.sum(dim=1) - self.s_out
-        F[N:] = W.sum(dim=0) - self.s_in
-
-        # NLL from -log1p(-exp(-z))
-        log_term = -torch.log1p(-torch.exp(-z_safe))
-        log_term.fill_diagonal_(0.0)
-        dot_term = theta_out @ self.s_out + theta_in @ self.s_in
-        nll = (dot_term + log_term.sum()).item()
-
-        return F, nll
-
-    def _residual_and_nll_chunked(
-        self, theta: _ArrayLike, chunk_size: int = _DEFAULT_CHUNK
-    ) -> tuple[torch.Tensor, float]:
-        """Chunked version of :meth:`residual_and_neg_log_likelihood`."""
-        theta = _to_tensor(theta)
-        N = self.N
-        theta_out = theta[:N]
-        theta_in = theta[N:]
-
-        s_out_hat = torch.zeros(N, dtype=torch.float64)
-        s_in_hat = torch.zeros(N, dtype=torch.float64)
-        dot_term = (theta_out @ self.s_out + theta_in @ self.s_in).item()
-        log_total = 0.0
-
-        for i_start in range(0, N, chunk_size):
-            i_end = min(i_start + chunk_size, N)
-            chunk_len = i_end - i_start
-            z = theta_out[i_start:i_end, None] + theta_in[None, :]  # (chunk, N)
-            z_safe = z.clamp(min=1e-15)
-
-            # Residual chunk
-            w_chunk = 1.0 / torch.expm1(z_safe)
-            local_idx = torch.arange(chunk_len, dtype=torch.long)
-            global_idx = torch.arange(i_start, i_end, dtype=torch.long)
-            w_chunk[local_idx, global_idx] = 0.0
-            if self.zero_out[i_start:i_end].any():
-                w_chunk[self.zero_out[i_start:i_end]] = 0.0
-            if self.zero_in.any():
-                w_chunk[:, self.zero_in] = 0.0
-
-            s_out_hat[i_start:i_end] = w_chunk.sum(dim=1)
-            s_in_hat += w_chunk.sum(dim=0)
-
-            # NLL chunk: -log1p(-exp(-z))
-            log_chunk = -torch.log1p(-torch.exp(-z_safe))
-            log_chunk[local_idx, global_idx] = 0.0
-            log_total += log_chunk.sum().item()
-
-        F = torch.empty(2 * N, dtype=torch.float64)
-        F[:N] = s_out_hat - self.s_out
-        F[N:] = s_in_hat - self.s_in
-
-        return F, dot_term + log_total
-
     # ------------------------------------------------------------------
     # Evaluation of constraint satisfaction
     # ------------------------------------------------------------------

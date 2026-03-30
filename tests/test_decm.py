@@ -357,30 +357,30 @@ class TestDECMSolverConvergence:
     def test_solve_tool_converges(self, N: int, seed: int):
         """solve_tool should converge to the true solution within CONV_TOL."""
         model, _ = make_decm_model(N=N, seed=seed)
-        result = model.solve_tool(
+        converged = model.solve_tool(
             ic="degrees",
             tol=CONV_TOL,
             max_iter=5000,
             anderson_depth=10,
         )
-        assert result.converged, (
-            f"N={N}, seed={seed}: not converged after {result.iterations} iters. "
-            f"Final residual: {result.residuals[-1]:.3e}"
+        assert converged, (
+            f"N={N}, seed={seed}: not converged after {model.sol.iterations} iters. "
+            f"Final residual: {model.sol.residuals[-1]:.3e}"
         )
-        assert model.constraint_error(result.theta) < CONV_TOL * 10
+        assert model.constraint_error(model.sol.theta) < CONV_TOL * 10
 
     @pytest.mark.parametrize("seed", [0, 1, 2])
     def test_solve_tool_n4_multiple_seeds(self, seed: int):
         """N=4 must converge from the degrees initialisation for any reasonable seed."""
         model, _ = make_decm_model(N=4, seed=seed)
-        result = model.solve_tool(
+        converged = model.solve_tool(
             ic="degrees",
             tol=CONV_TOL,
             max_iter=3000,
             anderson_depth=10,
         )
-        assert result.converged, (
-            f"seed={seed}: not converged. Last residual: {result.residuals[-1]:.3e}"
+        assert converged, (
+            f"seed={seed}: not converged. Last residual: {model.sol.residuals[-1]:.3e}"
         )
 
     def test_solve_fixed_point_decm_directly(self):
@@ -403,23 +403,37 @@ class TestDECMSolverConvergence:
         assert model.constraint_error(result.theta) < CONV_TOL * 10
 
     def test_result_has_correct_fields(self):
-        """SolverResult should have all expected fields."""
+        """SolverResult attributes should have all expected fields after solve_tool."""
         model, _ = make_decm_model(N=4)
-        result = model.solve_tool(tol=CONV_TOL, max_iter=3000)
-        assert hasattr(result, "theta")
-        assert hasattr(result, "converged")
-        assert hasattr(result, "iterations")
-        assert hasattr(result, "residuals")
-        assert hasattr(result, "elapsed_time")
-        assert hasattr(result, "peak_ram_bytes")
-        assert result.theta.shape == (16,)  # 4 * N with N=4
-        assert isinstance(result.residuals, list)
-        assert result.elapsed_time > 0
+        converged = model.solve_tool(tol=CONV_TOL, max_iter=3000)
+        # Full 4N result
+        assert hasattr(model, "sol")
+        assert hasattr(model.sol, "theta")
+        assert hasattr(model.sol, "converged")
+        assert hasattr(model.sol, "iterations")
+        assert hasattr(model.sol, "residuals")
+        assert hasattr(model.sol, "elapsed_time")
+        assert hasattr(model.sol, "peak_ram_bytes")
+        assert model.sol.theta.shape == (16,)  # 4 * N with N=4
+        assert isinstance(model.sol.residuals, list)
+        assert model.sol.elapsed_time > 0
+        # Topology sub-result: [θ_out | θ_in], shape (2N,)
+        assert hasattr(model, "sol_topo")
+        assert model.sol_topo.theta.shape == (8,)   # 2 * N
+        # Weight sub-result: [η_out | η_in], shape (2N,)
+        assert hasattr(model, "sol_weights")
+        assert model.sol_weights.theta.shape == (8,)  # 2 * N
+        # Consistency: sol_topo + sol_weights reconstitute sol
+        import numpy as np
+        np.testing.assert_array_equal(
+            model.sol.theta,
+            np.concatenate([model.sol_topo.theta, model.sol_weights.theta]),
+        )
 
     def test_solver_returns_best_iterate(self):
         """Even for a very tight tolerance, the returned theta should be near-optimal."""
         model, _ = make_decm_model(N=6)
-        result = model.solve_tool(tol=1e-12, max_iter=100)
+        model.solve_tool(tol=1e-12, max_iter=100)
         # Even if not converged, the best iterate should be reasonable
-        err = model.constraint_error(result.theta)
+        err = model.constraint_error(model.sol.theta)
         assert err < 1.0  # sanity check: not wildly wrong

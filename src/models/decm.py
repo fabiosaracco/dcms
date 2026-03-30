@@ -71,6 +71,14 @@ class DECMModel:
     The 4N unknowns are stored as a single vector:
     ``theta = [θ_out | θ_in | η_out | η_in]``
 
+    After calling :meth:`solve_tool`, the following result attributes are set:
+
+    * ``sol`` — :class:`~src.solvers.base.SolverResult` for the full 4N problem.
+    * ``sol_topo`` — :class:`~src.solvers.base.SolverResult` with
+      ``theta = [θ_out | θ_in]`` (topology / degree multipliers, shape 2N).
+    * ``sol_weights`` — :class:`~src.solvers.base.SolverResult` with
+      ``theta = [η_out | η_in]`` (weight multipliers, shape 2N).
+
     Attributes:
         N:          Number of nodes.
         k_out:      Observed out-degree sequence, shape (N,).
@@ -553,8 +561,16 @@ class DECMModel:
         max_time: float = 0,
         variant: str = "theta-newton",
         anderson_depth: int = 10,
-    ) -> SolverResult:
+    ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
+
+        Results are stored on the model instance:
+
+        * ``self.sol`` — full 4N :class:`~src.solvers.base.SolverResult`.
+        * ``self.sol_topo`` — :class:`~src.solvers.base.SolverResult` carrying
+          only the topology parameters ``theta = [θ_out | θ_in]``, shape (2N,).
+        * ``self.sol_weights`` — :class:`~src.solvers.base.SolverResult` carrying
+          only the weight parameters ``theta = [η_out | η_in]``, shape (2N,).
 
         Args:
             ic:            Initial condition method (``"degrees"``, ``"random"``,
@@ -566,14 +582,14 @@ class DECMModel:
             anderson_depth: Anderson acceleration depth.
 
         Returns:
-            :class:`~src.solvers.base.SolverResult` instance.
+            ``True`` if the solver converged, ``False`` otherwise.
         """
         from src.solvers.fixed_point_decm import solve_fixed_point_decm
 
-        theta0 = self.initial_theta(ic)
-        result = solve_fixed_point_decm(
+        self.ic = self.initial_theta(ic)
+        self.sol = solve_fixed_point_decm(
             residual_fn=self.residual,
-            theta0=theta0,
+            theta0=self.ic,
             k_out=self.k_out,
             k_in=self.k_in,
             s_out=self.s_out,
@@ -585,4 +601,30 @@ class DECMModel:
             anderson_depth=anderson_depth,
             max_time=max_time,
         )
-        return result
+        if self.sol.message:
+            print(self.sol.message)
+
+        # Split the 4N result into topology (θ_out, θ_in) and weight (η_out, η_in)
+        # sub-results so callers can access each part with the same interface used
+        # by DaECM (model.sol_topo.theta and model.sol_weights.theta).
+        N = self.N
+        theta_full = self.sol.theta  # numpy array, shape (4N,)
+        self.sol_topo = SolverResult(
+            theta=theta_full[: 2 * N],
+            converged=self.sol.converged,
+            iterations=self.sol.iterations,
+            residuals=self.sol.residuals,
+            elapsed_time=self.sol.elapsed_time,
+            peak_ram_bytes=self.sol.peak_ram_bytes,
+            message=self.sol.message,
+        )
+        self.sol_weights = SolverResult(
+            theta=theta_full[2 * N :],
+            converged=self.sol.converged,
+            iterations=self.sol.iterations,
+            residuals=self.sol.residuals,
+            elapsed_time=self.sol.elapsed_time,
+            peak_ram_bytes=self.sol.peak_ram_bytes,
+            message=self.sol.message,
+        )
+        return self.sol.converged

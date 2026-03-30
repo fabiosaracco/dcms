@@ -364,8 +364,10 @@ converged = model.solve_tool(
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     anderson_depth=10,
 )
-# solve_tool returns True if converged
-theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
+# solve_tool returns True if converged, and stores three result attributes:
+theta_full    = model.sol.theta         # full 4N parameters [θ_out|θ_in|η_out|η_in]
+theta_topo    = model.sol_topo.theta    # topology parameters [θ_out|θ_in], shape (2N,)
+theta_weights = model.sol_weights.theta # weight parameters  [η_out|η_in],  shape (2N,)
 ```
 
 Additional model methods:
@@ -390,10 +392,10 @@ Additional model methods:
 
 ### 3.5 SolverResult
 
-`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM/DECM, `model.sol_topo` / `model.sol_weights` for DaECM.  The `SolverResult` dataclass fields are:
+`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM, `model.sol_topo` / `model.sol_weights` for DaECM and DECM.  The `SolverResult` dataclass fields are:
 
 ```python
-result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM, (4N,) for DECM
+result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM/sol_topo/sol_weights, (4N,) for DECM model.sol
 result.converged       # bool
 result.iterations      # int
 result.residuals       # list[float] — ℓ∞ residual norm per accepted step

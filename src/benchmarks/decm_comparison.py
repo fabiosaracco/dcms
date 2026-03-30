@@ -113,8 +113,8 @@ def _run_decm_solver(
     timeout: float,
 ) -> Optional[SolverResult]:
     """Run one DECM solver and return the SolverResult (or None on timeout)."""
-    def _fn():
-        return model.solve_tool(
+    def _fn() -> SolverResult:
+        model.solve_tool(
             ic=ic,
             tol=tol,
             max_iter=max_iter,
@@ -122,6 +122,7 @@ def _run_decm_solver(
             variant=variant,
             anderson_depth=anderson_depth,
         )
+        return model.sol
 
     try:
         return _call_with_timeout(_fn, timeout)

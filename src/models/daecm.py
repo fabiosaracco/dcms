@@ -624,22 +624,22 @@ class DaECMModel:
         """
         # Step 1: solve the DCM topology
         self.ic_topo=self.initial_theta_topo(ic_topo)
-        self.topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
+        self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         
-        if len(self.topo.message)>0:
-            print(f'Topology: {self.topo.message}')
+        if len(self.sol_topo.message)>0:
+            print(f'Topology: {self.sol_topo.message}')
 
        
 
         # Step 2: solve the conditioned weight equations
-        self.ic_weig = self.initial_theta_weight(theta_topo = self.topo.theta, method=ic_weights)
+        self.ic_weig = self.initial_theta_weight(theta_topo = self.sol_topo.theta, method=ic_weights)
 
         # Build the residual function that fixes theta_topo
-        res_weight = functools.partial(self.residual_strength, theta_topo=self.topo.theta)
+        res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
 
-        self.weights = solve_fixed_point_daecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
-        if len(self.weights.message)>0:
-            print(f'Weights: {self.weights.message}')
+        self.sol_weights = solve_fixed_point_daecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
+        if len(self.sol_weights.message)>0:
+            print(f'Weights: {self.sol_weights.message}')
 
-        return self.topo.converged and self.weights.converged
+        return self.sol_topo.converged and self.sol_weights.converged
 

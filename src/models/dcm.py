@@ -355,10 +355,8 @@ class DCMModel:
             :class:`~src.solvers.base.SolverResult` instance.
         """
         self.ic=self.initial_theta(ic)
-        _solve = solve_fixed_point_dcm(self.residual, self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
-        if len(_solve.message)>0:
-            print(_solve.message)
+        self.sol = solve_fixed_point_dcm(self.residual, self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
+        if len(self.sol.message)>0:
+            print(self.sol.message)
             
-        # move all the attributes of _solve to self
-        self.__dict__.update(vars(_solve))
-        return _solve.converged
+        return self.sol.converged

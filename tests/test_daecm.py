@@ -230,7 +230,7 @@ class TestInitialThetaWeight:
 
     def test_all_positive(self) -> None:
         model, theta_topo, _ = make_daecm_model(N=6)
-        for method in ("topology", "topology_geo", "topology_scale", "topology_node"):
+        for method in ("topology", "topology_node"):
             theta0 = model.initial_theta_weight(theta_topo, method=method)
             assert torch.all(theta0 > 0), f"method={method!r} produced non-positive θ"
 

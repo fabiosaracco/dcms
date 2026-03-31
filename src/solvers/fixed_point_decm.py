@@ -52,7 +52,7 @@ from src.solvers.base import SolverResult
 # Numerical constants (mirrors fixed_point_daecm.py)
 # -------------------------------------------------------------------------
 _ANDERSON_MAX_NORM: float = 1e6
-_ANDERSON_BLOWUP_FACTOR: float = 5000.0
+_ANDERSON_BLOWUP_FACTOR: float = 50.0
 _Q_MAX: float = 0.9999
 
 _Z_G_CLAMP: float = 1e-8
@@ -505,7 +505,7 @@ def solve_fixed_point_decm(
     variant: str = "theta-newton",
     chunk_size: int = 0,
     anderson_depth: int = 10,
-    max_step: float = 1.0,
+    max_step: float = 0.5,
     max_time: float = 0.0,
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
@@ -600,6 +600,11 @@ def solve_fixed_point_decm(
     tracemalloc.start()
     t0 = time.perf_counter()
 
+    # Scale-adaptive Anderson blowup: generous for tiny networks (where wild
+    # Anderson excursions can find good iterates), strict for large ones
+    # (where residual cascades corrupt history for hundreds of iterations).
+    eff_blowup = max(50.0, min(5000.0, 200_000.0 / N))
+
     n_iter = 0
     residuals: list[float] = []
     converged = False
@@ -658,7 +663,7 @@ def solve_fixed_point_decm(
             if n_iter % _STAGNATION_WINDOW == 0:
                 if n_iter > _STAGNATION_WINDOW:
                     improvement = (best_res_old - best_res_recent) / max(best_res_old, 1e-30)
-                    if improvement < _STAGNATION_RTOL:
+                    if 0.0 <= improvement < _STAGNATION_RTOL:
                         message = (
                             f"Stagnation: residual improved by only {improvement:.2%} "
                             f"over last {_STAGNATION_WINDOW} iterations "
@@ -675,7 +680,7 @@ def solve_fixed_point_decm(
                 if (
                     len(_and_g) >= 2
                     and math.isfinite(res_norm)
-                    and res_norm > _ANDERSON_BLOWUP_FACTOR * _best_res_for_anderson
+                    and res_norm > eff_blowup * _best_res_for_anderson
                 ):
                     _and_g.clear()
                     _and_r.clear()

@@ -457,6 +457,10 @@ class DECMModel:
               for weights.
             * ``"random"``: uniform random in [0.1, 2.0] for all components.
             * ``"uniform"``: fixed value 1.0 for all components.
+            * ``"daecm"``: solve DaECM first (DCM topology + conditioned DWCM
+              weights) and use the concatenated 4N solution as warm-start.
+              More expensive to compute but lands in a much better basin for
+              networks with extreme s/k ratios or heterogeneous hubs.
 
         Zero-degree nodes have θ = +_THETA_MAX; zero-strength nodes have
         η = +_ETA_MAX.
@@ -468,6 +472,15 @@ class DECMModel:
             Initial parameter vector θ₀, shape (4N,).
         """
         N = self.N
+
+        if method == "daecm":
+            # Late import to avoid circular dependency at module level.
+            from src.models.daecm import DaECMModel
+            daecm = DaECMModel(self.k_out, self.k_in, self.s_out, self.s_in)
+            daecm.solve_tool(ic_topo="degrees", ic_weights="topology")
+            theta_topo = torch.as_tensor(daecm.sol_topo.theta, dtype=torch.float64)
+            theta_weight = torch.as_tensor(daecm.sol_weights.theta, dtype=torch.float64)
+            return torch.cat([theta_topo, theta_weight])
 
         if method in ("degrees", "random", "uniform"):
             if method == "degrees":
@@ -559,42 +572,72 @@ class DECMModel:
         max_time: float = 0,
         variant: str = "theta-newton",
         anderson_depth: int = 10,
+        multi_start: bool = True,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
+
+        If the primary IC does not converge and ``multi_start=True``,
+        automatically retries with ``"daecm"`` and ``"random"`` warm-starts.
+        Each fallback attempt uses the same ``max_iter`` budget.  The result
+        stored in ``self.sol`` is always the iterate with the lowest residual
+        found across all attempts.
 
         Results are stored on the model instance as ``self.sol``
         (:class:`~src.solvers.base.SolverResult`, full 4N parameter vector
         ``theta = [θ_out | θ_in | η_out | η_in]``).
 
         Args:
-            ic:            Initial condition method (``"degrees"``, ``"random"``,
-                           ``"uniform"``).
+            ic:            Primary initial condition (``"degrees"``, ``"random"``,
+                           ``"uniform"``, ``"daecm"``).
             tol:           Convergence tolerance on the ℓ∞ residual.
-            max_iter:      Maximum iterations.
-            max_time:      Wall-clock time limit in seconds (0 = no limit).
+            max_iter:      Maximum iterations per attempt.
+            max_time:      Wall-clock time limit in seconds per attempt
+                           (0 = no limit).
             variant:       Solver variant (only ``"theta-newton"`` is supported).
             anderson_depth: Anderson acceleration depth.
+            multi_start:   If ``True`` (default), retry with fallback ICs when
+                           the primary IC does not converge.  Set to ``False``
+                           for clean per-IC benchmarking.
 
         Returns:
-            ``True`` if the solver converged, ``False`` otherwise.
+            ``True`` if any attempt converged, ``False`` otherwise.
         """
         from src.solvers.fixed_point_decm import solve_fixed_point_decm
 
+        _FALLBACK_ICS = ["daecm", "random"]
+
+        def _run_once(ic_name: str):
+            theta0 = self.initial_theta(ic_name)
+            return solve_fixed_point_decm(
+                residual_fn=self.residual,
+                theta0=theta0,
+                k_out=self.k_out,
+                k_in=self.k_in,
+                s_out=self.s_out,
+                s_in=self.s_in,
+                tol=tol,
+                max_iter=max_iter,
+                variant=variant,
+                chunk_size=0,
+                anderson_depth=anderson_depth,
+                max_time=max_time,
+            )
+
         self.ic = self.initial_theta(ic)
-        self.sol = solve_fixed_point_decm(
-            residual_fn=self.residual,
-            theta0=self.ic,
-            k_out=self.k_out,
-            k_in=self.k_in,
-            s_out=self.s_out,
-            s_in=self.s_in,
-            tol=tol,
-            max_iter=max_iter,
-            variant=variant,
-            chunk_size=0,
-            anderson_depth=anderson_depth,
-            max_time=max_time,
-        )
+        self.sol = _run_once(ic)
         if self.sol.message:
             print(self.sol.message)
+
+        if multi_start and not self.sol.converged:
+            for fallback in _FALLBACK_ICS:
+                if fallback == ic:
+                    continue
+                fb_result = _run_once(fallback)
+                if fb_result.message:
+                    print(fb_result.message)
+                if fb_result.residuals[-1] < self.sol.residuals[-1]:
+                    self.sol = fb_result
+                if self.sol.converged:
+                    break
+
         return self.sol.converged

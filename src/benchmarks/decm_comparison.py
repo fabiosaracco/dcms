@@ -97,13 +97,15 @@ def _call_with_timeout(fn: Callable, timeout_s: float):
 # is returned, matching the multi-start logic used in the other comparisons.
 _ALL_METHODS: list[dict] = [
     {"name": "θ-Newton Anderson(10)", "ic": "degrees",  "variant": "theta-newton", "anderson_depth": 10},
+    {"name": "θ-Newton Anderson(10) [daecm]",   "ic": "daecm",   "variant": "theta-newton", "anderson_depth": 10},
     {"name": "θ-Newton Anderson(10) [uniform]", "ic": "uniform", "variant": "theta-newton", "anderson_depth": 10},
     {"name": "θ-Newton Anderson(10) [random]",  "ic": "random",  "variant": "theta-newton", "anderson_depth": 10},
 ]
 
-# Fast mode: only the default IC (degrees).
+# Fast mode: degrees (default) + daecm warm-start (most robust for large N).
 _FAST_METHODS: list[dict] = [
-    {"name": "θ-Newton Anderson(10)", "ic": "degrees", "variant": "theta-newton", "anderson_depth": 10},
+    {"name": "θ-Newton Anderson(10)",          "ic": "degrees", "variant": "theta-newton", "anderson_depth": 10},
+    {"name": "θ-Newton Anderson(10) [daecm]",  "ic": "daecm",  "variant": "theta-newton", "anderson_depth": 10},
 ]
 
 
@@ -127,6 +129,7 @@ def _run_one(
             max_time=timeout if timeout > 0 else 0,
             variant=m["variant"],
             anderson_depth=m["anderson_depth"],
+            multi_start=False,
         )
         return model.sol
 

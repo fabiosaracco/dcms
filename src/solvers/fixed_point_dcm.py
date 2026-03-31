@@ -467,7 +467,7 @@ def solve_fixed_point_dcm(
             if n_iter % _STAGNATION_WINDOW == 0:
                 if n_iter > _STAGNATION_WINDOW:
                     improvement = (best_res_old - best_res_recent) / max(best_res_old, 1e-30)
-                    if improvement < _STAGNATION_RTOL:
+                    if 0.0 <= improvement < _STAGNATION_RTOL:
                         message = (
                             f"Stagnation: residual improved by only {improvement:.2%} "
                             f"over last {_STAGNATION_WINDOW} iterations "
@@ -477,7 +477,6 @@ def solve_fixed_point_dcm(
                 best_res_old = best_res_recent
                 best_res_recent = float("inf")
 
-            # FP-GS periodic Newton correction
             _fpgs_newton_fired = False
             if variant != "theta-newton" and anderson_depth > 1:
                 if res_norm < _fpgs_best_local * 0.99:

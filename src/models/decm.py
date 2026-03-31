@@ -475,9 +475,13 @@ class DECMModel:
 
         if method == "daecm":
             # Late import to avoid circular dependency at module level.
+            import io, contextlib
             from src.models.daecm import DaECMModel
             daecm = DaECMModel(self.k_out, self.k_in, self.s_out, self.s_in)
-            daecm.solve_tool(ic_topo="degrees", ic_weights="topology")
+            # Suppress solver progress messages — this is an IC computation,
+            # not a user-facing solve.
+            with contextlib.redirect_stdout(io.StringIO()):
+                daecm.solve_tool(ic_topo="degrees", ic_weights="topology")
             theta_topo = torch.as_tensor(daecm.sol_topo.theta, dtype=torch.float64)
             theta_weight = torch.as_tensor(daecm.sol_weights.theta, dtype=torch.float64)
             return torch.cat([theta_topo, theta_weight])

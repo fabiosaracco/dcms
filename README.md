@@ -482,17 +482,25 @@ Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per 
 
 > FP-GS Anderson(10) fails for DaECM at N = 5 000 because the conditioned weight equations have spectral radius > 1 for power-law hubs: each `p_ij < 1` factor forces `β_i β_j` closer to 1 to satisfy the strength constraint, amplifying the fixed-point Jacobian.  The θ-Newton approach bypasses this limitation by working in log-space where the diagonal Hessian always stabilises the step.
 
-### DECM — N = 1 000
+### DECM — N = 1 000 and N = 5 000
 
-Benchmark over 10 seeds (`k_s_generator_pl(N=1000, rho=1e-3)`), `tol=1e-5`.
+Benchmarks over 5 seeds each (`k_s_generator_pl(N, rho=1e-3)`, `tol=1e-5`).
 
-The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.
+The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.  `solve_tool()` uses `multi_start=True` by default: if the primary IC ("degrees") does not converge, it automatically retries with the "daecm" warm-start (run DaECM first and use its 4N solution as starting point) and then "random".
 
-| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MRE (mean±2σ) |
-|--------|------:|----------------:|-----------------:|---------------:|
-| **θ-Newton Anderson(10)** | **100%** | **52.9 ± 6.1** | **1.9 ± 0.2** | **5.00e-07 ± 2.87e-07** |
+**N = 1 000**
 
-> The coupling between degree and strength equations makes the DECM more expensive per iteration than the DaECM (two passes over the N×N grid instead of one), but the alternating GS-Newton strategy achieves 100% convergence on all 10 test networks with modest iteration counts.
+| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
+|--------|------:|----------------:|-----------------:|--------------------:|
+| **θ-Newton Anderson(10)** | **100%** | **45 ± 8** | **2.3 ± 1.8** | **8.05e-07 ± 6.37e-07** |
+
+**N = 5 000**
+
+| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
+|--------|------:|----------------:|-----------------:|--------------------:|
+| **θ-Newton Anderson(10)** | **100%** | **67 ± 20** | **77.9 ± 22.8** | **1.50e-07 ± 2.58e-07** |
+
+> The coupling between degree and strength equations makes the DECM more expensive per iteration than the DaECM (two passes over the N×N grid instead of one), but the alternating GS-Newton strategy with multi-start achieves 100% convergence across all tested seeds.  Hard seeds (high s/k hubs) that the "degrees" IC cannot handle are resolved by the "daecm" warm-start fallback.
 
 ---
 

@@ -30,8 +30,8 @@ from typing import Union
 
 import torch
 
-from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.solvers.base import SolverResult
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
 
@@ -43,10 +43,10 @@ _THETA_MAX: float = 50.0
 
 # For N > this threshold, residual() and neg_log_likelihood() automatically
 # use chunked computation to avoid materialising the full N×N matrix.
-from src.models.parameters import DCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import DCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 
 # Number of rows processed per chunk when using memory-efficient mode.
-from src.models.parameters import _DEFAULT_CHUNK
+from dcms.models.parameters import _DEFAULT_CHUNK
 
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:

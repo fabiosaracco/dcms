@@ -23,10 +23,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.adecm import ADECMModel, _ETA_MAX, _ETA_MIN
-from src.models.dcm import DCMModel
-from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.models.adecm import ADECMModel, _ETA_MAX, _ETA_MIN
+from dcms.models.dcm import DCMModel
+from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
 # ---------------------------------------------------------------------------

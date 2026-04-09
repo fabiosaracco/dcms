@@ -46,9 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 
-from src.models.decm import DECMModel
-from src.solvers.base import SolverResult
-from src.utils.wng import k_s_generator_pl
+from dcms.models.decm import DECMModel
+from dcms.solvers.base import SolverResult
+from dcms.utils.wng import k_s_generator_pl
 
 
 # ---------------------------------------------------------------------------

@@ -23,9 +23,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.dwcm import DWCMModel, _ETA_MAX, _ETA_MIN
-from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
+from dcms.models.dwcm import DWCMModel, _ETA_MAX, _ETA_MIN
+from dcms.solvers.base import SolverResult
+from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ class TestFixedPointDWCM:
 
     def test_chunked_step_matches_dense_step(self) -> None:
         """Chunked fixed-point step must produce the same result as the dense path."""
-        from src.solvers.fixed_point_dwcm import _fp_step_chunked_dwcm
+        from dcms.solvers.fixed_point_dwcm import _fp_step_chunked_dwcm
         model, theta = make_dwcm_model(N=8)
         theta_t = torch.tensor(theta, dtype=torch.float64)
         N = model.N
@@ -436,7 +436,7 @@ class TestThetaNewtonDWCM:
 
     def test_chunked_matches_dense(self) -> None:
         """Chunked theta-newton step must give the same result as the dense path."""
-        from src.solvers.fixed_point_dwcm import (
+        from dcms.solvers.fixed_point_dwcm import (
             _theta_newton_step_dense, _theta_newton_step_chunked,
         )
         model, theta_np = make_dwcm_model(N=8, seed=5)

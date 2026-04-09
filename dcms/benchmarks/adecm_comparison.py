@@ -49,12 +49,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 
-from src.models.adecm import ADECMModel, _ETA_MIN, _ETA_MAX, _LARGE_N_THRESHOLD as _DAECM_LARGE_N
-from src.models.dcm import DCMModel
-from src.solvers.base import SolverResult
-from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.utils.wng import k_s_generator_pl
+from dcms.models.adecm import ADECMModel, _ETA_MIN, _ETA_MAX, _LARGE_N_THRESHOLD as _DAECM_LARGE_N
+from dcms.models.dcm import DCMModel
+from dcms.solvers.base import SolverResult
+from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.utils.wng import k_s_generator_pl
 
 
 class _TimeoutError(Exception):
@@ -234,7 +234,7 @@ def _fp_weight_multistart(
         :class:`~src.solvers.base.SolverResult` with the best solution found.
     """
     import time as _t
-    from src.solvers.base import SolverResult as _SR
+    from dcms.solvers.base import SolverResult as _SR
 
     # Pre-compute p_ij for dense path
     N = model.N

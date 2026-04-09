@@ -41,9 +41,9 @@ from typing import Union
 
 import torch
 
-from src.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
-from src.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
-from src.solvers.base import SolverResult
+from dcms.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
+from dcms.solvers.base import SolverResult
 
 # Type alias: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
@@ -477,7 +477,7 @@ class DECMModel:
         if method == "adecm":
             # Late import to avoid circular dependency at module level.
             import io, contextlib
-            from src.models.adecm import ADECMModel
+            from dcms.models.adecm import ADECMModel
             adecm = ADECMModel(self.k_out, self.k_in, self.s_out, self.s_in)
             # Suppress solver progress messages — this is an IC computation,
             # not a user-facing solve.
@@ -607,7 +607,7 @@ class DECMModel:
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
         """
-        from src.solvers.fixed_point_decm import solve_fixed_point_decm
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
         _FALLBACK_ICS = ["adecm", "random"]
 

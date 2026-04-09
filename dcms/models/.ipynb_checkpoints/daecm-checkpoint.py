@@ -44,17 +44,17 @@ from typing import Union
 import torch
 import functools
 
-from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from dcms.solvers.base import SolverResult
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.solvers.fixed_point_daecm import solve_fixed_point_daecm
 
-from src.models.dcm import DCMModel, _THETA_MAX
+from dcms.models.dcm import DCMModel, _THETA_MAX
 
 # Type alias for inputs: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
 
-from src.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
-from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
+from dcms.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 
 
 # Maximum allowed β_out * β_in product; individual β may exceed 1 as long

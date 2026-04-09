@@ -2,7 +2,7 @@
 import pytest
 import numpy as np
 import torch
-from src.utils.wng import k_s_generator_pl
+from dcms.utils.wng import k_s_generator_pl
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -20,14 +20,14 @@ def _setup(N=30, seed=42):
 
 class TestDCMSample:
     def _fitted(self):
-        from src.models.dcm import DCMModel
+        from dcms.models.dcm import DCMModel
         k_out, k_in, _, _ = _setup()
         m = DCMModel(k_out, k_in)
         m.solve_tool(tol=1e-6)
         return m
 
     def test_raises_before_solve(self):
-        from src.models.dcm import DCMModel
+        from dcms.models.dcm import DCMModel
         k_out, k_in, _, _ = _setup()
         with pytest.raises(RuntimeError):
             DCMModel(k_out, k_in).sample()
@@ -65,7 +65,7 @@ class TestDCMSample:
 
     def test_degree_distribution_approx(self):
         """Sampled mean degree should be close to the observed degree."""
-        from src.models.dcm import DCMModel
+        from dcms.models.dcm import DCMModel
         k_out, k_in, _, _ = _setup(N=50, seed=0)
         m = DCMModel(k_out, k_in)
         m.solve_tool(tol=1e-8)
@@ -88,14 +88,14 @@ class TestDCMSample:
 
 class TestDWCMSample:
     def _fitted(self):
-        from src.models.dwcm import DWCMModel
+        from dcms.models.dwcm import DWCMModel
         _, _, s_out, s_in = _setup()
         m = DWCMModel(s_out, s_in)
         m.solve_tool(tol=1e-6)
         return m
 
     def test_raises_before_solve(self):
-        from src.models.dwcm import DWCMModel
+        from dcms.models.dwcm import DWCMModel
         _, _, s_out, s_in = _setup()
         with pytest.raises(RuntimeError):
             DWCMModel(s_out, s_in).sample()
@@ -122,7 +122,7 @@ class TestDWCMSample:
 
     def test_strength_distribution_approx(self):
         """Sampled mean strength should be close to observed strength."""
-        from src.models.dwcm import DWCMModel
+        from dcms.models.dwcm import DWCMModel
         _, _, s_out, s_in = _setup(N=30, seed=0)
         m = DWCMModel(s_out, s_in)
         m.solve_tool(tol=1e-8)
@@ -147,14 +147,14 @@ class TestDWCMSample:
 
 class TestADECMSample:
     def _fitted(self):
-        from src.models.adecm import ADECMModel
+        from dcms.models.adecm import ADECMModel
         k_out, k_in, s_out, s_in = _setup()
         m = ADECMModel(k_out, k_in, s_out, s_in)
         m.solve_tool(tol=1e-6)
         return m
 
     def test_raises_before_solve(self):
-        from src.models.adecm import ADECMModel
+        from dcms.models.adecm import ADECMModel
         k_out, k_in, s_out, s_in = _setup()
         with pytest.raises(RuntimeError):
             ADECMModel(k_out, k_in, s_out, s_in).sample()
@@ -184,14 +184,14 @@ class TestADECMSample:
 
 class TestDECMSample:
     def _fitted(self):
-        from src.models.decm import DECMModel
+        from dcms.models.decm import DECMModel
         k_out, k_in, s_out, s_in = _setup()
         m = DECMModel(k_out, k_in, s_out, s_in)
         m.solve_tool(tol=1e-6)
         return m
 
     def test_raises_before_solve(self):
-        from src.models.decm import DECMModel
+        from dcms.models.decm import DECMModel
         k_out, k_in, s_out, s_in = _setup()
         with pytest.raises(RuntimeError):
             DECMModel(k_out, k_in, s_out, s_in).sample()

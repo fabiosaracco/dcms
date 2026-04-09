@@ -44,9 +44,9 @@ from typing import Callable
 
 import torch
 
-from src.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
-from src.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
-from src.solvers.base import SolverResult
+from dcms.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
+from dcms.solvers.base import SolverResult
 
 # -------------------------------------------------------------------------
 # Numerical constants (mirrors fixed_point_adecm.py)

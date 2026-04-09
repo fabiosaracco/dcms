@@ -24,8 +24,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.decm import DECMModel, _ETA_MAX, _ETA_MIN, _THETA_MAX
-from src.solvers.fixed_point_decm import solve_fixed_point_decm
+from dcms.models.decm import DECMModel, _ETA_MAX, _ETA_MIN, _THETA_MAX
+from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
 # ---------------------------------------------------------------------------
 # Tolerance

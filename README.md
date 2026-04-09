@@ -272,8 +272,7 @@ Additional model methods:
 | `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess: `"degrees"` (default) or `"random"` |
-
-### 3.2 DWCM — `DWCMModel`
+| `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.7) | — `DWCMModel`
 
 ```python
 from src.models.dwcm import DWCMModel
@@ -300,6 +299,7 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.max_relative_error(theta)` | float | `max‖F_i‖ / s_i` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess (see below) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DWCM (see §3.7) |
 
 `initial_theta` methods for DWCM:
 
@@ -343,6 +343,7 @@ Additional model methods:
 | `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative error over all 4N constraints |
 | `model.initial_theta_topo(method)` | `(2N,)` tensor | Topology initial guess (`"degrees"` or `"random"`) |
 | `model.initial_theta_weight(theta_topo, method)` | `(2N,)` tensor | Weight initial guess (see below) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted aDECM (see §3.7) |
 
 `initial_theta_weight` methods for aDECM:
 
@@ -382,6 +383,7 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ,η)‖` |
 | `model.max_relative_error(theta)` | float | Max relative error over all 4N non-zero constraints |
 | `model.initial_theta(method)` | `(4N,)` tensor | Initial guess (see below) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DECM (see §3.7) |
 
 `initial_theta` methods for DECM:
 
@@ -390,7 +392,36 @@ Additional model methods:
 | `"degrees"` (default) | θ from `k/(N-1)` heuristic; η from `β = sqrt(1 − k/s)` mean-field |
 | `"random"` | Uniform random `θ ∈ [0.1, 2.0]`, `η ∈ [0.1, 2.0]` |
 
-### 3.5 SolverResult
+### 3.5 Sampling synthetic networks — `model.sample()`
+
+After calling `solve_tool()`, every model exposes a `sample()` method that draws one independent realisation from the fitted MaxEnt distribution.
+
+```python
+edges = model.sample(
+    seed=42,          # integer or None — random seed for reproducibility
+    chunk_size=512,   # rows processed per iteration (controls peak RAM)
+)
+```
+
+The output format and the underlying sampling distribution differ by model:
+
+| Model | Output | Sampling distribution |
+|-------|--------|-----------------------|
+| `DCMModel` | `[[i, j], ...]` | `A_ij ~ Bernoulli(p_ij)` independently for each `i ≠ j` |
+| `DWCMModel` | `[[i, j, w], ...]` | `w_ij ~ Geom(1 − β_ij) − 1` (starts at 0); pairs with `w=0` omitted |
+| `ADECMModel` | `[[i, j, w], ...]` | Step 1: `A_ij ~ Bernoulli(p_ij)`; step 2 if link: `w_ij ~ Geom(1 − β_ij)` (starts at 1) |
+| `DECMModel` | `[[i, j, w], ...]` | Same two steps, but `p_ij` uses the full coupled DECM formula |
+
+where `β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)` and `p_ij` is the relevant model's link probability.
+
+The geometric distributions follow Mastrandrea et al. (2014) / Vallarano et al. (2021):
+
+- **DWCM**: integer weights `w ≥ 0`, `P(w=k) = (1−β_ij) β_ij^k`.  The expected weight is `β_ij / (1−β_ij)`, matching the constraint `s_out_i = Σ_j ⟨w_ij⟩`.
+- **aDECM / DECM**: integer weights `w ≥ 1` conditional on the link existing, `P(w=k|A=1) = (1−β_ij) β_ij^{k−1}`.  The unconditional expected weight is `p_ij / (1−β_ij)`.
+
+Calls `sample()` before `solve_tool()` raise `RuntimeError`.
+
+### 3.6 SolverResult
 
 `solve_tool()` stores results on the model: `model.sol` for DCM/DWCM/DECM, `model.sol_topo` / `model.sol_weights` for aDECM.  The `SolverResult` dataclass fields are:
 
@@ -404,7 +435,7 @@ result.peak_ram_bytes  # int
 result.message         # str — warnings or error description
 ```
 
-### 3.6 Standalone solvers (advanced)
+### 3.7 Standalone solvers (advanced)
 
 The underlying solvers can be called directly without the model wrapper, e.g. to pass a custom residual function or to interleave topology and weight steps manually:
 
@@ -430,7 +461,7 @@ result = solve_fixed_point_dcm(
 
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 
-### 3.6 Network generator (`src/utils/wng.py`)
+### 3.8 Network generator (`src/utils/wng.py`)
 
 ```python
 from src.utils.wng import k_s_generator_pl

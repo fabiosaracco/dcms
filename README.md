@@ -249,7 +249,7 @@ All three models expose a unified `solve_tool()` method.  Instantiate with the o
 ### 3.1 DCM — `DCMModel`
 
 ```python
-from src.models.dcm import DCMModel
+from dcms.models.dcm import DCMModel
 
 model = DCMModel(k_out, k_in)
 converged = model.solve_tool(
@@ -275,7 +275,7 @@ Additional model methods:
 | `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.7) | — `DWCMModel`
 
 ```python
-from src.models.dwcm import DWCMModel
+from dcms.models.dwcm import DWCMModel
 
 model = DWCMModel(s_out, s_in)
 converged = model.solve_tool(
@@ -313,7 +313,7 @@ Additional model methods:
 ### 3.3 aDECM — `ADECMModel`
 
 ```python
-from src.models.adecm import ADECMModel
+from dcms.models.adecm import ADECMModel
 
 model = ADECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
@@ -355,7 +355,7 @@ Additional model methods:
 ### 3.4 DECM — `DECMModel`
 
 ```python
-from src.models.decm import DECMModel
+from dcms.models.decm import DECMModel
 
 model = DECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
@@ -440,10 +440,10 @@ result.message         # str — warnings or error description
 The underlying solvers can be called directly without the model wrapper, e.g. to pass a custom residual function or to interleave topology and weight steps manually:
 
 ```python
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
-from src.solvers.fixed_point_decm import solve_fixed_point_decm
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
+from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm
+from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
 result = solve_fixed_point_dcm(
     residual_fn,             # callable F(θ) → (2N,) tensor
@@ -464,7 +464,7 @@ result = solve_fixed_point_dcm(
 ### 3.8 Network generator (`src/utils/wng.py`)
 
 ```python
-from src.utils.wng import k_s_generator_pl
+from dcms.utils.wng import k_s_generator_pl
 
 k, s = k_s_generator_pl(
     N,                  # number of nodes
@@ -559,28 +559,28 @@ pytest tests/
 
 ```bash
 # DCM comparison (two methods, N=1000, 10 seeds)
-python -m src.benchmarks.dcm_comparison --sizes 1000 --n_seeds 10 --fast
+python -m dcms.benchmarks.dcm_comparison --sizes 1000 --n_seeds 10 --fast
 
 # DCM scaling across sizes
-python -m src.benchmarks.dcm_scaling --sizes 1000 5000 10000
+python -m dcms.benchmarks.dcm_scaling --sizes 1000 5000 10000
 
 # DWCM comparison
-python -m src.benchmarks.dwcm_comparison --sizes 1000 --n_seeds 10 --fast
+python -m dcms.benchmarks.dwcm_comparison --sizes 1000 --n_seeds 10 --fast
 
 # DWCM at N=5000
-python -m src.benchmarks.dwcm_comparison --sizes 5000 --n_seeds 5 --fast
+python -m dcms.benchmarks.dwcm_comparison --sizes 5000 --n_seeds 5 --fast
 
 # aDECM comparison (N=1000)
-python -m src.benchmarks.adecm_comparison --sizes 1000 --n_seeds 10 --fast
+python -m dcms.benchmarks.adecm_comparison --sizes 1000 --n_seeds 10 --fast
 
 # aDECM at N=5000 (θ-Newton only reliable method)
-python -m src.benchmarks.adecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
+python -m dcms.benchmarks.adecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
 
 # DECM comparison (N=1000, 10 seeds)
-python -m src.benchmarks.decm_comparison --phase6
+python -m dcms.benchmarks.decm_comparison --phase6
 
 # DECM at custom size/seeds
-python -m src.benchmarks.decm_comparison --n 500 --n_seeds 5
+python -m dcms.benchmarks.decm_comparison --n 500 --n_seeds 5
 ```
 
 ## References

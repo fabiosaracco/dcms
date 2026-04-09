@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.dcm import DCMModel
+from dcms.models.dcm import DCMModel
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ class TestZeroDegreeBehavior:
 
     def test_initial_theta_zero_degree_nodes_large(self) -> None:
         """initial_theta must set θ = _THETA_MAX for zero-degree nodes."""
-        from src.models.dcm import _THETA_MAX
+        from dcms.models.dcm import _THETA_MAX
         model = self._make_zero_degree_model()
         N = model.N
         theta0 = model.initial_theta("degrees")
@@ -180,7 +180,7 @@ class TestZeroDegreeBehavior:
 
     def test_initial_theta_random_zero_degree_nodes_large(self) -> None:
         """initial_theta('random') must also set θ = _THETA_MAX for zero-degree nodes."""
-        from src.models.dcm import _THETA_MAX
+        from dcms.models.dcm import _THETA_MAX
         model = self._make_zero_degree_model()
         N = model.N
         theta0 = model.initial_theta("random")
@@ -189,7 +189,7 @@ class TestZeroDegreeBehavior:
 
     def test_solver_converges_with_zero_degree_nodes(self) -> None:
         """Zero-degree nodes must not prevent solver convergence."""
-        from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+        from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
         model = self._make_zero_degree_model()
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_dcm(
@@ -220,7 +220,7 @@ class TestSaturatedNodeBehavior:
 
     def test_initial_theta_saturated_out_nodes_negative(self) -> None:
         """initial_theta('degrees') must set θ_out = -_THETA_MAX for k_out = N-1."""
-        from src.models.dcm import _THETA_MAX
+        from dcms.models.dcm import _THETA_MAX
         model = self._make_saturated_model()
         theta0 = model.initial_theta("degrees")
         assert theta0[0].item() == -_THETA_MAX, (
@@ -229,7 +229,7 @@ class TestSaturatedNodeBehavior:
 
     def test_initial_theta_saturated_in_nodes_negative(self) -> None:
         """initial_theta('degrees') must set θ_in = -_THETA_MAX for k_in = N-1."""
-        from src.models.dcm import _THETA_MAX
+        from dcms.models.dcm import _THETA_MAX
         model = self._make_saturated_model()
         N = model.N
         theta0 = model.initial_theta("degrees")
@@ -239,7 +239,7 @@ class TestSaturatedNodeBehavior:
 
     def test_initial_theta_random_saturated_nodes_negative(self) -> None:
         """initial_theta('random') must also set θ = -_THETA_MAX for saturated nodes."""
-        from src.models.dcm import _THETA_MAX
+        from dcms.models.dcm import _THETA_MAX
         model = self._make_saturated_model()
         N = model.N
         theta0 = model.initial_theta("random")
@@ -286,7 +286,7 @@ class TestSaturatedNodeBehavior:
 
     def test_solver_converges_with_saturated_nodes(self) -> None:
         """Saturated nodes must not prevent solver convergence."""
-        from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+        from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
         model = self._make_saturated_model()
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_dcm(

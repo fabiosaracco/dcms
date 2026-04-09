@@ -23,10 +23,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.daecm import DaECMModel, _ETA_MAX, _ETA_MIN
-from src.models.dcm import DCMModel
-from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.models.daecm import DaECMModel, _ETA_MAX, _ETA_MIN
+from dcms.models.dcm import DCMModel
+from dcms.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
 # ---------------------------------------------------------------------------

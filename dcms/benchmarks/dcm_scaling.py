@@ -25,10 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 
-from src.models.dcm import DCMModel
-from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.utils.wng import k_s_generator_pl
+from dcms.models.dcm import DCMModel
+from dcms.solvers.base import SolverResult
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
+from dcms.utils.wng import k_s_generator_pl
 
 # ---------------------------------------------------------------------------
 # Scaling thresholds

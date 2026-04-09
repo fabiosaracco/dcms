@@ -23,9 +23,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.dcm import DCMModel, _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm, _fp_step_chunked_dcm
-from src.utils.wng import k_s_generator_pl
+from dcms.models.dcm import DCMModel, _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm, _fp_step_chunked_dcm
+from dcms.utils.wng import k_s_generator_pl
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ class TestChunkedResidualCorrectness:
 
     def test_auto_switch_for_large_n(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """residual() must call _residual_chunked when N > _LARGE_N_THRESHOLD."""
-        import src.models.dcm as dcm_module
+        import dcms.models.dcm as dcm_module
 
         model, theta_true = _make_known_model(N=20, seed=7)
         theta = torch.tensor(theta_true, dtype=torch.float64)
@@ -403,7 +403,7 @@ class TestScalingBenchmarkModule:
 
     def test_run_scaling_benchmark_n50(self) -> None:
         """run_scaling_benchmark must complete without error for N=50."""
-        from src.benchmarks.dcm_scaling import run_scaling_benchmark
+        from dcms.benchmarks.dcm_scaling import run_scaling_benchmark
         records = run_scaling_benchmark(N=50, rho=0.3, seed=0, tol=1e-6,
                                         timeout=60.0, verbose=False)
         assert len(records) > 0
@@ -413,7 +413,7 @@ class TestScalingBenchmarkModule:
 
     def test_run_scaling_benchmark_n200(self) -> None:
         """run_scaling_benchmark must complete without error for N=200."""
-        from src.benchmarks.dcm_scaling import run_scaling_benchmark
+        from dcms.benchmarks.dcm_scaling import run_scaling_benchmark
         records = run_scaling_benchmark(N=200, rho=0.1, seed=0, tol=1e-6,
                                         timeout=60.0, verbose=False)
         assert len(records) > 0

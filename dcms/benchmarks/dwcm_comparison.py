@@ -43,10 +43,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 
-from src.models.dwcm import DWCMModel, _ETA_MIN, _ETA_MAX
-from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-from src.utils.wng import k_s_generator_pl
+from dcms.models.dwcm import DWCMModel, _ETA_MIN, _ETA_MAX
+from dcms.solvers.base import SolverResult
+from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
+from dcms.utils.wng import k_s_generator_pl
 
 
 class _TimeoutError(Exception):
@@ -197,7 +197,7 @@ def _make_solvers(
     # ── Fixed-point GS + Anderson depth=10, multi-start ─────────────────────
     def _fp_anderson_multistart() -> SolverResult:
         import time as _t
-        from src.solvers.base import SolverResult as _SR
+        from dcms.solvers.base import SolverResult as _SR
         inits = [theta0,
                  model.initial_theta("normalized"),
                  model.initial_theta("uniform"),
@@ -242,7 +242,7 @@ def _make_solvers(
 
     def _theta_newton_multistart() -> SolverResult:
         import time as _t
-        from src.solvers.base import SolverResult as _SR
+        from dcms.solvers.base import SolverResult as _SR
         inits = [theta0,
                  model.initial_theta("normalized"),
                  model.initial_theta("uniform"),

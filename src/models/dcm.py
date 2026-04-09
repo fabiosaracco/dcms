@@ -75,6 +75,7 @@ class DCMModel:
         # i.e., θ → +∞.  Track them so pij_matrix can return exact zeros.
         self.zero_out: torch.Tensor = (self.k_out == 0)  # shape (N,)
         self.zero_in: torch.Tensor = (self.k_in == 0)    # shape (N,)
+        self.sol: SolverResult | None = None
 
     # ------------------------------------------------------------------
     # Core probability matrix
@@ -360,3 +361,42 @@ class DCMModel:
             print(self.sol.message)
             
         return self.sol.converged
+
+    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+        """Sample a binary directed network from the fitted DCM.
+
+        For each ordered pair ``(i, j)`` with ``i ≠ j``, a directed edge is
+        drawn independently with probability::
+
+            p_ij = x_i y_j / (1 + x_i y_j),   x_i = exp(-θ_out_i), y_j = exp(-θ_in_j)
+
+        Args:
+            seed: Random seed for reproducibility.
+            chunk_size: Number of source rows processed at a time (controls peak RAM).
+
+        Returns:
+            Edge list: list of ``[source, target]`` integer pairs.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        N = self.N
+        theta_out = theta[:N]
+        theta_in  = theta[N:]
+        edges: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            # p_ij = sigmoid(-(θ_out_i + θ_in_j))
+            logit = -theta_out[i_start:i_end, None] - theta_in[None, :]  # (chunk, N)
+            p = 1.0 / (1.0 + np.exp(-logit))
+            for k, i in enumerate(range(i_start, i_end)):
+                p[k, i] = 0.0  # no self-loops
+            rows, cols = np.where(rng.random(p.shape) < p)
+            for k, j in zip(rows, cols):
+                edges.append([i_start + int(k), int(j)])
+        return edges

@@ -117,6 +117,7 @@ class DECMModel:
         self.zero_k_in: torch.Tensor = (self.k_in == 0)
         self.zero_s_out: torch.Tensor = (self.s_out == 0)
         self.zero_s_in: torch.Tensor = (self.s_in == 0)
+        self.sol: SolverResult | None = None
 
     # ------------------------------------------------------------------
     # Core matrices
@@ -645,3 +646,60 @@ class DECMModel:
                     break
 
         return self.sol.converged
+
+    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+        """Sample a weighted directed network from the fitted DECM.
+
+        Two-step procedure using the exact DECM distribution:
+
+        1. **Topology** — draw ``A_ij ~ Bernoulli(p_ij)`` using the full
+           DECM link-probability formula (weight multipliers enter ``p_ij``)::
+
+               p_ij = σ(−θ_out_i − θ_in_j − log(exp(η_out_i + η_in_j) − 1))
+
+        2. **Weights** — for each present link draw ``w_ij`` from a geometric
+           distribution starting at 1 (conditional on the link existing)::
+
+               P(w_ij = k | A_ij = 1) = (1 − β_ij) β_ij^{k−1},   k = 1, 2, …
+               β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
+
+        Args:
+            seed: Random seed for reproducibility.
+            chunk_size: Number of source rows processed at a time.
+
+        Returns:
+            Weighted edge list: list of ``[source, target, weight]`` integer triples.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        N = self.N
+        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        theta_out = theta[:N]
+        theta_in  = theta[N : 2 * N]
+        eta_out   = theta[2 * N : 3 * N]
+        eta_in    = theta[3 * N :]
+        beta_out  = np.exp(-eta_out)
+        beta_in   = np.exp(-eta_in)
+        edges: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, N)
+            # log_q = -log(exp(η)-1) = -log(expm1(η))
+            log_q = -np.log(np.expm1(eta_chunk).clip(min=1e-300))
+            logit_p = -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q
+            p = 1.0 / (1.0 + np.exp(-logit_p))
+            for k, i in enumerate(range(i_start, i_end)):
+                p[k, i] = 0.0  # no self-loops
+            A = rng.random(p.shape) < p  # (chunk, N) bool
+            # Weights on present links — Geom(1-β) starting at 1
+            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)
+            rows, cols = np.where(A)
+            for k, j in zip(rows, cols):
+                w = int(rng.geometric(1.0 - b[k, j]))
+                edges.append([i_start + int(k), int(j), w])
+        return edges

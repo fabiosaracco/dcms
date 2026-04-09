@@ -64,6 +64,7 @@ class DWCMModel:
         # Nodes with strength 0: β is exactly 0 (θ → +∞).
         self.zero_out: torch.Tensor = (self.s_out == 0)
         self.zero_in: torch.Tensor = (self.s_in == 0)
+        self.sol: SolverResult | None = None
 
     # ------------------------------------------------------------------
     # Core expected-weight matrix
@@ -411,3 +412,46 @@ class DWCMModel:
             print(self.sol.message)
             
         return self.sol.converged
+
+    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+        """Sample a weighted directed network from the fitted DWCM.
+
+        For each ordered pair ``(i, j)`` with ``i ≠ j``, the weight is drawn
+        from a geometric distribution starting at 0::
+
+            P(w_ij = k) = (1 − β_ij) β_ij^k,   k = 0, 1, 2, …
+            β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
+
+        Pairs with ``w_ij = 0`` (no link) are omitted.
+
+        Args:
+            seed: Random seed for reproducibility.
+            chunk_size: Number of source rows processed at a time.
+
+        Returns:
+            Weighted edge list: list of ``[source, target, weight]`` integer triples.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        N = self.N
+        beta_out = np.exp(-theta[:N])
+        beta_in  = np.exp(-theta[N:])
+        edges: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)  # (chunk, N)
+            for k, i in enumerate(range(i_start, i_end)):
+                b[k, i] = 0.0  # no self-loops → w=0, filtered below
+            # Geometric(p) from numpy starts at 1: P(X=k) = (1-p)^(k-1)*p
+            # We need w ~ Geom-0(β): P(w=k) = (1-β)*β^k, so w = X-1 with p=1-β
+            w = rng.geometric(1.0 - b) - 1  # shape (chunk, N), values ≥ 0
+            rows, cols = np.where(w > 0)
+            for k, j in zip(rows, cols):
+                edges.append([i_start + int(k), int(j), int(w[k, j])])
+        return edges

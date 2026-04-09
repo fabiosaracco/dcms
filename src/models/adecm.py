@@ -107,6 +107,8 @@ class ADECMModel:
         # Nodes with zero strength (β = 0 exactly, θ_β → +∞).
         self.zero_s_out: torch.Tensor = (self.s_out == 0)
         self.zero_s_in: torch.Tensor = (self.s_in == 0)
+        self.sol_topo: SolverResult | None = None
+        self.sol_weights: SolverResult | None = None
 
     # ------------------------------------------------------------------
     # Core matrices
@@ -642,4 +644,56 @@ class ADECMModel:
             print(f'Weights: {self.sol_weights.message}')
 
         return self.sol_topo.converged and self.sol_weights.converged
+
+    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+        """Sample a weighted directed network from the fitted aDECM.
+
+        Two-step procedure mirroring the aDECM factorisation:
+
+        1. **Topology** — draw ``A_ij ~ Bernoulli(p_ij)`` where
+           ``p_ij = x_i y_j / (1 + x_i y_j)`` comes from the DCM solution.
+        2. **Weights** — for each present link draw ``w_ij`` from a geometric
+           distribution starting at 1 (the conditional distribution given the
+           link exists)::
+
+               P(w_ij = k | A_ij = 1) = (1 − β_ij) β_ij^{k−1},   k = 1, 2, …
+               β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
+
+        Args:
+            seed: Random seed for reproducibility.
+            chunk_size: Number of source rows processed at a time.
+
+        Returns:
+            Weighted edge list: list of ``[source, target, weight]`` integer triples.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        if self.sol_topo is None or self.sol_weights is None:
+            raise RuntimeError("Call solve_tool() first.")
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        N = self.N
+        theta_topo = np.asarray(self.sol_topo.theta, dtype=np.float64)
+        theta_out  = theta_topo[:N]
+        theta_in   = theta_topo[N:]
+        theta_w   = np.asarray(self.sol_weights.theta, dtype=np.float64)
+        beta_out  = np.exp(-theta_w[:N])
+        beta_in   = np.exp(-theta_w[N:])
+        edges: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            # Step 1: topology
+            logit = -theta_out[i_start:i_end, None] - theta_in[None, :]
+            p = 1.0 / (1.0 + np.exp(-logit))
+            for k, i in enumerate(range(i_start, i_end)):
+                p[k, i] = 0.0
+            A = rng.random(p.shape) < p  # (chunk, N) bool
+            # Step 2: weights on present links — Geom(1-β) starting at 1
+            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)
+            rows, cols = np.where(A)
+            for k, j in zip(rows, cols):
+                w = int(rng.geometric(1.0 - b[k, j]))
+                edges.append([i_start + int(k), int(j), w])
+        return edges
 

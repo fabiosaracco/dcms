@@ -44,12 +44,12 @@ from typing import Callable
 
 import torch
 
-from src.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from src.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
 from src.solvers.base import SolverResult
 
 # -------------------------------------------------------------------------
-# Numerical constants (mirrors fixed_point_daecm.py)
+# Numerical constants (mirrors fixed_point_adecm.py)
 # -------------------------------------------------------------------------
 _ANDERSON_MAX_NORM: float = 1e6
 _ANDERSON_BLOWUP_FACTOR: float = 50.0
@@ -67,7 +67,7 @@ _STAGNATION_RTOL: float = 0.01
 
 
 # -------------------------------------------------------------------------
-# Anderson mixing (identical to the version in fixed_point_daecm.py)
+# Anderson mixing (identical to the version in fixed_point_adecm.py)
 # -------------------------------------------------------------------------
 
 def _anderson_mixing(

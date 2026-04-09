@@ -1,6 +1,6 @@
-"""Fixed-point iteration solver for the DaECM weight step.
+"""Fixed-point iteration solver for the aDECM weight step.
 
-The DaECM weight equations (conditioned on a fixed DCM topology ``p_ij``) are:
+The aDECM weight equations (conditioned on a fixed DCM topology ``p_ij``) are:
 
     s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
     s_in_i  = Σ_{j≠i} p_ji · β_out_j · β_in_i / (1 − β_out_j · β_in_i)
@@ -51,7 +51,7 @@ from typing import Callable
 
 import torch
 
-from src.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 from src.solvers.base import SolverResult
 
@@ -164,7 +164,7 @@ def _fp_step_dense(
     theta: torch.Tensor | None = None,
     max_step: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One dense fixed-point update step for the DaECM weight equations.
+    """One dense fixed-point update step for the aDECM weight equations.
 
     Args:
         beta_out: Current β_out values, shape (N,).
@@ -249,7 +249,7 @@ def _fp_step_chunked(
     theta: torch.Tensor | None = None,
     max_step: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Chunked fixed-point update for DaECM weight equations.
+    """Chunked fixed-point update for aDECM weight equations.
 
     Avoids materialising the full N×N P and β matrices.
 
@@ -376,7 +376,7 @@ def _theta_newton_step_dense(
     s_in: torch.Tensor,
     max_step: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One θ-space coordinate Newton step for the DaECM weight equations (dense).
+    """One θ-space coordinate Newton step for the aDECM weight equations (dense).
 
     For each node i:
         Δθ_β_out_i = (Σ_{j≠i} p_ij G_ij − s_out_i) / Σ_{j≠i} p_ij G_ij(1+G_ij)
@@ -455,7 +455,7 @@ def _theta_newton_step_chunked(
     chunk_size: int,
     max_step: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked θ-space Gauss-Seidel Newton step for DaECM weight equations.
+    """Chunked θ-space Gauss-Seidel Newton step for aDECM weight equations.
 
     Two passes over the (N, N) product matrix, mirroring the DWCM chunked
     Newton step:
@@ -650,7 +650,7 @@ def _theta_newton_step_chunked(
     return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
 
 
-def solve_fixed_point_daecm(
+def solve_fixed_point_adecm(
     residual_fn: Callable[[torch.Tensor], torch.Tensor],
     theta0: "ArrayLike",  # type: ignore[name-defined]
     s_out: "ArrayLike",  # type: ignore[name-defined]
@@ -666,7 +666,7 @@ def solve_fixed_point_daecm(
     max_step: float = 1.0,
     max_time: float = 0.0,
 ) -> SolverResult:
-    """Fixed-point iteration for the DaECM weight step.
+    """Fixed-point iteration for the aDECM weight step.
 
     Args:
         residual_fn: Function F_w(θ_β) → strength residual tensor (2N,).

@@ -8,11 +8,11 @@ Two methods are implemented for each model:
 from .base import SolverResult
 from .fixed_point_dcm import solve_fixed_point_dcm
 from .fixed_point_dwcm import solve_fixed_point_dwcm
-from .fixed_point_daecm import solve_fixed_point_daecm
+from .fixed_point_adecm import solve_fixed_point_adecm
 
 __all__ = [
     "SolverResult",
     "solve_fixed_point_dcm",
     "solve_fixed_point_dwcm",
-    "solve_fixed_point_daecm",
+    "solve_fixed_point_adecm",
 ]

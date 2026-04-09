@@ -1,8 +1,8 @@
-# DaECM N=5,000 Benchmark
+# aDECM N=5,000 Benchmark
 
 **Command:**
 ```
-python -m src.benchmarks.daecm_comparison --sizes 5000 --n_seeds 5 --start_seed 0 --timeout 0 --fast
+python -m src.benchmarks.adecm_comparison --sizes 5000 --n_seeds 5 --start_seed 0 --timeout 0 --fast
 ```
 
 **Network generator:** `k_s_generator_pl(N=5000, rho=1e-3)` (power-law degree/strength sequences)  
@@ -40,7 +40,7 @@ python -m src.benchmarks.daecm_comparison --sizes 5000 --n_seeds 5 --start_seed 
   (spectral radius > 1 for power-law hub nodes with high s/k ratio).
 - **L-BFGS** is too slow: O(N²) cost per gradient evaluation (~370 ms/call at N=5,000)
   and hundreds of iterations needed → always exceeds the 150 s cap.
-- The weight solver fixes (PR#12 continuation + bad-seed fixes in `fixed_point_daecm.py`):
+- The weight solver fixes (PR#12 continuation + bad-seed fixes in `fixed_point_adecm.py`):
   - `_Z_G_CLAMP = 1e-8`: accurate G near z=0, enables self-escape from z→0 deadlock
   - `_Z_NEWTON_FLOOR = 1e-8`: hard floor = z_clamp, enables O(log N) doubling recovery
   - `_Z_NEWTON_FRAC = 0.5`: relative downward step limit, prevents period-2 oscillation

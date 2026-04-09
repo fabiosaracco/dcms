@@ -1,6 +1,6 @@
-"""Directed approximated Enhanced Configuration Model (DaECM).
+"""Approximated Directed Enhanced Configuration Model (aDECM).
 
-The DaECM fixes *four* sequences per node: out-degree, in-degree,
+The aDECM fixes *four* sequences per node: out-degree, in-degree,
 out-strength and in-strength (k_out, k_in, s_out, s_in).  It is solved in
 two sequential steps:
 
@@ -45,14 +45,14 @@ import functools
 
 from src.solvers.base import SolverResult
 from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
 
 from src.models.dcm import DCMModel, _THETA_MAX
 
 # Type alias for inputs: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
 
-from src.models.parameters import DaECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from src.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 
 
@@ -69,8 +69,8 @@ def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tenso
     return torch.tensor(x, dtype=dtype, device="cpu")
 
 
-class DaECMModel:
-    """Encapsulates the DaECM weight-step equations for a network of *N* nodes.
+class ADECMModel:
+    """Encapsulates the aDECM weight-step equations for a network of *N* nodes.
 
     The topology step (DCM) is handled separately via the ``DCMModel`` class.
     This class provides residuals, Jacobians and initialisations for the
@@ -130,7 +130,7 @@ class DaECMModel:
     ) -> torch.Tensor:
         """Return the N×N conditioned expected-weight matrix.
 
-        The expected weight of arc i→j in the DaECM approximation is:
+        The expected weight of arc i→j in the aDECM approximation is:
 
             W_ij = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
                  = p_ij / expm1(θ_β_out_i + θ_β_in_j)
@@ -441,7 +441,7 @@ class DaECMModel:
 
         All strategies are topology-aware: they use the observed degree sequences
         (and optionally the DCM probability matrix p_ij) to estimate β values
-        consistent with the DaECM weight equation E[w_ij] = p_ij/(1−β_out_i β_in_j).
+        consistent with the aDECM weight equation E[w_ij] = p_ij/(1−β_out_i β_in_j).
 
         * ``"topology"`` (default): β = sqrt(1 − k/s) per node, derived from the
           mean-field identity s_i/k_i ≈ 1/(1−β²).
@@ -637,7 +637,7 @@ class DaECMModel:
         # Build the residual function that fixes theta_topo
         res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
 
-        self.sol_weights = solve_fixed_point_daecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
+        self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         if len(self.sol_weights.message)>0:
             print(f'Weights: {self.sol_weights.message}')
 

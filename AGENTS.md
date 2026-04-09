@@ -30,7 +30,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Con strength reduction: il numero di incognite scende al numero di valori distinti di (s_out, s_in)
 - **Status: ✅ COMPLETATO** — converge con θ-Newton Anderson(10) fino a N=10k.
 
-### Modello 3: DaECM (Directed approximated Enhanced Configuration Model) — binario + pesato
+### Modello 3: aDECM (Approximated Directed Enhanced Configuration Model) — binario + pesato
 - Vincoli: sequenza di gradi E strengths (k_out_i, k_in_i, s_out_i, s_in_i)
 - Incognite: 4N moltiplicatori (x_i, y_i, β_out_i, β_in_i)
 - Equazioni:
@@ -61,7 +61,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 
 ## Metodi di risoluzione
 
-> **Lezione appresa dalle Fasi 1-5:** solo i metodi Fixed-Point scalano e convergono in modo affidabile per N grande. I metodi Newton-like (Newton pieno, Broyden, LM) richiedono O(N²) RAM e non scalano oltre N≈500. L-BFGS scala in RAM ma non converge in modo affidabile sul DWCM puro per reti eterogenee; tuttavia funziona sul DaECM con warm-start dalla soluzione two-step. Pertanto, il DECM va implementato usando **prioritariamente** i metodi seguenti.
+> **Lezione appresa dalle Fasi 1-5:** solo i metodi Fixed-Point scalano e convergono in modo affidabile per N grande. I metodi Newton-like (Newton pieno, Broyden, LM) richiedono O(N²) RAM e non scalano oltre N≈500. L-BFGS scala in RAM ma non converge in modo affidabile sul DWCM puro per reti eterogenee; tuttavia funziona sul aDECM con warm-start dalla soluzione two-step. Pertanto, il DECM va implementato usando **prioritariamente** i metodi seguenti.
 
 ### Metodo 1: Fixed-Point Gauss-Seidel (β-space)
 - Aggiorna ciascun moltiplicatore isolandolo dalla rispettiva equazione
@@ -70,7 +70,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Damping opzionale α ∈ (0, 1] — usare α=1.0 di default, ridurre se oscilla
 - **Anderson acceleration** (depth 5-10) per accelerare la convergenza: mantiene una storia dei residui e usa mixing lineare per predire il passo successivo
 - Multi-start con 4 inizializzazioni: "strengths"/"degrees", "normalized", "uniform", "random"
-- **Dove funziona:** DCM a tutte le scale; DWCM per reti non troppo eterogenee; DaECM (parte pesata)
+- **Dove funziona:** DCM a tutte le scale; DWCM per reti non troppo eterogenee; aDECM (parte pesata)
 - **Dove fallisce:** DWCM con nodi hub (β → 1), causa oscillazioni
 
 ### Metodo 2: θ-Newton coordinato (θ-space)
@@ -83,14 +83,14 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Ordine Gauss-Seidel: aggiorna θ_out prima, poi θ_in con valori freschi
 - **Anderson acceleration** (depth 10) per convergenza superlineare
 - Multi-start con 4 inizializzazioni
-- **Dove funziona:** DWCM a tutte le scale, incluse reti con hub estremi; DaECM (parte pesata)
+- **Dove funziona:** DWCM a tutte le scale, incluse reti con hub estremi; aDECM (parte pesata)
 - **Questo è il metodo di riferimento per DWCM e probabilmente per DECM**
 
-### Metodo 3: Two-step solver (solo DaECM)
+### Metodo 3: Two-step solver (solo aDECM)
 - **Step 1:** risolvere il DCM con FP-GS → ottenere (x*, y*)
 - **Step 2:** con p_ij fissati dal DCM, risolvere la parte pesata con θ-Newton Anderson(10)
-- Codice: `src/solvers/daecm_solver.py`
-- Funziona perché il DaECM è separabile: le equazioni di grado non dipendono da β
+- Codice: `src/solvers/adecm_solver.py`
+- Funziona perché il aDECM è separabile: le equazioni di grado non dipendono da β
 - **Non applicabile al DECM** (dove le equazioni di k dipendono da β)
 
 ### Dettagli implementativi comuni
@@ -124,19 +124,19 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Benchmark: `src/benchmarks/dwcm_comparison.py` (flag `--phase4`, `--sizes`, `--fast`)
 - Codice: `src/solvers/fixed_point_dwcm.py` (varianti "gauss-seidel", "theta-newton")
 
-### Fase 5: DaECM ✅ COMPLETATA
-- Modello: `src/models/daecm.py` — equazioni condizionate W_ij = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
-- Two-step solver: `src/solvers/daecm_solver.py` — DCM → conditioned DWCM (θ-Newton Anderson)
-- FP solver per la parte pesata: `src/solvers/fixed_point_daecm.py` — varianti FP-GS, Jacobi, θ-Newton + Anderson
+### Fase 5: aDECM ✅ COMPLETATA
+- Modello: `src/models/adecm.py` — equazioni condizionate W_ij = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
+- Two-step solver: `src/solvers/adecm_solver.py` — DCM → conditioned DWCM (θ-Newton Anderson)
+- FP solver per la parte pesata: `src/solvers/fixed_point_adecm.py` — varianti FP-GS, Jacobi, θ-Newton + Anderson
 - Metodi joint su 4N variabili: `residual_joint`, `neg_log_likelihood_joint`, `constraint_error_joint`
-- 46 unit test: `tests/test_daecm.py`
-- Benchmark N=1k: `src/benchmarks/daecm_comparison.py`
-- README aggiornato con sezione DaECM (modello 1.3 + tabella N=1k)
+- 46 unit test: `tests/test_adecm.py`
+- Benchmark N=1k: `src/benchmarks/adecm_comparison.py`
+- README aggiornato con sezione aDECM (modello 1.3 + tabella N=1k)
 
 ### Fase 6: DECM — DA FARE (il più difficile)
 1. Implementare le equazioni del DECM in `src/models/decm.py`
    - 4N incognite: (x_i, y_i, β_out_i, β_in_i)
-   - Le equazioni di grado e di strength sono **accoppiate** — non separabili come nel DaECM
+   - Le equazioni di grado e di strength sono **accoppiate** — non separabili come nel aDECM
    - Equazione di grado: il termine `1/(1 - β_out_i * β_in_j)` entra nel denominatore di k_out_i
    - Implementare: `residual`, `neg_log_likelihood`, `hessian_diag`, `jacobian` (per N piccolo), `initial_theta`, `constraint_error`, `max_relative_error`
 2. Implementare il solver in `src/solvers/fixed_point_decm.py`:
@@ -150,7 +150,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 5. Testare prima su N=10 con soluzione nota, poi N=100, 1k, 5k
 6. Se non converge con la Strategia consigliata, provare:
    - Damping aggressivo (α=0.1-0.3) sulle prime 50 iterazioni, poi rilasciare
-   - Continuazione: risolvere prima il DaECM, poi usare quella soluzione come init per il DECM
+   - Continuazione: risolvere prima il aDECM, poi usare quella soluzione come init per il DECM
    - Anderson depth più alto (20-30)
 7. Benchmark: creare `src/benchmarks/decm_comparison.py`
 
@@ -163,7 +163,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 
 Queste informazioni servono per evitare di ripetere esperimenti falliti:
 
-| Metodo | DCM | DWCM | DaECM | Motivo del fallimento |
+| Metodo | DCM | DWCM | aDECM | Motivo del fallimento |
 |--------|-----|------|-------|----------------------|
 | FP-GS α=1.0 | ✅ 100% | ⚠ oscilla su hub | ✅ (parte pesata) | β > 1 causa periodo-3 su DWCM |
 | FP-GS α=0.3-0.5 | ✅ più lento | ⚠ stesso problema | ✅ | damping non basta per DWCM hub |
@@ -176,7 +176,7 @@ Queste informazioni servono per evitare di ripetere esperimenti falliti:
 | LM (full Jacobian) | ✅ N≤500 | ✅ N≤500 | ✅ N≤500 | O(N²) RAM, non scala |
 | LM (diag Hessian) | ⚠ lento | ❌ | ⚠ | non converge affidabilmente |
 
-**Conclusione: usare FP-GS + θ-Newton con Anderson per la parte pesata. Per il DECM, provare prima la strategia alternata (FP-GS topo + θ-Newton peso) con warm-start da DaECM.**
+**Conclusione: usare FP-GS + θ-Newton con Anderson per la parte pesata. Per il DECM, provare prima la strategia alternata (FP-GS topo + θ-Newton peso) con warm-start da aDECM.**
 
 ## Criteri di successo
 - Un metodo "converge" se ‖F(θ)‖∞ < 1e-5
@@ -194,7 +194,7 @@ Queste informazioni servono per evitare di ripetere esperimenti falliti:
 - NON implementare Newton pieno, Broyden, o LM full-Jacobian per il DECM a scala grande — non scalano e abbiamo già verificato
 - NON dichiarare un metodo "non funzionante" dopo un singolo tentativo — provare almeno 4 inizializzazioni diverse
 - NON ignorare i NaN — se compaiono, loggare dove e con quali parametri e fermarsi con grazia
-- NON riscrivere le parti DCM/DWCM/DaECM del README quando aggiungi il DECM — solo appendere
+- NON riscrivere le parti DCM/DWCM/aDECM del README quando aggiungi il DECM — solo appendere
 
 ## Generazione reti di test
 

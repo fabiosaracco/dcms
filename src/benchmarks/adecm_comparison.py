@@ -1,7 +1,7 @@
-"""DaECM solver comparison benchmark — Phase 5.
+"""aDECM solver comparison benchmark — Phase 5.
 
 Generates test networks using the Chung-Lu power-law model (``k_s_generator_pl``),
-then runs all applicable DaECM two-step solvers and prints a comparison table.
+then runs all applicable aDECM two-step solvers and prints a comparison table.
 
 The **multi-seed variant** runs *n_seeds* independent network realisations per
 node count and reports aggregate statistics:
@@ -15,19 +15,19 @@ node count and reports aggregate statistics:
 Usage::
 
     # Single network
-    python -m src.benchmarks.daecm_comparison --n 100 --seed 42
+    python -m src.benchmarks.adecm_comparison --n 100 --seed 42
 
     # Multi-seed comparison (Phase 5 full run)
-    python -m src.benchmarks.daecm_comparison --n 1000 --n_seeds 10
+    python -m src.benchmarks.adecm_comparison --n 1000 --n_seeds 10
 
     # Both N=1k and N=5k
-    python -m src.benchmarks.daecm_comparison --sizes 1000 5000
+    python -m src.benchmarks.adecm_comparison --sizes 1000 5000
 
-    # Fast mode: Newton / L-BFGS only (skip FP-GS Anderson which never converges for DaECM)
-    python -m src.benchmarks.daecm_comparison --n 1000 --fast
+    # Fast mode: Newton / L-BFGS only (skip FP-GS Anderson which never converges for aDECM)
+    python -m src.benchmarks.adecm_comparison --n 1000 --fast
 
     # Phase 5 focused benchmark (N=1k, 10 seeds, saves bad seeds)
-    python -m src.benchmarks.daecm_comparison --phase5
+    python -m src.benchmarks.adecm_comparison --phase5
 
 Memory thresholds
 -----------------
@@ -49,10 +49,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 
-from src.models.daecm import DaECMModel, _ETA_MIN, _ETA_MAX, _LARGE_N_THRESHOLD as _DAECM_LARGE_N
+from src.models.adecm import ADECMModel, _ETA_MIN, _ETA_MAX, _LARGE_N_THRESHOLD as _DAECM_LARGE_N
 from src.models.dcm import DCMModel
 from src.solvers.base import SolverResult
-from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
 from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from src.utils.wng import k_s_generator_pl
 
@@ -110,7 +110,7 @@ DEFAULT_N_SEEDS: int = 10
 # ---------------------------------------------------------------------------
 
 def _make_strength_residual_fn(
-    model: DaECMModel,
+    model: ADECMModel,
     theta_topo: torch.Tensor,
     P: Optional[torch.Tensor] = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -127,7 +127,7 @@ def _make_strength_residual_fn(
 
 
 def _run_topo_step(
-    model: DaECMModel,
+    model: ADECMModel,
     tol: float,
     timeout: float,
     theta_topo0: Optional[torch.Tensor] = None,
@@ -138,7 +138,7 @@ def _run_topo_step(
     well-conditioned networks), fall back to θ-Newton A10 if not converged.
 
     Args:
-        model:       DaECMModel instance.
+        model:       ADECMModel instance.
         tol:         Convergence tolerance.
         timeout:     Total wall-clock time budget for the topology step.
         theta_topo0: Initial guess; if None, uses model.initial_theta_topo().
@@ -200,7 +200,7 @@ def _run_topo_step(
 
 
 def _fp_weight_multistart(
-    model: DaECMModel,
+    model: ADECMModel,
     theta_topo: torch.Tensor,
     theta_weight0: torch.Tensor,
     tol: float,
@@ -216,7 +216,7 @@ def _fp_weight_multistart(
     """FP weight solver with multiple initialisations.
 
     Args:
-        model:              DaECMModel instance.
+        model:              ADECMModel instance.
         theta_topo:         Fixed topology parameters.
         theta_weight0:      Default initial weight parameters.
         tol:                Convergence tolerance.
@@ -265,7 +265,7 @@ def _fp_weight_multistart(
         # θ found so far rather than a fresh initialisation.
         if best_result is not None and not best_result.converged:
             t0 = torch.tensor(best_result.theta, dtype=torch.float64)
-        r = solve_fixed_point_daecm(
+        r = solve_fixed_point_adecm(
             res_fn, t0,
             model.s_out, model.s_in,
             theta_topo=theta_topo,
@@ -299,7 +299,7 @@ def _fp_weight_multistart(
 
 
 def _make_solvers(
-    model: DaECMModel,
+    model: ADECMModel,
     theta_topo: torch.Tensor,
     theta_weight0: torch.Tensor,
     tol: float,
@@ -311,7 +311,7 @@ def _make_solvers(
     Each callable returns ``(converged, iterations, elapsed_s, mre)``.
 
     Args:
-        model:          DaECMModel instance.
+        model:          ADECMModel instance.
         theta_topo:     Fixed topology parameters (from DCM step).
         theta_weight0:  Default initial weight parameters.
         tol:            Convergence tolerance.
@@ -385,7 +385,7 @@ def run_comparison(
     seed: Optional[int] = None,
     tol: float = DEFAULT_TOL,
 ) -> None:
-    """Run all DaECM weight solvers on a single random network.
+    """Run all aDECM weight solvers on a single random network.
 
     Args:
         N:    Number of nodes.
@@ -393,7 +393,7 @@ def run_comparison(
         tol:  Convergence tolerance.
     """
     print(f"\n{'='*100}")
-    print(f"DaECM Solver Comparison  |  N={N} nodes  |  seed={seed}  |  tol={tol:.0e}")
+    print(f"aDECM Solver Comparison  |  N={N} nodes  |  seed={seed}  |  tol={tol:.0e}")
     print(f"{'='*100}")
 
     k, s = k_s_generator_pl(N, rho=DEFAULT_RHO, seed=seed)
@@ -408,7 +408,7 @@ def run_comparison(
     print(f"  s_in:  min={s_in.min():.0f}  max={s_in.max():.0f}  mean={s_in.mean():.1f}")
     print()
 
-    model = DaECMModel(k_out, k_in, s_out, s_in)
+    model = ADECMModel(k_out, k_in, s_out, s_in)
     theta_topo0 = model.initial_theta_topo("degrees")
 
     # Step 1: solve topology
@@ -454,7 +454,7 @@ def _run_single_network(
     timeout: float,
     fast: bool = False,
 ) -> Optional[dict[str, dict]]:
-    """Run all DaECM weight solvers on one network realisation.
+    """Run all aDECM weight solvers on one network realisation.
 
     Returns:
         Dict mapping solver name → result dict, or None if the network is invalid.
@@ -471,7 +471,7 @@ def _run_single_network(
     if k_out.sum() == 0 or k_in.sum() == 0:
         return None
 
-    model = DaECMModel(k_out, k_in, s_out, s_in)
+    model = ADECMModel(k_out, k_in, s_out, s_in)
     theta_topo0 = model.initial_theta_topo("degrees")
 
     # Step 1: topology (DCM) — FP-GS A10 then θ-Newton A10
@@ -560,7 +560,7 @@ def run_multi_seed_comparison(
     verbose: bool = True,
     fast: bool = False,
 ) -> tuple[dict[str, dict], list[int]]:
-    """Run all DaECM weight solvers on *n_seeds* independent network realisations.
+    """Run all aDECM weight solvers on *n_seeds* independent network realisations.
 
     Collects per-run statistics and reports aggregate mean ± 2σ for:
     - calculation time (seconds)
@@ -583,7 +583,7 @@ def run_multi_seed_comparison(
     if verbose:
         print(f"\n{'='*100}")
         print(
-            f"DaECM Multi-Seed Comparison  |  N={N:,} nodes  |  "
+            f"aDECM Multi-Seed Comparison  |  N={N:,} nodes  |  "
             f"{n_seeds} runs  |  tol={tol:.0e}  |  start_seed={start_seed}"
         )
         print(f"{'='*100}")
@@ -759,7 +759,7 @@ def run_scaling_comparison(
     start_seed: int = 0,
     fast: bool = False,
 ) -> None:
-    """Run multi-seed DaECM comparison for each size in *sizes*.
+    """Run multi-seed aDECM comparison for each size in *sizes*.
 
     Args:
         sizes:      List of node counts to benchmark.
@@ -781,7 +781,7 @@ def run_scaling_comparison(
         all_bad[N] = bad
 
     print(f"\n{'='*74}")
-    print(f"{'DaECM SCALING SUMMARY — Convergence Rate':^74}")
+    print(f"{'aDECM SCALING SUMMARY — Convergence Rate':^74}")
     print(f"{'='*74}")
 
     all_methods: list[str] = []
@@ -832,7 +832,7 @@ def main() -> None:
     import time as _time_mod
 
     parser = argparse.ArgumentParser(
-        description="DaECM solver comparison benchmark (Phase 5)."
+        description="aDECM solver comparison benchmark (Phase 5)."
     )
     parser.add_argument("--n", type=int, default=None,
                         help="Number of nodes (single-size run)")

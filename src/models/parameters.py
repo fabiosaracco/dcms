@@ -2,7 +2,7 @@
 # computation to avoid materialising the full N×N matrix.
 DCM_LARGE_N_THRESHOLD: int = 5_000
 DWCM_LARGE_N_THRESHOLD: int = 5_000
-DaECM_LARGE_N_THRESHOLD: int = 2_000
+aDECM_LARGE_N_THRESHOLD: int = 2_000
 
 # Number of rows processed per chunk when using memory-efficient mode.
 _DEFAULT_CHUNK: int = 512

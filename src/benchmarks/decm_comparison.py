@@ -3,7 +3,7 @@
 Generates test networks using the Chung-Lu power-law model
 (``k_s_generator_pl``), solves them with the DECM θ-Newton Anderson(10)
 solver, and prints a comparison table identical in format to the
-dcm_comparison, dwcm_comparison and daecm_comparison benchmarks.
+dcm_comparison, dwcm_comparison and adecm_comparison benchmarks.
 
 The **multi-seed variant** runs *n_seeds* independent realisations per node
 count and reports aggregate statistics:
@@ -97,15 +97,15 @@ def _call_with_timeout(fn: Callable, timeout_s: float):
 # is returned, matching the multi-start logic used in the other comparisons.
 _ALL_METHODS: list[dict] = [
     {"name": "θ-Newton Anderson(10)", "ic": "degrees",  "variant": "theta-newton", "anderson_depth": 10},
-    {"name": "θ-Newton Anderson(10) [daecm]",   "ic": "daecm",   "variant": "theta-newton", "anderson_depth": 10},
+    {"name": "θ-Newton Anderson(10) [adecm]",   "ic": "adecm",   "variant": "theta-newton", "anderson_depth": 10},
     {"name": "θ-Newton Anderson(10) [uniform]", "ic": "uniform", "variant": "theta-newton", "anderson_depth": 10},
     {"name": "θ-Newton Anderson(10) [random]",  "ic": "random",  "variant": "theta-newton", "anderson_depth": 10},
 ]
 
-# Fast mode: degrees (default) + daecm warm-start (most robust for large N).
+# Fast mode: degrees (default) + adecm warm-start (most robust for large N).
 _FAST_METHODS: list[dict] = [
     {"name": "θ-Newton Anderson(10)",          "ic": "degrees", "variant": "theta-newton", "anderson_depth": 10},
-    {"name": "θ-Newton Anderson(10) [daecm]",  "ic": "daecm",  "variant": "theta-newton", "anderson_depth": 10},
+    {"name": "θ-Newton Anderson(10) [adecm]",  "ic": "adecm",  "variant": "theta-newton", "anderson_depth": 10},
 ]
 
 
@@ -411,7 +411,7 @@ def _print_aggregate_table(
     n_seeds: int,
     bad_seeds: Optional[list[int]] = None,
 ) -> None:
-    """Print the aggregate statistics table (same format as daecm_comparison).
+    """Print the aggregate statistics table (same format as adecm_comparison).
 
     Performance metrics are reported only over converged runs.
 

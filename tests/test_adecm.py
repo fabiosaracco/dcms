@@ -1,7 +1,7 @@
-"""Tests for the DaECM model equations and two-step solver.
+"""Tests for the aDECM model equations and two-step solver.
 
 Tests cover:
-- DaECMModel construction and basic properties.
+- ADECMModel construction and basic properties.
 - wij_matrix_conditioned: correct shape, zero diagonal, non-negative values.
 - residual_strength: correct value at the true solution.
 - jacobian_strength: finite-difference consistency and negative diagonal.
@@ -23,9 +23,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.daecm import DaECMModel, _ETA_MAX, _ETA_MIN
+from src.models.adecm import ADECMModel, _ETA_MAX, _ETA_MIN
 from src.models.dcm import DCMModel
-from src.solvers.fixed_point_daecm import solve_fixed_point_daecm
+from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
 from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
@@ -36,8 +36,8 @@ from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 CONV_TOL = 1e-5  # acceptance threshold for constraint error
 
 
-def make_daecm_model(N: int = 6, seed: int = 0) -> tuple[DaECMModel, np.ndarray, np.ndarray]:
-    """Return a DaECMModel with a known exact solution.
+def make_adecm_model(N: int = 6, seed: int = 0) -> tuple[ADECMModel, np.ndarray, np.ndarray]:
+    """Return a ADECMModel with a known exact solution.
 
     Generates random ``θ_topo`` and ``θ_weight`` (both positive, in [0.5, 2.0]),
     computes the corresponding (k_out, k_in, s_out, s_in) analytically, then
@@ -79,17 +79,17 @@ def make_daecm_model(N: int = 6, seed: int = 0) -> tuple[DaECMModel, np.ndarray,
     s_out = W.sum(axis=1)
     s_in = W.sum(axis=0)
 
-    model = DaECMModel(k_out, k_in, s_out, s_in)
+    model = ADECMModel(k_out, k_in, s_out, s_in)
     return model, theta_topo_true, theta_weight_true
 
 
 # ---------------------------------------------------------------------------
-# DaECMModel construction
+# ADECMModel construction
 # ---------------------------------------------------------------------------
 
-class TestDaECMModelConstruction:
+class TestADECMModelConstruction:
     def test_shapes(self) -> None:
-        model, _, _ = make_daecm_model(N=6)
+        model, _, _ = make_adecm_model(N=6)
         assert model.k_out.shape == (6,)
         assert model.k_in.shape == (6,)
         assert model.s_out.shape == (6,)
@@ -98,7 +98,7 @@ class TestDaECMModelConstruction:
 
     def test_mismatched_lengths_raises(self) -> None:
         with pytest.raises(ValueError):
-            DaECMModel(
+            ADECMModel(
                 k_out=np.ones(4),
                 k_in=np.ones(5),   # mismatch
                 s_out=np.ones(4),
@@ -112,17 +112,17 @@ class TestDaECMModelConstruction:
 
 class TestPijMatrix:
     def test_shape(self) -> None:
-        model, theta_topo, _ = make_daecm_model(N=6)
+        model, theta_topo, _ = make_adecm_model(N=6)
         P = model.pij_matrix(theta_topo)
         assert P.shape == torch.Size([6, 6])
 
     def test_zero_diagonal(self) -> None:
-        model, theta_topo, _ = make_daecm_model(N=6)
+        model, theta_topo, _ = make_adecm_model(N=6)
         P = model.pij_matrix(theta_topo)
         assert torch.all(P.diagonal() == 0.0)
 
     def test_values_in_range(self) -> None:
-        model, theta_topo, _ = make_daecm_model(N=6)
+        model, theta_topo, _ = make_adecm_model(N=6)
         P = model.pij_matrix(theta_topo)
         assert torch.all(P >= 0.0)
         assert torch.all(P <= 1.0)
@@ -134,23 +134,23 @@ class TestPijMatrix:
 
 class TestWijMatrixConditioned:
     def test_shape(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
+        model, theta_topo, theta_weight = make_adecm_model(N=6)
         W = model.wij_matrix_conditioned(theta_topo, theta_weight)
         assert W.shape == torch.Size([6, 6])
 
     def test_zero_diagonal(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
+        model, theta_topo, theta_weight = make_adecm_model(N=6)
         W = model.wij_matrix_conditioned(theta_topo, theta_weight)
         assert torch.all(W.diagonal() == 0.0)
 
     def test_non_negative(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
+        model, theta_topo, theta_weight = make_adecm_model(N=6)
         W = model.wij_matrix_conditioned(theta_topo, theta_weight)
         assert torch.all(W >= 0.0)
 
     def test_bounded_by_G(self) -> None:
         """W_ij = p_ij * G_new_ij ≤ G_new_ij (since p_ij ≤ 1)."""
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
+        model, theta_topo, theta_weight = make_adecm_model(N=6)
         W = model.wij_matrix_conditioned(theta_topo, theta_weight)
         # W must be ≤ the conditional expected weight G_new (since p_ij ≤ 1)
         N = model.N
@@ -170,18 +170,18 @@ class TestWijMatrixConditioned:
 class TestResidualStrength:
     def test_near_zero_at_solution(self) -> None:
         """Strength residual should be ~0 at the true parameters."""
-        model, theta_topo, theta_weight = make_daecm_model(N=10)
+        model, theta_topo, theta_weight = make_adecm_model(N=10)
         F = model.residual_strength(theta_topo, theta_weight)
         assert F.abs().max().item() < 1e-8, f"Max residual = {F.abs().max().item()}"
 
     def test_shape(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
+        model, theta_topo, theta_weight = make_adecm_model(N=6)
         F = model.residual_strength(theta_topo, theta_weight)
         assert F.shape == (12,)
 
     def test_chunked_equals_dense(self) -> None:
         """Chunked residual must match dense for small N."""
-        model, theta_topo, theta_weight = make_daecm_model(N=8, seed=7)
+        model, theta_topo, theta_weight = make_adecm_model(N=8, seed=7)
         F_dense = model.residual_strength(theta_topo, theta_weight)
         F_chunked = model._residual_strength_chunked(
             theta_topo, theta_weight, chunk_size=3
@@ -196,13 +196,13 @@ class TestResidualStrength:
 
 class TestNegLogLikelihoodStrength:
     def test_finite(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=6)
+        model, theta_topo, theta_weight = make_adecm_model(N=6)
         nll = model.neg_log_likelihood_strength(theta_topo, theta_weight)
         assert np.isfinite(nll)
 
     def test_gradient_equals_residual(self) -> None:
         """The gradient of −L_w equals −F_w (numerical check)."""
-        model, theta_topo, theta_weight = make_daecm_model(N=5, seed=2)
+        model, theta_topo, theta_weight = make_adecm_model(N=5, seed=2)
         theta_w = torch.tensor(theta_weight, dtype=torch.float64)
         eps = 1e-5
         n = 2 * model.N
@@ -224,18 +224,18 @@ class TestNegLogLikelihoodStrength:
 
 class TestInitialThetaWeight:
     def test_shape(self) -> None:
-        model, theta_topo, _ = make_daecm_model(N=6)
+        model, theta_topo, _ = make_adecm_model(N=6)
         theta0 = model.initial_theta_weight(theta_topo, method="topology")
         assert theta0.shape == (12,)
 
     def test_all_positive(self) -> None:
-        model, theta_topo, _ = make_daecm_model(N=6)
+        model, theta_topo, _ = make_adecm_model(N=6)
         for method in ("topology", "topology_node"):
             theta0 = model.initial_theta_weight(theta_topo, method=method)
             assert torch.all(theta0 > 0), f"method={method!r} produced non-positive θ"
 
     def test_unknown_method_raises(self) -> None:
-        model, theta_topo, _ = make_daecm_model(N=6)
+        model, theta_topo, _ = make_adecm_model(N=6)
         with pytest.raises(ValueError):
             model.initial_theta_weight(theta_topo, method="bad_method")
 
@@ -246,12 +246,12 @@ class TestInitialThetaWeight:
 
 class TestConstraintErrors:
     def test_near_zero_at_solution(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=10)
+        model, theta_topo, theta_weight = make_adecm_model(N=10)
         err = model.constraint_error_strength(theta_topo, theta_weight)
         assert err < 1e-8
 
     def test_max_rel_error_near_zero(self) -> None:
-        model, theta_topo, theta_weight = make_daecm_model(N=10)
+        model, theta_topo, theta_weight = make_adecm_model(N=10)
         mre = model.max_relative_error(theta_topo, theta_weight)
         assert mre < 1e-6
 
@@ -261,14 +261,14 @@ class TestConstraintErrors:
 # ---------------------------------------------------------------------------
 
 def _solve_two_step(
-    model: DaECMModel,
+    model: ADECMModel,
     tol: float = 1e-5,
     topo_max_iter: int = 5_000,
     weight_max_iter: int = 10_000,
     weight_variant: str = "theta-newton",
     anderson_depth: int = 10,
 ) -> tuple:
-    """Run the two-step DaECM solve and return (topo_result, weight_result)."""
+    """Run the two-step aDECM solve and return (topo_result, weight_result)."""
     dcm = DCMModel(model.k_out, model.k_in)
     theta_topo0 = model.initial_theta_topo()
     r_topo = solve_fixed_point_dcm(
@@ -285,7 +285,7 @@ def _solve_two_step(
         torch.tensor(theta_topo, dtype=torch.float64),
         tw.clamp(_ETA_MIN, _ETA_MAX),
     )
-    r_weight = solve_fixed_point_daecm(
+    r_weight = solve_fixed_point_adecm(
         res_fn, theta_w0,
         model.s_out, model.s_in,
         theta_topo=torch.tensor(theta_topo, dtype=torch.float64),
@@ -296,12 +296,12 @@ def _solve_two_step(
 
 
 class TestSolverConvergenceSmall:
-    """Convergence tests for the two-step DaECM solver on small networks."""
+    """Convergence tests for the two-step aDECM solver on small networks."""
 
     @pytest.mark.parametrize("N,seed", [(4, 0), (4, 1), (10, 0)])
     def test_theta_newton_converges(self, N: int, seed: int) -> None:
         """θ-Newton must converge on small networks."""
-        model, theta_topo_true, theta_weight_true = make_daecm_model(N=N, seed=seed)
+        model, theta_topo_true, theta_weight_true = make_adecm_model(N=N, seed=seed)
         r_topo, r_weight = _solve_two_step(
             model, tol=CONV_TOL, weight_variant="theta-newton",
         )
@@ -316,7 +316,7 @@ class TestSolverConvergenceSmall:
     @pytest.mark.parametrize("N,seed", [(4, 0), (4, 1), (10, 0)])
     def test_fp_gs_no_crash(self, N: int, seed: int) -> None:
         """FP-GS Anderson may not converge but must not crash."""
-        model, _, _ = make_daecm_model(N=N, seed=seed)
+        model, _, _ = make_adecm_model(N=N, seed=seed)
         r_topo, r_weight = _solve_two_step(
             model, tol=CONV_TOL, weight_variant="gauss-seidel",
             weight_max_iter=2_000,
@@ -334,15 +334,15 @@ class TestSolverConvergenceSmall:
 # Fixed-point solver direct tests
 # ---------------------------------------------------------------------------
 
-class TestFixedPointDaECM:
-    """Direct tests of solve_fixed_point_daecm."""
+class TestFixedPointaDECM:
+    """Direct tests of solve_fixed_point_adecm."""
 
     def test_fp_gs_converges_n4(self) -> None:
-        model, theta_topo_true, _ = make_daecm_model(N=4, seed=0)
+        model, theta_topo_true, _ = make_adecm_model(N=4, seed=0)
         theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
         theta_weight0 = model.initial_theta_weight(theta_topo, "topology")
         res_fn = lambda tw: model.residual_strength(theta_topo, tw.clamp(_ETA_MIN, _ETA_MAX))
-        result = solve_fixed_point_daecm(
+        result = solve_fixed_point_adecm(
             res_fn, theta_weight0,
             model.s_out, model.s_in,
             theta_topo=theta_topo,
@@ -353,11 +353,11 @@ class TestFixedPointDaECM:
         assert result.iterations >= 0
 
     def test_theta_newton_converges_n4(self) -> None:
-        model, theta_topo_true, _ = make_daecm_model(N=4, seed=0)
+        model, theta_topo_true, _ = make_adecm_model(N=4, seed=0)
         theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
         theta_weight0 = model.initial_theta_weight(theta_topo, "topology")
         res_fn = lambda tw: model.residual_strength(theta_topo, tw.clamp(_ETA_MIN, _ETA_MAX))
-        result = solve_fixed_point_daecm(
+        result = solve_fixed_point_adecm(
             res_fn, theta_weight0,
             model.s_out, model.s_in,
             theta_topo=theta_topo,

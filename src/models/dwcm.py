@@ -34,7 +34,6 @@ from src.models.parameters import DWCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from src.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 
 from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
     """Convert *x* to a float64 CPU torch.Tensor (no-copy if already correct)."""
@@ -407,6 +406,7 @@ class DWCMModel:
             :class:`~src.solvers.base.SolverResult` instance.
         """
         self.ic=self.initial_theta(ic)
+        from src.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
         self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         if len(self.sol.message)>0:
             print(self.sol.message)

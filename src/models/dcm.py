@@ -29,7 +29,6 @@ from typing import Union
 import torch
 
 from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
 
@@ -356,6 +355,7 @@ class DCMModel:
             :class:`~src.solvers.base.SolverResult` instance.
         """
         self.ic=self.initial_theta(ic)
+        from src.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
         self.sol = solve_fixed_point_dcm(self.residual, self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         if len(self.sol.message)>0:
             print(self.sol.message)

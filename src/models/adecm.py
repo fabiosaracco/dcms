@@ -44,8 +44,6 @@ import torch
 import functools
 
 from src.solvers.base import SolverResult
-from src.solvers.fixed_point_dcm import solve_fixed_point_dcm
-from src.solvers.fixed_point_adecm import solve_fixed_point_adecm
 
 from src.models.dcm import DCMModel, _THETA_MAX
 
@@ -626,6 +624,7 @@ class ADECMModel:
         """
         # Step 1: solve the DCM topology
         self.ic_topo=self.initial_theta_topo(ic_topo)
+        from src.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
         self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         
         if len(self.sol_topo.message)>0:
@@ -639,6 +638,7 @@ class ADECMModel:
         # Build the residual function that fixes theta_topo
         res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
 
+        from src.solvers.fixed_point_adecm import solve_fixed_point_adecm  # lazy import to avoid circular dependency
         self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
         if len(self.sol_weights.message)>0:
             print(f'Weights: {self.sol_weights.message}')

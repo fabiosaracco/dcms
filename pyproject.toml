@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+numba = ["numba>=0.57"]
 
 [tool.setuptools.packages.find]
 include = ["dcms*"]

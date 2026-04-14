@@ -183,6 +183,7 @@ def solve_fixed_point_dwcm(
     anderson_depth: int = 0,
     max_step: float = 1.0,
     max_time: float = 0.0,
+    backend: str = "auto",
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -218,6 +219,10 @@ def solve_fixed_point_dwcm(
         max_time: Wall-clock time limit in seconds.  If > 0, the solver
             stops after this many seconds even if max_iter has not been
             reached.  Default 0 (no time limit).
+        backend: Compute backend: ``"auto"`` (default), ``"pytorch"``, or
+            ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and Numba
+            for larger networks.  Falls back automatically with a warning
+            if the requested backend is unavailable.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -250,7 +255,18 @@ def solve_fixed_point_dwcm(
     # Clamp initial theta to feasible range
     theta = theta.clamp(_ETA_MIN, _ETA_MAX)
 
-    # Decide whether to use chunked computation
+    # Resolve compute backend
+    from dcms.utils.backend import resolve_backend
+    _backend = resolve_backend(backend, N)
+    _use_numba = (_backend == "numba")
+    if _use_numba:
+        import numpy as np
+        from dcms.solvers._numba_kernels import (
+            _dwcm_theta_newton_numba,
+            _dwcm_fp_gs_numba,
+        )
+
+    # Decide whether to use chunked computation (PyTorch path only)
     if chunk_size == 0:
         effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
     else:
@@ -307,7 +323,16 @@ def solve_fixed_point_dwcm(
                 # θ-space coordinate Newton step.
                 # Returns (theta_new, F_current) where F_current = F(θ)
                 # at the *input* θ (before the update).
-                if effective_chunk > 0:
+                if _use_numba:
+                    to = theta[:N].numpy()
+                    ti = theta[N:].numpy()
+                    to_new, ti_new, fo, fi = _dwcm_theta_newton_numba(
+                        to, ti, s_out.numpy(), s_in.numpy(),
+                        max_step, _ETA_MIN, _ETA_MAX,
+                    )
+                    theta_fp = torch.from_numpy(np.concatenate([to_new, ti_new]))
+                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
+                elif effective_chunk > 0:
                     theta_fp, F_current = _theta_newton_step_chunked(
                         theta, s_out, s_in, effective_chunk, max_step
                     )
@@ -317,15 +342,28 @@ def solve_fixed_point_dwcm(
                     )
             else:
                 # β-space fixed-point iteration (Gauss-Seidel or Jacobi)
-                beta_out = torch.exp(-theta[:N])
-                beta_in = torch.exp(-theta[N:])
-
-                if effective_chunk > 0:
+                if _use_numba:
+                    bo = torch.exp(-theta[:N]).numpy()
+                    bi = torch.exp(-theta[N:]).numpy()
+                    bon, bin_, fo, fi = _dwcm_fp_gs_numba(
+                        bo, bi, s_out.numpy(), s_in.numpy(),
+                        theta[:N].numpy(), theta[N:].numpy(),
+                        max_step, _ETA_MIN, _ETA_MAX,
+                        _FP_NEWTON_FALLBACK_DELTA, True,
+                    )
+                    beta_out_new = torch.from_numpy(bon)
+                    beta_in_new = torch.from_numpy(bin_)
+                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
+                elif effective_chunk > 0:
+                    beta_out = torch.exp(-theta[:N])
+                    beta_in = torch.exp(-theta[N:])
                     beta_out_new, beta_in_new, F_current = _fp_step_chunked_dwcm(
                         beta_out, beta_in, s_out, s_in, effective_chunk,
                         theta=theta, max_step=max_step,
                     )
                 else:
+                    beta_out = torch.exp(-theta[:N])
+                    beta_in = torch.exp(-theta[N:])
                     # Dense path (materialises full N×N matrix)
                     xy = beta_out[:, None] * beta_in[None, :]
 
@@ -597,7 +635,16 @@ def solve_fixed_point_dwcm(
                 _nt_and_g: list[torch.Tensor] = []
                 _nt_and_r: list[torch.Tensor] = []
                 for _ in range(_FPGS_NEWTON_STEPS):
-                    if effective_chunk > 0:
+                    if _use_numba:
+                        to = theta_nt[:N].numpy()
+                        ti = theta_nt[N:].numpy()
+                        to_new, ti_new, fo, fi = _dwcm_theta_newton_numba(
+                            to, ti, s_out.numpy(), s_in.numpy(),
+                            max_step, _ETA_MIN, _ETA_MAX,
+                        )
+                        theta_nt_fp = torch.from_numpy(np.concatenate([to_new, ti_new]))
+                        F_nt = torch.from_numpy(np.concatenate([fo, fi]))
+                    elif effective_chunk > 0:
                         theta_nt_fp, F_nt = _theta_newton_step_chunked(
                             theta_nt, s_out, s_in, effective_chunk, max_step
                         )

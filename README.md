@@ -491,7 +491,7 @@ pip install dcms[numba]          # installs numba as an optional extra
 pip install dcms numba           # equivalent
 ```
 
-### 3.8 Network generator (`src/utils/wng.py`)
+### 3.9 Network generator (`src/utils/wng.py`)
 
 ```python
 from dcms.utils.wng import k_s_generator_pl

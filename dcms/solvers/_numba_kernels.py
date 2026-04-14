@@ -412,12 +412,13 @@ def _adecm_theta_newton_numba(
 
             z = theta_beta_out[i] + theta_beta_in[j]
             z_safe = max(z, Z_G_CLAMP)
-            em1 = _expm1(z_safe)
-            G = 1.0 / em1
+            # G = 1/(1-exp(-z)) = -1/expm1(-z)  (NOT 1/expm1(z)!)
+            em1_neg = _expm1(-z_safe)  # exp(-z) - 1, negative
+            G = -1.0 / em1_neg if em1_neg < -1e-300 else 1e15
 
             pG = p * G
             F_out[i] += pG
-            h_out[i] -= p * G * (1.0 + G)
+            h_out[i] -= p * G * (G - 1.0)  # derivative: -G(G-1)
             F_in_current[j] += pG
 
     theta_beta_out_new = np.empty(N)
@@ -437,7 +438,7 @@ def _adecm_theta_newton_numba(
             z_floor = max(Z_NEWTON_FLOOR, theta_beta_out[i] * Z_NEWTON_FRAC)
             min_allowed = z_floor - min_in
             new_val = max(new_val, min_allowed)
-            theta_beta_out_new[i] = _clamp(new_val, ETA_MIN, ETA_MAX)
+            theta_beta_out_new[i] = _clamp(new_val, -ETA_MAX, ETA_MAX)
 
     # ── Pass 2: in-direction with updated θ_β_out ──
     F_in2 = np.zeros(N)
@@ -452,12 +453,13 @@ def _adecm_theta_newton_numba(
 
             z = theta_beta_out_new[i] + theta_beta_in[j]
             z_safe = max(z, Z_G_CLAMP)
-            em1 = _expm1(z_safe)
-            G = 1.0 / em1
+            # G = 1/(1-exp(-z))
+            em1_neg = _expm1(-z_safe)
+            G = -1.0 / em1_neg if em1_neg < -1e-300 else 1e15
 
             pG = p * G
             F_in2[j] += pG
-            h_in[j] -= p * G * (1.0 + G)
+            h_in[j] -= p * G * (G - 1.0)
 
     theta_beta_in_new = np.empty(N)
     for j in range(N):
@@ -476,7 +478,7 @@ def _adecm_theta_newton_numba(
             z_floor = max(Z_NEWTON_FLOOR, theta_beta_in[j] * Z_NEWTON_FRAC)
             min_allowed = z_floor - min_out
             new_val = max(new_val, min_allowed)
-            theta_beta_in_new[j] = _clamp(new_val, ETA_MIN, ETA_MAX)
+            theta_beta_in_new[j] = _clamp(new_val, -ETA_MAX, ETA_MAX)
 
     return theta_beta_out_new, theta_beta_in_new, F_out, F_in_current
 

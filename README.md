@@ -39,14 +39,6 @@ To include optional [Numba](https://numba.pydata.org/) support for large network
 pip install "dcms[numba] @ git+https://github.com/fabiosaracco/dcms.git"
 ```
 
-For development (editable install with test dependencies):
-
-```bash
-git clone https://github.com/fabiosaracco/dcms.git
-cd dcms
-pip install -e ".[dev,numba]"
-```
-
 **Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, NumPy ≥ 1.24, SciPy ≥ 1.10.
 
 ---

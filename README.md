@@ -25,6 +25,32 @@ https://iopscience.iop.org/article/10.1088/1367-2630/ab74a7
 
 ---
 
+## 0. Installation
+
+Install from GitHub (the package is not yet on PyPI):
+
+```bash
+pip install git+https://github.com/fabiosaracco/dcms.git
+```
+
+To include optional [Numba](https://numba.pydata.org/) support for large networks (N > 5 000):
+
+```bash
+pip install "dcms[numba] @ git+https://github.com/fabiosaracco/dcms.git"
+```
+
+For development (editable install with test dependencies):
+
+```bash
+git clone https://github.com/fabiosaracco/dcms.git
+cd dcms
+pip install -e ".[dev,numba]"
+```
+
+**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, NumPy ≥ 1.24, SciPy ≥ 1.10.
+
+---
+
 ## 1. Models
 
 ### 1.1 DCM — Directed Configuration Model (binary)
@@ -38,7 +64,7 @@ k_in_i  = Σ_{j≠i}  x_j · y_i / (1 + x_j · y_i)
 
 where `x_i = exp(-θ_out_i)` and `y_i = exp(-θ_in_i)`.  The link probability is then `p_ij = x_i y_j / (1 + x_i y_j)`.
 
-**Implementation:** `src/models/dcm.py` — `DCMModel`
+**Implementation:** `dcms/models/dcm.py` — `DCMModel`
 
 ### 1.2 DWCM — Directed Weighted Configuration Model (weighted)
 
@@ -51,7 +77,7 @@ s_in_i  = Σ_{j≠i}  β_out_j · β_in_i / (1 − β_out_j · β_in_i)
 
 where `β = exp(-θ)`.  **Feasibility constraint:** `β_out_i · β_in_j < 1` for all `i ≠ j` (i.e. `θ > 0` for all multipliers).
 
-**Implementation:** `src/models/dwcm.py` — `DWCMModel`
+**Implementation:** `dcms/models/dwcm.py` — `DWCMModel`
 
 ### 1.3 aDECM — Approximated Directed Enhanced Configuration Model (binary + weighted)
 
@@ -70,7 +96,7 @@ The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight mu
 
 **Feasibility constraint:** `β_out_i · β_in_j < 1` for all `i ≠ j`.
 
-**Implementation:** `src/models/adecm.py` — `ADECMModel`
+**Implementation:** `dcms/models/adecm.py` — `ADECMModel`
 
 ### 1.4 DECM — Directed Enhanced Configuration Model (binary + weighted, fully coupled)
 
@@ -104,7 +130,7 @@ s_in_i  = Σ_{j≠i} p_ji · G_ji
 
 **Key difference from aDECM:** in the aDECM approximation, `p_ij = x_i y_j/(1+x_i y_j)` is decoupled from `β`; in the exact DECM, `p_ij` depends on both `(θ, η)` simultaneously.
 
-**Implementation:** `src/models/decm.py` — `DECMModel`
+**Implementation:** `dcms/models/decm.py` — `DECMModel`
 
 ---
 
@@ -159,10 +185,10 @@ The coefficients `c` are found by a small `m×m` least-squares system (O(m²) pe
 
 #### Implementation
 
-- `src/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="gauss-seidel", anderson_depth=10)`
-- `src/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="gauss-seidel", anderson_depth=10)`
-- `src/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="gauss-seidel", anderson_depth=10)`
-- `src/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (DECM only uses θ-Newton; see §2.2)
+- `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="gauss-seidel", anderson_depth=10)`
+- `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="gauss-seidel", anderson_depth=10)`
+- `dcms/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="gauss-seidel", anderson_depth=10)`
+- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (DECM only uses θ-Newton; see §2.2)
 
 All four files share the same algorithmic skeleton:
 
@@ -218,10 +244,10 @@ which equals the aDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_
 
 #### Implementation
 
-- `src/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="theta-newton", anderson_depth=10)`
-- `src/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="theta-newton", anderson_depth=10)`
-- `src/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="theta-newton", anderson_depth=10)`
-- `src/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., anderson_depth=10)` (alternating out/in GS-Newton on 4N vector)
+- `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="theta-newton", anderson_depth=10)`
+- `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="theta-newton", anderson_depth=10)`
+- `dcms/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="theta-newton", anderson_depth=10)`
+- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., anderson_depth=10)` (alternating out/in GS-Newton on 4N vector)
 
 Internally, each file has a `_theta_newton_step_chunked` (and optionally `_theta_newton_step_dense`) function that computes the diagonal Jacobian and applies the clipped step without materialising the full Jacobian matrix (O(N) RAM).
 
@@ -491,7 +517,7 @@ pip install dcms[numba]          # installs numba as an optional extra
 pip install dcms numba           # equivalent
 ```
 
-### 3.9 Network generator (`src/utils/wng.py`)
+### 3.9 Network generator (`dcms/utils/wng.py`)
 
 ```python
 from dcms.utils.wng import k_s_generator_pl

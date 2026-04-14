@@ -259,6 +259,7 @@ converged = model.solve_tool(
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     variant="theta-newton", # "theta-newton" (default) or "gauss-seidel"
     anderson_depth=10,
+    backend="auto",         # "auto" (default), "pytorch", or "numba"
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -285,6 +286,7 @@ converged = model.solve_tool(
     max_time=0,
     variant="theta-newton",
     anderson_depth=10,
+    backend="auto",         # "auto" (default), "pytorch", or "numba"
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -324,6 +326,7 @@ converged = model.solve_tool(
     max_time=0,
     variant="theta-newton",
     anderson_depth=10,
+    backend="auto",         # "auto" (default), "pytorch", or "numba"
 )
 # solve_tool returns True if *both* topology and weight steps converged
 theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
@@ -364,6 +367,7 @@ converged = model.solve_tool(
     max_iter=5000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     anderson_depth=10,
+    backend="auto",         # "auto" (default), "pytorch", or "numba"
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
@@ -454,12 +458,38 @@ result = solve_fixed_point_dcm(
     variant="theta-newton",  # "theta-newton" (default) or "gauss-seidel"
     anderson_depth=10,
     max_time=0,
+    backend="auto",          # "auto" (default), "pytorch", or "numba"
 )
 ```
 
 `solve_fixed_point_dwcm` and `solve_fixed_point_adecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; aDECM additionally requires `theta_topo`).
 
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
+
+### 3.8 Compute backend
+
+All solvers accept a `backend` parameter that controls which compute engine executes the N×N inner loops:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"auto"` (default) | PyTorch dense for N ≤ 5 000; Numba scalar loops for N > 5 000. |
+| `"pytorch"` | Always use PyTorch (dense or chunked depending on N). |
+| `"numba"` | Always use Numba JIT-compiled scalar loops. |
+
+**Automatic fallback.** If the requested backend is not installed, the solver falls back to whichever is available and emits a `warnings.warn()` plus a `logging.warning()` message so the switch is never silent.
+
+**Why two backends?**
+
+* **PyTorch** is a hard dependency and is always available.  For small N it is very fast because it materialises the full N×N matrix once and uses vectorised operations.  For large N the chunked variant avoids OOM but still allocates `chunk × N` temporary tensors.
+* **Numba** (optional: `pip install numba`) compiles the update loop to native code with O(N) peak memory.  For N > 5 000 it is typically faster and uses far less RAM than chunked PyTorch.
+
+To install with Numba support:
+
+```bash
+pip install dcms[numba]          # installs numba as an optional extra
+# or
+pip install dcms numba           # equivalent
+```
 
 ### 3.8 Network generator (`src/utils/wng.py`)
 

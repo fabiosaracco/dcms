@@ -95,6 +95,12 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 
 ### Dettagli implementativi comuni
 - Chunked computation per N > 5000: non materializzare mai la matrice N×N completa, calcolare a blocchi di chunk×N
+- **Backend selezionabile**: ogni solver accetta un parametro `backend` (`"auto"`, `"pytorch"`, `"numba"`).
+  - `"auto"` (default): PyTorch dense per N ≤ 5000, Numba scalar per N > 5000
+  - `"pytorch"`: forza PyTorch (dense o chunked a seconda di N)
+  - `"numba"`: forza Numba JIT-compilato (O(N) RAM, nessuna matrice N×N)
+  - Fallback automatico con warning se il backend richiesto non è disponibile
+  - Numba è opzionale: `pip install dcms[numba]`
 - Zero-strength/zero-degree nodes: fissare θ = θ_MAX e non aggiornare mai
 - Convergenza: ‖F‖∞ < tol (default 1e-5)
 - Profiling: ogni solver restituisce `SolverResult` con theta, converged, iterations, residuals, elapsed_time, peak_ram_bytes

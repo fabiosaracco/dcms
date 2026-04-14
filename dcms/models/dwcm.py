@@ -392,7 +392,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic:str='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10)-> SolverResult:
+    def solve_tool(self, ic:str='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto')-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -401,13 +401,16 @@ class DWCMModel:
             max_iter (int): the maximum number of iterations. Default=2000.
             variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
             anderson_depth (int): Anderson acceleration depth. Default=10.
+            backend (str): Compute backend: ``"auto"`` (default), ``"pytorch"``,
+                or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
+                Numba for larger networks.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
         """
         self.ic=self.initial_theta(ic)
         from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
-        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth)
+        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend)
         if len(self.sol.message)>0:
             print(self.sol.message)
             

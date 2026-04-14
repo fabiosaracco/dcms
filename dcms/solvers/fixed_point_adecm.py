@@ -665,6 +665,7 @@ def solve_fixed_point_adecm(
     anderson_depth: int = 0,
     max_step: float = 1.0,
     max_time: float = 0.0,
+    backend: str = "auto",
 ) -> SolverResult:
     """Fixed-point iteration for the aDECM weight step.
 
@@ -695,6 +696,10 @@ def solve_fixed_point_adecm(
         max_time:    Wall-clock time limit in seconds.  If > 0, the solver
                      stops after this many seconds even if ``max_iter`` has not
                      been reached.  Default 0 (no time limit).
+        backend:     Compute backend: ``"auto"`` (default), ``"pytorch"``, or
+                     ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
+                     Numba for larger networks.  Falls back automatically with
+                     a warning if the requested backend is unavailable.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -730,14 +735,28 @@ def solve_fixed_point_adecm(
     N = s_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)  # allow β>1 (negative θ)
 
-    # Decide chunked vs dense
+    # Resolve compute backend
+    from dcms.utils.backend import resolve_backend
+    _backend = resolve_backend(backend, N)
+    _use_numba = (_backend == "numba")
+    if _use_numba:
+        import numpy as np
+        from dcms.solvers._numba_kernels import (
+            _adecm_theta_newton_numba,
+            _adecm_fp_gs_numba,
+        )
+
+    # Decide chunked vs dense (PyTorch path only)
     if chunk_size == 0:
         effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
     else:
         effective_chunk = chunk_size
 
     # Pre-compute DCM probability matrix (or use caller-supplied one)
-    if effective_chunk == 0:  # dense path: pre-compute P once
+    if _use_numba:
+        theta_topo_out_chunked = theta_topo[:N]
+        theta_topo_in_chunked = theta_topo[N:]
+    elif effective_chunk == 0:  # dense path: pre-compute P once
         if P is None:
             theta_topo_out = theta_topo[:N]
             theta_topo_in = theta_topo[N:]
@@ -792,7 +811,20 @@ def solve_fixed_point_adecm(
 
             if variant == "theta-newton":
                 # θ-space coordinate Newton step.
-                if effective_chunk > 0:
+                if _use_numba:
+                    tbo = theta[:N].numpy()
+                    tbi = theta[N:].numpy()
+                    tbo_new, tbi_new, fo, fi = _adecm_theta_newton_numba(
+                        tbo, tbi,
+                        theta_topo_out_chunked.numpy(),
+                        theta_topo_in_chunked.numpy(),
+                        s_out.numpy(), s_in.numpy(),
+                        max_step, _ETA_MIN, _ETA_MAX,
+                        _Z_G_CLAMP, _Z_NEWTON_FLOOR, _Z_NEWTON_FRAC,
+                    )
+                    theta_fp = torch.from_numpy(np.concatenate([tbo_new, tbi_new]))
+                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
+                elif effective_chunk > 0:
                     theta_fp, F_current = _theta_newton_step_chunked(
                         theta,
                         theta_topo_out_chunked,
@@ -808,10 +840,24 @@ def solve_fixed_point_adecm(
                     )
             else:
                 # β-space fixed-point iteration (Gauss-Seidel or Jacobi)
-                beta_out = torch.exp(-theta[:N])
-                beta_in = torch.exp(-theta[N:])
-
-                if effective_chunk > 0:
+                if _use_numba:
+                    bo = torch.exp(-theta[:N]).numpy()
+                    bi = torch.exp(-theta[N:]).numpy()
+                    bon, bin_, fo, fi = _adecm_fp_gs_numba(
+                        bo, bi,
+                        theta_topo_out_chunked.numpy(),
+                        theta_topo_in_chunked.numpy(),
+                        s_out.numpy(), s_in.numpy(),
+                        theta[:N].numpy(), theta[N:].numpy(),
+                        max_step, _ETA_MIN, _ETA_MAX,
+                        _Q_MAX, _FP_NEWTON_FALLBACK_DELTA, True,
+                    )
+                    beta_out_new = torch.from_numpy(bon)
+                    beta_in_new = torch.from_numpy(bin_)
+                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
+                elif effective_chunk > 0:
+                    beta_out = torch.exp(-theta[:N])
+                    beta_in = torch.exp(-theta[N:])
                     beta_out_new, beta_in_new, F_current = _fp_step_chunked(
                         beta_out, beta_in,
                         theta_topo_out_chunked, theta_topo_in_chunked,
@@ -819,6 +865,8 @@ def solve_fixed_point_adecm(
                         theta=theta, max_step=max_step,
                     )
                 else:
+                    beta_out = torch.exp(-theta[:N])
+                    beta_in = torch.exp(-theta[N:])
                     beta_out_new, beta_in_new, F_current = _fp_step_dense(
                         beta_out, beta_in, P_mat, s_out, s_in, variant,
                         theta=theta, max_step=max_step,
@@ -977,7 +1025,20 @@ def solve_fixed_point_adecm(
                 _nt_and_g: list[torch.Tensor] = []
                 _nt_and_r: list[torch.Tensor] = []
                 for _ in range(_FPGS_NEWTON_STEPS):
-                    if effective_chunk > 0:
+                    if _use_numba:
+                        tbo = theta_nt[:N].numpy()
+                        tbi = theta_nt[N:].numpy()
+                        tbo_new, tbi_new, fo, fi = _adecm_theta_newton_numba(
+                            tbo, tbi,
+                            theta_topo_out_chunked.numpy(),
+                            theta_topo_in_chunked.numpy(),
+                            s_out.numpy(), s_in.numpy(),
+                            max_step, _ETA_MIN, _ETA_MAX,
+                            _Z_G_CLAMP, _Z_NEWTON_FLOOR, _Z_NEWTON_FRAC,
+                        )
+                        theta_nt_fp = torch.from_numpy(np.concatenate([tbo_new, tbi_new]))
+                        F_nt = torch.from_numpy(np.concatenate([fo, fi]))
+                    elif effective_chunk > 0:
                         theta_nt_fp, F_nt = _theta_newton_step_chunked(
                             theta_nt,
                             theta_topo_out_chunked,

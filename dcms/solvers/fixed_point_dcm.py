@@ -329,6 +329,7 @@ def solve_fixed_point_dcm(
     anderson_depth: int = 0,
     max_step: float = 1.0,
     max_time: float = 0.0,
+    backend: str = "auto",
 ) -> SolverResult:
     """Fixed-point iteration for the DCM binary model.
 
@@ -348,6 +349,11 @@ def solve_fixed_point_dcm(
         anderson_depth: Anderson acceleration depth.  0 = plain FP.
         max_step:   Maximum per-node Newton step in ``"theta-newton"`` variant.
         max_time:   Wall-clock time limit in seconds.  0 = no limit.
+        backend:    Compute backend: ``"auto"`` (default), ``"pytorch"``, or
+                    ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
+                    Numba for larger networks.  If the requested backend is
+                    unavailable the solver falls back automatically with a
+                    warning.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -378,7 +384,18 @@ def solve_fixed_point_dcm(
     N = k_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)
 
-    # Decide whether to use chunked computation
+    # Resolve compute backend
+    from dcms.utils.backend import resolve_backend
+    _backend = resolve_backend(backend, N)
+    _use_numba = (_backend == "numba")
+    if _use_numba:
+        import numpy as np
+        from dcms.solvers._numba_kernels import (
+            _dcm_theta_newton_numba,
+            _dcm_fp_gs_numba,
+        )
+
+    # Decide whether to use chunked computation (PyTorch path only)
     if chunk_size == 0:
         effective_chunk = _DEFAULT_CHUNK if N > _LARGE_N_THRESHOLD else max(N, 1)
     else:
@@ -417,21 +434,41 @@ def solve_fixed_point_dcm(
                 break
 
             if variant == "theta-newton":
-                theta_fp, F_current = _theta_newton_step_chunked_dcm(
-                    theta, k_out, k_in, effective_chunk, max_step
-                )
+                if _use_numba:
+                    to = theta[:N].numpy()
+                    ti = theta[N:].numpy()
+                    to_new, ti_new, fo, fi = _dcm_theta_newton_numba(
+                        to, ti, k_out.numpy(), k_in.numpy(), max_step, _ETA_MAX,
+                    )
+                    theta_fp = torch.from_numpy(np.concatenate([to_new, ti_new]))
+                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
+                else:
+                    theta_fp, F_current = _theta_newton_step_chunked_dcm(
+                        theta, k_out, k_in, effective_chunk, max_step
+                    )
             else:
-                x = torch.exp(-theta[:N])
-                y = torch.exp(-theta[N:])
+                if _use_numba:
+                    x_np = np.exp(-theta[:N].numpy())
+                    y_np = np.exp(-theta[N:].numpy())
+                    xn, yn, fo, fi = _dcm_fp_gs_numba(
+                        x_np, y_np, k_out.numpy(), k_in.numpy(),
+                        max_step, _ETA_MAX, _FP_NEWTON_FALLBACK_DELTA,
+                        True,
+                    )
+                    x_new = torch.from_numpy(xn).clamp(1e-300, 1e300)
+                    y_new = torch.from_numpy(yn).clamp(1e-300, 1e300)
+                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
+                else:
+                    x = torch.exp(-theta[:N])
+                    y = torch.exp(-theta[N:])
+                    x_new, y_new, F_current = _fp_step_chunked_dcm(
+                        x, y, k_out, k_in, effective_chunk,
+                        theta=None, max_step=max_step,
+                    )
 
-                x_new, y_new, F_current = _fp_step_chunked_dcm(
-                    x, y, k_out, k_in, effective_chunk,
-                    theta=None, max_step=max_step,
-                )
-
-                # Clamp to valid range
-                x_new = x_new.clamp(1e-300, 1e300)
-                y_new = y_new.clamp(1e-300, 1e300)
+                    # Clamp to valid range
+                    x_new = x_new.clamp(1e-300, 1e300)
+                    y_new = y_new.clamp(1e-300, 1e300)
 
                 # Convert to θ-space and apply damping
                 theta_out_new = (-torch.log(x_new)).clamp(-_ETA_MAX, _ETA_MAX)
@@ -538,9 +575,18 @@ def solve_fixed_point_dcm(
                 _nt_and_g: list[torch.Tensor] = []
                 _nt_and_r: list[torch.Tensor] = []
                 for _ in range(_FPGS_NEWTON_STEPS):
-                    theta_nt_fp, F_nt = _theta_newton_step_chunked_dcm(
-                        theta_nt, k_out, k_in, effective_chunk, max_step
-                    )
+                    if _use_numba:
+                        to = theta_nt[:N].numpy()
+                        ti = theta_nt[N:].numpy()
+                        to_new, ti_new, fo, fi = _dcm_theta_newton_numba(
+                            to, ti, k_out.numpy(), k_in.numpy(), max_step, _ETA_MAX,
+                        )
+                        theta_nt_fp = torch.from_numpy(np.concatenate([to_new, ti_new]))
+                        F_nt = torch.from_numpy(np.concatenate([fo, fi]))
+                    else:
+                        theta_nt_fp, F_nt = _theta_newton_step_chunked_dcm(
+                            theta_nt, k_out, k_in, effective_chunk, max_step
+                        )
                     _nt_floor = torch.full_like(theta_nt, -_ETA_MAX)
                     theta_nt_fp = theta_nt_fp.clamp(-_ETA_MAX, _ETA_MAX)
                     nt_res = F_nt.abs().max().item()

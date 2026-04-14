@@ -578,6 +578,7 @@ class DECMModel:
         variant: str = "theta-newton",
         anderson_depth: int = 10,
         multi_start: bool = True,
+        backend: str = "auto",
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -603,6 +604,9 @@ class DECMModel:
             multi_start:   If ``True`` (default), retry with fallback ICs when
                            the primary IC does not converge.  Set to ``False``
                            for clean per-IC benchmarking.
+            backend:       Compute backend: ``"auto"`` (default), ``"pytorch"``,
+                           or ``"numba"``.  ``"auto"`` uses PyTorch for
+                           N ≤ 5 000 and Numba for larger networks.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -626,6 +630,7 @@ class DECMModel:
                 chunk_size=0,
                 anderson_depth=anderson_depth,
                 max_time=max_time,
+                backend=backend,
             )
 
         self.ic = self.initial_theta(ic)

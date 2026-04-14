@@ -507,6 +507,7 @@ def solve_fixed_point_decm(
     anderson_depth: int = 10,
     max_step: float = 0.5,
     max_time: float = 0.0,
+    backend: str = "auto",
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -535,6 +536,10 @@ def solve_fixed_point_decm(
         anderson_depth: Anderson acceleration depth (0 = plain Newton).
         max_step:       Maximum |Δ| per node per Newton step.
         max_time:       Wall-clock time limit in seconds (0 = no limit).
+        backend:        Compute backend: ``"auto"`` (default), ``"pytorch"``,
+                        or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000
+                        and Numba for larger networks.  Falls back automatically
+                        with a warning if the requested backend is unavailable.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -575,14 +580,44 @@ def solve_fixed_point_decm(
     theta[:2*N] = theta[:2*N].clamp(-_THETA_MAX, _THETA_MAX)
     theta[2*N:] = theta[2*N:].clamp(_ETA_MIN, _ETA_MAX)
 
-    # Decide chunked vs dense
+    # Resolve compute backend
+    from dcms.utils.backend import resolve_backend
+    _backend = resolve_backend(backend, N)
+    _use_numba = (_backend == "numba")
+    if _use_numba:
+        import numpy as np
+        from dcms.solvers._numba_kernels import _decm_step_numba
+
+    # Decide chunked vs dense (PyTorch path only)
     if chunk_size == 0:
         effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
     else:
         effective_chunk = chunk_size
 
     # Step function with bound arguments
-    if effective_chunk > 0:
+    if _use_numba:
+        def _step(th):
+            to_ = th[:N].numpy()
+            ti_ = th[N:2*N].numpy()
+            eo_ = th[2*N:3*N].numpy()
+            ei_ = th[3*N:].numpy()
+            result = _decm_step_numba(
+                to_, ti_, eo_, ei_,
+                k_out.numpy(), k_in.numpy(),
+                s_out.numpy(), s_in.numpy(),
+                zero_k_out.numpy(), zero_k_in.numpy(),
+                zero_s_out.numpy(), zero_s_in.numpy(),
+                max_step, _THETA_MAX, _ETA_MAX,
+                _Z_G_CLAMP, _Z_NEWTON_FLOOR, _Z_NEWTON_FRAC,
+            )
+            theta_new = torch.from_numpy(
+                np.concatenate([result[0], result[1], result[2], result[3]])
+            )
+            F_current = torch.from_numpy(
+                np.concatenate([result[4], result[5], result[6], result[7]])
+            )
+            return theta_new, F_current
+    elif effective_chunk > 0:
         def _step(th):
             return _decm_step_chunked(
                 th, k_out, k_in, s_out, s_in,

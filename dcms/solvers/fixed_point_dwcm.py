@@ -184,6 +184,7 @@ def solve_fixed_point_dwcm(
     max_step: float = 1.0,
     max_time: float = 0.0,
     backend: str = "auto",
+    num_threads: int = 0,
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -223,6 +224,9 @@ def solve_fixed_point_dwcm(
             ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and Numba
             for larger networks.  Falls back automatically with a warning
             if the requested backend is unavailable.
+        num_threads: Number of Numba parallel threads.  0 (default) leaves
+            the global Numba thread count unchanged.  Only takes effect when
+            ``backend="numba"`` (or ``"auto"`` at large N).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -259,12 +263,17 @@ def solve_fixed_point_dwcm(
     from dcms.utils.backend import resolve_backend
     _backend = resolve_backend(backend, N)
     _use_numba = (_backend == "numba")
+    _prev_numba_threads: int | None = None
     if _use_numba:
         import numpy as np
         from dcms.solvers._numba_kernels import (
             _dwcm_theta_newton_numba,
             _dwcm_fp_gs_numba,
         )
+        if num_threads > 0:
+            import numba as _numba_mod
+            _prev_numba_threads = _numba_mod.get_num_threads()
+            _numba_mod.set_num_threads(num_threads)
 
     # Decide whether to use chunked computation (PyTorch path only)
     if chunk_size == 0:
@@ -692,6 +701,9 @@ def solve_fixed_point_dwcm(
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)
         peak_ram = _peak_ram_monitor.peak_bytes
+        if _prev_numba_threads is not None:
+            import numba as _numba_mod
+            _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
         theta=best_theta.detach().numpy(),

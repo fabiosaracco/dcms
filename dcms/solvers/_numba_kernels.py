@@ -1,9 +1,38 @@
-"""Numba JIT-compiled scalar kernels for the fixed-point solvers.
+"""Numba JIT-compiled parallel kernels for the fixed-point solvers.
 
 These kernels mirror the PyTorch dense/chunked implementations but use
-Numba ``@njit`` loops to avoid materialising N×N matrices entirely.
-Memory usage is O(N) and the loops are compiled to native code, making
-them competitive with (and often faster than) chunked PyTorch for large N.
+Numba ``@njit(parallel=True)`` loops to avoid materialising N×N matrices.
+Memory usage is O(N) and the loops are compiled to native code and run in
+parallel across all available CPU threads.
+
+Parallelism strategy
+--------------------
+Every double sum over (i, j) pairs is split into two independent passes:
+
+* **Row-pass** (parallel over *i*): accumulates per-row quantities
+  (out-direction sums). Each thread owns a private accumulator for row ``i``
+  and reads shared but *read-only* column vectors.
+* **Col-pass** (parallel over *j*): accumulates per-column quantities
+  (in-direction sums). Each thread owns a private accumulator for column ``j``
+  and reads shared but *read-only* row vectors.
+
+This avoids the race condition that would arise from parallelising the outer
+loop of the original fused ``for i / for j`` nest (where `out[j] += f(i,j)`
+would be written by multiple threads).
+
+Z-floor optimisation
+--------------------
+The aDECM and DECM kernels need ``min_{j≠i}(θ_in[j])`` for each node ``i``.
+The naïve O(N) inner search per node makes the update step O(N²).  We instead
+precompute the global minimum *and* second minimum in O(N), so each node can
+look up the answer in O(1).
+
+Thread count
+------------
+Set the number of Numba threads with ``numba.set_num_threads(n)`` before
+calling a kernel.  The default is ``numba.config.NUMBA_NUM_THREADS``
+(equal to ``os.cpu_count()``).  Passing ``num_threads=0`` leaves the global
+setting unchanged.
 
 All functions accept and return plain NumPy arrays (float64).  The calling
 solver is responsible for converting between ``torch.Tensor`` and NumPy.
@@ -17,7 +46,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import numba  # noqa: F401 — guaranteed available by the backend dispatcher
+import numba
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -36,11 +65,29 @@ def _clamp(x: float, lo: float, hi: float) -> float:  # pragma: no cover
     return x
 
 
+@numba.njit(cache=True, fastmath=False)
+def _min2(arr: np.ndarray) -> tuple:  # pragma: no cover
+    """Return ``(idx_min, val_min, val_second_min)`` over *arr* in one pass."""
+    N = arr.shape[0]
+    idx_min = 0
+    val_min = arr[0]
+    val_2nd = math.inf
+    for k in range(1, N):
+        v = arr[k]
+        if v < val_min:
+            val_2nd = val_min
+            val_min = v
+            idx_min = k
+        elif v < val_2nd:
+            val_2nd = v
+    return idx_min, val_min, val_2nd
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DCM kernels
 # ═══════════════════════════════════════════════════════════════════════════
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _dcm_theta_newton_numba(
     theta_out: np.ndarray,
     theta_in: np.ndarray,
@@ -49,61 +96,75 @@ def _dcm_theta_newton_numba(
     max_step: float,
     ETA_MAX: float,
 ) -> tuple:  # pragma: no cover
-    """Jacobi θ-Newton step for the DCM (scalar loops).
+    """Jacobi θ-Newton step for the DCM (parallel scalar loops).
 
     Returns ``(theta_out_new, theta_in_new, F_out, F_in)``.
     """
     N = theta_out.shape[0]
     x = np.empty(N)
     y = np.empty(N)
-    for i in range(N):
+    for i in numba.prange(N):
         x[i] = math.exp(-theta_out[i])
         y[i] = math.exp(-theta_in[i])
 
-    k_out_hat = np.zeros(N)
-    sum_p1p_out = np.zeros(N)
-    k_in_hat = np.zeros(N)
-    sum_p1p_in = np.zeros(N)
-
-    for i in range(N):
+    # ── Row-pass (parallel over i): out-direction sums ──
+    k_out_hat = np.empty(N)
+    sum_p1p_out = np.empty(N)
+    for i in numba.prange(N):
+        acc_k = 0.0
+        acc_h = 0.0
+        xi = x[i]
         for j in range(N):
             if i == j:
                 continue
-            xy = x[i] * y[j]
+            xy = xi * y[j]
             p = xy / (1.0 + xy)
-            p1p = p * (1.0 - p)
-            k_out_hat[i] += p
-            sum_p1p_out[i] += p1p
-            k_in_hat[j] += p
-            sum_p1p_in[j] += p1p
+            acc_k += p
+            acc_h += p * (1.0 - p)
+        k_out_hat[i] = acc_k
+        sum_p1p_out[i] = acc_h
 
+    # ── Col-pass (parallel over j): in-direction sums ──
+    k_in_hat = np.empty(N)
+    sum_p1p_in = np.empty(N)
+    for j in numba.prange(N):
+        acc_k = 0.0
+        acc_h = 0.0
+        yj = y[j]
+        for i in range(N):
+            if i == j:
+                continue
+            xy = x[i] * yj
+            p = xy / (1.0 + xy)
+            acc_k += p
+            acc_h += p * (1.0 - p)
+        k_in_hat[j] = acc_k
+        sum_p1p_in[j] = acc_h
+
+    # ── Newton update ──
     F_out = np.empty(N)
     F_in = np.empty(N)
     theta_out_new = np.empty(N)
     theta_in_new = np.empty(N)
-
-    for i in range(N):
+    for i in numba.prange(N):
         F_out[i] = k_out_hat[i] - k_out[i]
-        F_in[i] = k_in_hat[i] - k_in[i]
-
         H_out = max(sum_p1p_out[i], 1e-15)
         delta_out = _clamp(F_out[i] / H_out, -max_step, max_step)
-        if k_out[i] == 0.0:
-            theta_out_new[i] = ETA_MAX
-        else:
-            theta_out_new[i] = _clamp(theta_out[i] + delta_out, -ETA_MAX, ETA_MAX)
+        theta_out_new[i] = ETA_MAX if k_out[i] == 0.0 else _clamp(
+            theta_out[i] + delta_out, -ETA_MAX, ETA_MAX
+        )
 
+        F_in[i] = k_in_hat[i] - k_in[i]
         H_in = max(sum_p1p_in[i], 1e-15)
         delta_in = _clamp(F_in[i] / H_in, -max_step, max_step)
-        if k_in[i] == 0.0:
-            theta_in_new[i] = ETA_MAX
-        else:
-            theta_in_new[i] = _clamp(theta_in[i] + delta_in, -ETA_MAX, ETA_MAX)
+        theta_in_new[i] = ETA_MAX if k_in[i] == 0.0 else _clamp(
+            theta_in[i] + delta_in, -ETA_MAX, ETA_MAX
+        )
 
     return theta_out_new, theta_in_new, F_out, F_in
 
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _dcm_fp_gs_numba(
     x: np.ndarray,
     y: np.ndarray,
@@ -114,87 +175,83 @@ def _dcm_fp_gs_numba(
     FP_NEWTON_FALLBACK_DELTA: float,
     use_newton_fallback: bool,
 ) -> tuple:  # pragma: no cover
-    """Gauss-Seidel FP step for the DCM (scalar loops).
+    """Gauss-Seidel FP step for the DCM (parallel scalar loops).
 
     Returns ``(x_new, y_new, F_out, F_in)``.
     """
     N = x.shape[0]
-    D_out = np.zeros(N)
-    k_in_hat = np.zeros(N)
 
-    for i in range(N):
+    # ── Pass 1, row-sum (parallel over i): D_out ──
+    D_out = np.empty(N)
+    for i in numba.prange(N):
+        acc = 0.0
+        xi = x[i]
         for j in range(N):
             if i == j:
                 continue
-            xy = x[i] * y[j]
-            denom = 1.0 + xy
-            D_out[i] += y[j] / denom
-            p = xy / denom
-            k_in_hat[j] += p
+            acc += y[j] / (1.0 + xi * y[j])
+        D_out[i] = acc
 
+    # ── Pass 1, col-sum (parallel over j): k_in_hat ──
+    k_in_hat = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        yj = y[j]
+        for i in range(N):
+            if i == j:
+                continue
+            xy = x[i] * yj
+            acc += xy / (1.0 + xy)
+        k_in_hat[j] = acc
+
+    # ── Compute x_new and F_out ──
     k_out_hat = np.empty(N)
     x_new = np.empty(N)
-    for i in range(N):
-        k_out_hat[i] = x[i] * D_out[i]
-
     F_out = np.empty(N)
-    for i in range(N):
+    for i in numba.prange(N):
+        k_out_hat[i] = x[i] * D_out[i]
+        x_new[i] = k_out[i] / D_out[i] if D_out[i] > 0 else x[i]
         F_out[i] = k_out_hat[i] - k_out[i]
 
-    for i in range(N):
-        if D_out[i] > 0:
-            x_new[i] = k_out[i] / D_out[i]
-        else:
-            x_new[i] = x[i]
-
-    # Newton fallback for out-direction
+    # Newton fallback for out-direction (uses x_new[i], private per i)
     if use_newton_fallback:
-        theta_out = np.empty(N)
-        for i in range(N):
-            theta_out[i] = -math.log(max(x[i], 1e-300))
-
-        for i in range(N):
-            theta_out_fp = _clamp(-math.log(max(x_new[i], 1e-300)), -ETA_MAX, ETA_MAX)
-            if abs(theta_out_fp - theta_out[i]) > FP_NEWTON_FALLBACK_DELTA:
+        for i in numba.prange(N):
+            theta_out_i = -math.log(max(x[i], 1e-300))
+            theta_fp = _clamp(-math.log(max(x_new[i], 1e-300)), -ETA_MAX, ETA_MAX)
+            if abs(theta_fp - theta_out_i) > FP_NEWTON_FALLBACK_DELTA:
                 s_hat = max(k_out_hat[i], 1e-30)
                 delta = _clamp((k_out_hat[i] - k_out[i]) / s_hat, -max_step, max_step)
-                theta_nt = _clamp(theta_out[i] + delta, -ETA_MAX, ETA_MAX)
-                x_new[i] = math.exp(-theta_nt)
+                x_new[i] = math.exp(-_clamp(theta_out_i + delta, -ETA_MAX, ETA_MAX))
 
-    # Gauss-Seidel: use updated x immediately for D_in
-    D_in = np.zeros(N)
-    for j in range(N):
-        for i in range(N):
+    # ── Pass 2 (parallel over i): D_in using updated x_new ──
+    D_in = np.empty(N)
+    for i in numba.prange(N):
+        acc = 0.0
+        yi = y[i]
+        for j in range(N):
             if j == i:
                 continue
-            D_in[i] += x_new[j] / (1.0 + x_new[j] * y[i])
+            acc += x_new[j] / (1.0 + x_new[j] * yi)
+        D_in[i] = acc
 
+    # ── Compute y_new and F_in ──
     y_new = np.empty(N)
     k_in_hat_upd = np.empty(N)
-    for i in range(N):
+    F_in = np.empty(N)
+    for i in numba.prange(N):
         k_in_hat_upd[i] = y[i] * D_in[i]
-        if D_in[i] > 0:
-            y_new[i] = k_in[i] / D_in[i]
-        else:
-            y_new[i] = y[i]
+        y_new[i] = k_in[i] / D_in[i] if D_in[i] > 0 else y[i]
+        F_in[i] = k_in_hat[i] - k_in[i]
 
     # Newton fallback for in-direction
     if use_newton_fallback:
-        theta_in = np.empty(N)
-        for i in range(N):
-            theta_in[i] = -math.log(max(y[i], 1e-300))
-
-        for i in range(N):
-            theta_in_fp = _clamp(-math.log(max(y_new[i], 1e-300)), -ETA_MAX, ETA_MAX)
-            if abs(theta_in_fp - theta_in[i]) > FP_NEWTON_FALLBACK_DELTA:
+        for i in numba.prange(N):
+            theta_in_i = -math.log(max(y[i], 1e-300))
+            theta_fp = _clamp(-math.log(max(y_new[i], 1e-300)), -ETA_MAX, ETA_MAX)
+            if abs(theta_fp - theta_in_i) > FP_NEWTON_FALLBACK_DELTA:
                 s_hat = max(k_in_hat_upd[i], 1e-30)
                 delta = _clamp((k_in_hat_upd[i] - k_in[i]) / s_hat, -max_step, max_step)
-                theta_nt = _clamp(theta_in[i] + delta, -ETA_MAX, ETA_MAX)
-                y_new[i] = math.exp(-theta_nt)
-
-    F_in = np.empty(N)
-    for i in range(N):
-        F_in[i] = k_in_hat[i] - k_in[i]
+                y_new[i] = math.exp(-_clamp(theta_in_i + delta, -ETA_MAX, ETA_MAX))
 
     return x_new, y_new, F_out, F_in
 
@@ -203,7 +260,7 @@ def _dcm_fp_gs_numba(
 # DWCM kernels
 # ═══════════════════════════════════════════════════════════════════════════
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _dwcm_theta_newton_numba(
     theta_out: np.ndarray,
     theta_in: np.ndarray,
@@ -213,32 +270,46 @@ def _dwcm_theta_newton_numba(
     ETA_MIN: float,
     ETA_MAX: float,
 ) -> tuple:  # pragma: no cover
-    """θ-Newton GS step for the DWCM (scalar loops).
+    """θ-Newton GS step for the DWCM (parallel scalar loops).
 
     Returns ``(theta_out_new, theta_in_new, F_out, F_in)``.
     """
     N = theta_out.shape[0]
 
-    # ── Pass 1: out-direction at current θ ──
-    F_out = np.zeros(N)
-    h_out = np.zeros(N)
-    F_in_current = np.zeros(N)
-
-    for i in range(N):
+    # ── Pass 1, row-sum (parallel over i): F_out, h_out ──
+    F_out = np.empty(N)
+    h_out = np.empty(N)
+    for i in numba.prange(N):
+        acc_f = 0.0
+        acc_h = 0.0
+        to_i = theta_out[i]
         for j in range(N):
             if i == j:
                 continue
-            z = theta_out[i] + theta_in[j]
+            z = to_i + theta_in[j]
             z_safe = max(z, 1e-15)
-            em1 = _expm1(z_safe)
-            W = 1.0 / em1
-            F_out[i] += W
-            h_out[i] -= W * (1.0 + W)
-            F_in_current[j] += W
+            W = 1.0 / _expm1(z_safe)
+            acc_f += W
+            acc_h -= W * (1.0 + W)
+        F_out[i] = acc_f - s_out[i]
+        h_out[i] = acc_h
 
+    # ── Pass 1, col-sum (parallel over j): F_in at old θ ──
+    F_in_current = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        ti_j = theta_in[j]
+        for i in range(N):
+            if i == j:
+                continue
+            z = theta_out[i] + ti_j
+            z_safe = max(z, 1e-15)
+            acc += 1.0 / _expm1(z_safe)
+        F_in_current[j] = acc - s_in[j]
+
+    # ── Update θ_out ──
     theta_out_new = np.empty(N)
-    for i in range(N):
-        F_out[i] -= s_out[i]
+    for i in numba.prange(N):
         if s_out[i] == 0.0:
             theta_out_new[i] = ETA_MAX
         else:
@@ -246,25 +317,27 @@ def _dwcm_theta_newton_numba(
             delta = _clamp(-F_out[i] / denom, -max_step, max_step)
             theta_out_new[i] = _clamp(theta_out[i] + delta, ETA_MIN, ETA_MAX)
 
-    # ── Pass 2: in-direction with updated θ_out ──
-    F_in2 = np.zeros(N)
-    h_in = np.zeros(N)
-
-    for i in range(N):
-        for j in range(N):
+    # ── Pass 2, col-sum (parallel over j): F_in, h_in with new θ_out ──
+    F_in2 = np.empty(N)
+    h_in = np.empty(N)
+    for j in numba.prange(N):
+        acc_f = 0.0
+        acc_h = 0.0
+        ti_j = theta_in[j]
+        for i in range(N):
             if i == j:
                 continue
-            z = theta_out_new[i] + theta_in[j]
+            z = theta_out_new[i] + ti_j
             z_safe = max(z, 1e-15)
-            em1 = _expm1(z_safe)
-            W = 1.0 / em1
-            F_in2[j] += W
-            h_in[j] -= W * (1.0 + W)
+            W = 1.0 / _expm1(z_safe)
+            acc_f += W
+            acc_h -= W * (1.0 + W)
+        F_in2[j] = acc_f - s_in[j]
+        h_in[j] = acc_h
 
+    # ── Update θ_in ──
     theta_in_new = np.empty(N)
-    for j in range(N):
-        F_in2[j] -= s_in[j]
-        F_in_current[j] -= s_in[j]
+    for j in numba.prange(N):
         if s_in[j] == 0.0:
             theta_in_new[j] = ETA_MAX
         else:
@@ -275,7 +348,7 @@ def _dwcm_theta_newton_numba(
     return theta_out_new, theta_in_new, F_out, F_in_current
 
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _dwcm_fp_gs_numba(
     beta_out: np.ndarray,
     beta_in: np.ndarray,
@@ -289,42 +362,52 @@ def _dwcm_fp_gs_numba(
     FP_NEWTON_FALLBACK_DELTA: float,
     use_newton_fallback: bool,
 ) -> tuple:  # pragma: no cover
-    """Gauss-Seidel FP step for the DWCM (scalar loops).
+    """Gauss-Seidel FP step for the DWCM (parallel scalar loops).
 
     Returns ``(beta_out_new, beta_in_new, F_out, F_in)``.
     """
     N = beta_out.shape[0]
-    D_out = np.zeros(N)
-    s_in_hat = np.zeros(N)
 
-    for i in range(N):
+    # ── Pass 1, row-sum (parallel over i): D_out ──
+    D_out = np.empty(N)
+    for i in numba.prange(N):
+        acc = 0.0
+        bo_i = beta_out[i]
         for j in range(N):
             if i == j:
                 continue
-            xy = beta_out[i] * beta_in[j]
+            xy = bo_i * beta_in[j]
             denom = max(1.0 - xy, 1e-15)
-            d = beta_in[j] / denom
-            D_out[i] += d
-            s_in_hat[j] += beta_out[i] * d
+            acc += beta_in[j] / denom
+        D_out[i] = acc
 
+    # ── Pass 1, col-sum (parallel over j): s_in_hat at old β ──
+    s_in_hat_orig = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        bi_j = beta_in[j]
+        for i in range(N):
+            if i == j:
+                continue
+            xy = beta_out[i] * bi_j
+            denom = max(1.0 - xy, 1e-15)
+            acc += beta_out[i] * bi_j / denom
+        s_in_hat_orig[j] = acc
+
+    # ── Compute beta_out_new, F_out, F_in ──
     s_out_hat = np.empty(N)
     beta_out_new = np.empty(N)
-    for i in range(N):
-        s_out_hat[i] = beta_out[i] * D_out[i]
-        if D_out[i] > 0:
-            beta_out_new[i] = s_out[i] / D_out[i]
-        else:
-            beta_out_new[i] = beta_out[i]
-
     F_out = np.empty(N)
     F_in = np.empty(N)
-    for i in range(N):
+    for i in numba.prange(N):
+        s_out_hat[i] = beta_out[i] * D_out[i]
+        beta_out_new[i] = s_out[i] / D_out[i] if D_out[i] > 0 else beta_out[i]
         F_out[i] = s_out_hat[i] - s_out[i]
-        F_in[i] = s_in_hat[i] - s_in[i]
+        F_in[i] = s_in_hat_orig[i] - s_in[i]
 
     # Newton fallback for out-direction
     if use_newton_fallback:
-        for i in range(N):
+        for i in numba.prange(N):
             b_clamped = max(min(beta_out_new[i], 1.0 - 1e-15), 1e-300)
             theta_fp = _clamp(-math.log(b_clamped), ETA_MIN, ETA_MAX)
             if abs(theta_fp - theta_out[i]) > FP_NEWTON_FALLBACK_DELTA:
@@ -334,39 +417,41 @@ def _dwcm_fp_gs_numba(
                 beta_out_new[i] = math.exp(-theta_nt)
 
     # Clamp beta_out_new
-    for i in range(N):
+    for i in numba.prange(N):
         beta_out_new[i] = max(min(beta_out_new[i], 1.0 - 1e-15), 1e-300)
 
-    # Gauss-Seidel: use updated β_out for D_in
-    D_in = np.zeros(N)
-    for j in range(N):
+    # ── Pass 2, col-sum (parallel over j): D_in with updated β_out ──
+    D_in = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        bi_j = beta_in[j]
         for i in range(N):
-            if j == i:
+            if i == j:
                 continue
-            xy = beta_out_new[j] * beta_in[i]
+            xy = beta_out_new[i] * bi_j
             denom = max(1.0 - xy, 1e-15)
-            D_in[i] += beta_out_new[j] / denom
+            acc += beta_out_new[i] / denom
+        D_in[j] = acc
 
+    # ── Compute beta_in_new ──
+    s_in_hat_upd = np.empty(N)
     beta_in_new = np.empty(N)
-    for i in range(N):
-        if D_in[i] > 0:
-            beta_in_new[i] = s_in[i] / D_in[i]
-        else:
-            beta_in_new[i] = beta_in[i]
+    for i in numba.prange(N):
+        s_in_hat_upd[i] = beta_in[i] * D_in[i]
+        beta_in_new[i] = s_in[i] / D_in[i] if D_in[i] > 0 else beta_in[i]
 
     # Newton fallback for in-direction
     if use_newton_fallback:
-        for i in range(N):
-            s_in_hat_cur = beta_in[i] * D_in[i]
+        for i in numba.prange(N):
             b_clamped = max(min(beta_in_new[i], 1.0 - 1e-15), 1e-300)
             theta_fp = _clamp(-math.log(b_clamped), ETA_MIN, ETA_MAX)
             if abs(theta_fp - theta_in[i]) > FP_NEWTON_FALLBACK_DELTA:
-                s_hat = max(s_in_hat_cur, 1e-30)
-                delta = _clamp((s_in_hat_cur - s_in[i]) / s_hat, -max_step, max_step)
+                s_hat = max(s_in_hat_upd[i], 1e-30)
+                delta = _clamp((s_in_hat_upd[i] - s_in[i]) / s_hat, -max_step, max_step)
                 theta_nt = _clamp(theta_in[i] + delta, ETA_MIN, ETA_MAX)
                 beta_in_new[i] = math.exp(-theta_nt)
 
-    for i in range(N):
+    for i in numba.prange(N):
         beta_in_new[i] = max(min(beta_in_new[i], 1.0 - 1e-15), 1e-300)
 
     return beta_out_new, beta_in_new, F_out, F_in
@@ -376,7 +461,7 @@ def _dwcm_fp_gs_numba(
 # aDECM kernels
 # ═══════════════════════════════════════════════════════════════════════════
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _adecm_theta_newton_numba(
     theta_beta_out: np.ndarray,
     theta_beta_in: np.ndarray,
@@ -391,99 +476,116 @@ def _adecm_theta_newton_numba(
     Z_NEWTON_FLOOR: float,
     Z_NEWTON_FRAC: float,
 ) -> tuple:  # pragma: no cover
-    """θ-Newton GS step for the aDECM weight equations (scalar loops).
+    """θ-Newton GS step for the aDECM weight equations (parallel scalar loops).
 
     Returns ``(theta_beta_out_new, theta_beta_in_new, F_out, F_in)``.
     """
     N = theta_beta_out.shape[0]
 
-    # ── Pass 1: out-direction ──
-    F_out = np.zeros(N)
-    h_out = np.zeros(N)
-    F_in_current = np.zeros(N)
+    # Precompute global min/second-min of theta_beta_in for z-floor (O(N) total)
+    idx_min_in, val_min_in, val_2nd_in = _min2(theta_beta_in)
 
-    for i in range(N):
+    # ── Pass 1, row-sum (parallel over i): F_out, h_out ──
+    F_out = np.empty(N)
+    h_out = np.empty(N)
+    for i in numba.prange(N):
+        acc_f = 0.0
+        acc_h = 0.0
+        tbo_i = theta_beta_out[i]
+        tto_i = theta_topo_out[i]
         for j in range(N):
             if i == j:
                 continue
-            # p_ij = sigmoid(-θ_topo_out_i - θ_topo_in_j)
-            logit = -theta_topo_out[i] - theta_topo_in[j]
+            logit = -tto_i - theta_topo_in[j]
             p = 1.0 / (1.0 + math.exp(-logit))
-
-            z = theta_beta_out[i] + theta_beta_in[j]
+            z = tbo_i + theta_beta_in[j]
             z_safe = max(z, Z_G_CLAMP)
-            # G = 1/(1-exp(-z)) = -1/expm1(-z)  (NOT 1/expm1(z)!)
-            em1_neg = _expm1(-z_safe)  # exp(-z) - 1, negative
+            em1_neg = _expm1(-z_safe)
             G = -1.0 / em1_neg if em1_neg < -1e-300 else 1e15
-
             pG = p * G
-            F_out[i] += pG
-            h_out[i] -= p * G * (G - 1.0)  # derivative: -G(G-1)
-            F_in_current[j] += pG
+            acc_f += pG
+            acc_h -= p * G * (G - 1.0)
+        F_out[i] = acc_f - s_out[i]
+        h_out[i] = acc_h
 
+    # ── Pass 1, col-sum (parallel over j): F_in at old θ ──
+    F_in_current = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        tbi_j = theta_beta_in[j]
+        tti_j = theta_topo_in[j]
+        for i in range(N):
+            if i == j:
+                continue
+            logit = -theta_topo_out[i] - tti_j
+            p = 1.0 / (1.0 + math.exp(-logit))
+            z = theta_beta_out[i] + tbi_j
+            z_safe = max(z, Z_G_CLAMP)
+            em1_neg = _expm1(-z_safe)
+            G = -1.0 / em1_neg if em1_neg < -1e-300 else 1e15
+            acc += p * G
+        F_in_current[j] = acc - s_in[j]
+
+    # ── Update θ_β_out (z-floor via precomputed min) ──
     theta_beta_out_new = np.empty(N)
-    for i in range(N):
-        F_out[i] -= s_out[i]
+    for i in numba.prange(N):
         if s_out[i] == 0.0:
             theta_beta_out_new[i] = ETA_MAX
         else:
             denom = h_out[i] - 1e-30
             delta = _clamp(-F_out[i] / denom, -max_step, max_step)
             new_val = theta_beta_out[i] + delta
-            # z-floor line search
-            min_in = ETA_MAX
-            for j in range(N):
-                if j != i and theta_beta_in[j] < min_in:
-                    min_in = theta_beta_in[j]
+            # z-floor: use precomputed min (O(1) per node)
+            min_in = val_2nd_in if i == idx_min_in else val_min_in
             z_floor = max(Z_NEWTON_FLOOR, theta_beta_out[i] * Z_NEWTON_FRAC)
-            min_allowed = z_floor - min_in
-            new_val = max(new_val, min_allowed)
+            new_val = max(new_val, z_floor - min_in)
             theta_beta_out_new[i] = _clamp(new_val, -ETA_MAX, ETA_MAX)
 
-    # ── Pass 2: in-direction with updated θ_β_out ──
-    F_in2 = np.zeros(N)
-    h_in = np.zeros(N)
+    # Precompute global min/second-min of theta_beta_out_new for in-direction z-floor
+    idx_min_out_new, val_min_out_new, val_2nd_out_new = _min2(theta_beta_out_new)
 
-    for i in range(N):
-        for j in range(N):
+    # ── Pass 2, col-sum (parallel over j): F_in, h_in with new θ_β_out ──
+    F_in2 = np.empty(N)
+    h_in = np.empty(N)
+    for j in numba.prange(N):
+        acc_f = 0.0
+        acc_h = 0.0
+        tbi_j = theta_beta_in[j]
+        tti_j = theta_topo_in[j]
+        for i in range(N):
             if i == j:
                 continue
-            logit = -theta_topo_out[i] - theta_topo_in[j]
+            logit = -theta_topo_out[i] - tti_j
             p = 1.0 / (1.0 + math.exp(-logit))
-
-            z = theta_beta_out_new[i] + theta_beta_in[j]
+            z = theta_beta_out_new[i] + tbi_j
             z_safe = max(z, Z_G_CLAMP)
-            # G = 1/(1-exp(-z))
             em1_neg = _expm1(-z_safe)
             G = -1.0 / em1_neg if em1_neg < -1e-300 else 1e15
-
             pG = p * G
-            F_in2[j] += pG
-            h_in[j] -= p * G * (G - 1.0)
+            acc_f += pG
+            acc_h -= p * G * (G - 1.0)
+        F_in2[j] = acc_f - s_in[j]
+        h_in[j] = acc_h
 
+    # ── Update θ_β_in ──
     theta_beta_in_new = np.empty(N)
-    for j in range(N):
-        F_in2[j] -= s_in[j]
-        F_in_current[j] -= s_in[j]
+    for j in numba.prange(N):
         if s_in[j] == 0.0:
             theta_beta_in_new[j] = ETA_MAX
         else:
             denom = h_in[j] - 1e-30
             delta = _clamp(-F_in2[j] / denom, -max_step, max_step)
             new_val = theta_beta_in[j] + delta
-            min_out = ETA_MAX
-            for i in range(N):
-                if i != j and theta_beta_out_new[i] < min_out:
-                    min_out = theta_beta_out_new[i]
+            # z-floor using precomputed min of θ_β_out_new
+            min_out = val_2nd_out_new if j == idx_min_out_new else val_min_out_new
             z_floor = max(Z_NEWTON_FLOOR, theta_beta_in[j] * Z_NEWTON_FRAC)
-            min_allowed = z_floor - min_out
-            new_val = max(new_val, min_allowed)
+            new_val = max(new_val, z_floor - min_out)
             theta_beta_in_new[j] = _clamp(new_val, -ETA_MAX, ETA_MAX)
 
     return theta_beta_out_new, theta_beta_in_new, F_out, F_in_current
 
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _adecm_fp_gs_numba(
     beta_out: np.ndarray,
     beta_in: np.ndarray,
@@ -500,40 +602,56 @@ def _adecm_fp_gs_numba(
     FP_NEWTON_FALLBACK_DELTA: float,
     use_newton_fallback: bool,
 ) -> tuple:  # pragma: no cover
-    """Gauss-Seidel FP step for the aDECM weight equations (scalar loops).
+    """Gauss-Seidel FP step for the aDECM weight equations (parallel scalar loops).
 
     Returns ``(beta_out_new, beta_in_new, F_out, F_in)``.
     """
     N = beta_out.shape[0]
-    s_out_hat = np.zeros(N)
-    s_in_hat_orig = np.zeros(N)
 
-    for i in range(N):
+    # ── Pass 1, row-sum (parallel over i): s_out_hat ──
+    s_out_hat = np.empty(N)
+    for i in numba.prange(N):
+        acc = 0.0
+        bo_i = beta_out[i]
+        tto_i = theta_topo_out[i]
         for j in range(N):
             if i == j:
                 continue
-            logit = -theta_topo_out[i] - theta_topo_in[j]
+            logit = -tto_i - theta_topo_in[j]
             p = 1.0 / (1.0 + math.exp(-logit))
-            xy = beta_out[i] * beta_in[j]
+            xy = bo_i * beta_in[j]
             denom = max(1.0 - min(xy, Q_MAX), 1e-8)
-            val = p / denom
-            s_out_hat[i] += val
-            s_in_hat_orig[j] += val
+            acc += p / denom
+        s_out_hat[i] = acc
 
+    # ── Pass 1, col-sum (parallel over j): s_in_hat_orig ──
+    s_in_hat_orig = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        bi_j = beta_in[j]
+        tti_j = theta_topo_in[j]
+        for i in range(N):
+            if i == j:
+                continue
+            logit = -theta_topo_out[i] - tti_j
+            p = 1.0 / (1.0 + math.exp(-logit))
+            xy = beta_out[i] * bi_j
+            denom = max(1.0 - min(xy, Q_MAX), 1e-8)
+            acc += p / denom
+        s_in_hat_orig[j] = acc
+
+    # ── Compute beta_out_new, F_out, F_in ──
+    beta_out_new = np.empty(N)
     F_out = np.empty(N)
     F_in = np.empty(N)
-    beta_out_new = np.empty(N)
-    for i in range(N):
+    for i in numba.prange(N):
         F_out[i] = s_out_hat[i] - s_out[i]
         F_in[i] = s_in_hat_orig[i] - s_in[i]
-        if s_out_hat[i] > 0:
-            beta_out_new[i] = beta_out[i] * s_out[i] / s_out_hat[i]
-        else:
-            beta_out_new[i] = beta_out[i]
+        beta_out_new[i] = beta_out[i] * s_out[i] / s_out_hat[i] if s_out_hat[i] > 0 else beta_out[i]
 
     # Newton fallback for out-direction
     if use_newton_fallback:
-        for i in range(N):
+        for i in numba.prange(N):
             b_clamped = max(min(beta_out_new[i], 1.0 - 1e-15), 1e-300)
             theta_fp = _clamp(-math.log(b_clamped), -ETA_MAX, ETA_MAX)
             if abs(theta_fp - theta_beta_out[i]) > FP_NEWTON_FALLBACK_DELTA:
@@ -542,30 +660,33 @@ def _adecm_fp_gs_numba(
                 theta_nt = _clamp(theta_beta_out[i] + delta, -ETA_MAX, ETA_MAX)
                 beta_out_new[i] = math.exp(-theta_nt)
 
-    for i in range(N):
+    for i in numba.prange(N):
         beta_out_new[i] = max(min(beta_out_new[i], 1.0 - 1e-15), 1e-300)
 
-    # GS: use updated β_out for D_in
-    s_in_hat = np.zeros(N)
-    for j in range(N):
+    # ── Pass 2, col-sum (parallel over j): s_in_hat with updated β_out ──
+    s_in_hat = np.empty(N)
+    for j in numba.prange(N):
+        acc = 0.0
+        bi_j = beta_in[j]
+        tti_j = theta_topo_in[j]
         for i in range(N):
-            if j == i:
+            if i == j:
                 continue
-            logit = -theta_topo_out[j] - theta_topo_in[i]
+            logit = -theta_topo_out[i] - tti_j
             p = 1.0 / (1.0 + math.exp(-logit))
-            xy = beta_out_new[j] * beta_in[i]
+            xy = beta_out_new[i] * bi_j
             denom = max(1.0 - min(xy, Q_MAX), 1e-8)
-            s_in_hat[i] += p / denom
+            acc += p / denom
+        s_in_hat[j] = acc
 
+    # ── Compute beta_in_new ──
     beta_in_new = np.empty(N)
-    for i in range(N):
-        if s_in_hat[i] > 0:
-            beta_in_new[i] = beta_in[i] * s_in[i] / s_in_hat[i]
-        else:
-            beta_in_new[i] = beta_in[i]
+    for i in numba.prange(N):
+        beta_in_new[i] = beta_in[i] * s_in[i] / s_in_hat[i] if s_in_hat[i] > 0 else beta_in[i]
 
+    # Newton fallback for in-direction
     if use_newton_fallback:
-        for i in range(N):
+        for i in numba.prange(N):
             b_clamped = max(min(beta_in_new[i], 1.0 - 1e-15), 1e-300)
             theta_fp = _clamp(-math.log(b_clamped), -ETA_MAX, ETA_MAX)
             if abs(theta_fp - theta_beta_in[i]) > FP_NEWTON_FALLBACK_DELTA:
@@ -574,7 +695,7 @@ def _adecm_fp_gs_numba(
                 theta_nt = _clamp(theta_beta_in[i] + delta, -ETA_MAX, ETA_MAX)
                 beta_in_new[i] = math.exp(-theta_nt)
 
-    for i in range(N):
+    for i in numba.prange(N):
         beta_in_new[i] = max(min(beta_in_new[i], 1.0 - 1e-15), 1e-300)
 
     return beta_out_new, beta_in_new, F_out, F_in
@@ -584,7 +705,7 @@ def _adecm_fp_gs_numba(
 # DECM kernels
 # ═══════════════════════════════════════════════════════════════════════════
 
-@numba.njit(cache=True, fastmath=False)
+@numba.njit(cache=True, fastmath=False, parallel=True)
 def _decm_step_numba(
     theta_out: np.ndarray,
     theta_in: np.ndarray,
@@ -605,67 +726,67 @@ def _decm_step_numba(
     Z_NEWTON_FLOOR: float,
     Z_NEWTON_FRAC: float,
 ) -> tuple:  # pragma: no cover
-    """Alternating GS-Newton step for the DECM (scalar loops).
+    """Alternating GS-Newton step for the DECM (parallel scalar loops).
 
     Returns ``(theta_out_new, theta_in_new, eta_out_new, eta_in_new,
                F_k_out, F_k_in, F_s_out, F_s_in)``.
     """
     N = theta_out.shape[0]
 
-    # ── Pass 1: compute sums at current state ──
-    k_out_hat = np.zeros(N)
-    k_in_hat = np.zeros(N)
-    s_out_hat = np.zeros(N)
-    s_in_hat = np.zeros(N)
+    # Precompute global min/second-min of eta_in for z-floor (O(N))
+    idx_min_eta_in, val_min_eta_in, val_2nd_eta_in = _min2(eta_in)
 
-    H_k_out = np.zeros(N)
-    H_s_out = np.zeros(N)
-
-    for i in range(N):
+    # ── Pass 1, row-sum (parallel over i): out-direction quantities ──
+    k_out_hat = np.empty(N)
+    s_out_hat = np.empty(N)
+    H_k_out = np.empty(N)
+    H_s_out = np.empty(N)
+    for i in numba.prange(N):
+        acc_k = 0.0
+        acc_s = 0.0
+        acc_hk = 0.0
+        acc_hs = 0.0
+        to_i = theta_out[i]
+        eo_i = eta_out[i]
         for j in range(N):
             if i == j:
                 continue
-            eta = eta_out[i] + eta_in[j]
+            eta = eo_i + eta_in[j]
             eta_safe = max(eta, Z_G_CLAMP)
             em1 = _expm1(eta_safe)
             G = 1.0 / em1 if em1 > 0 else 1e15
             log_q = -math.log(em1) if em1 > 1e-300 else 300.0
-            logit_p = -theta_out[i] - theta_in[j] + log_q
-            # sigmoid
+            logit_p = -to_i - theta_in[j] + log_q
             if logit_p >= 0:
                 p = 1.0 / (1.0 + math.exp(-logit_p))
             else:
                 ep = math.exp(logit_p)
                 p = ep / (1.0 + ep)
-
-            k_out_hat[i] += p
-            k_in_hat[j] += p
+            acc_k += p
             pG = p * G
-            s_out_hat[i] += pG
-            s_in_hat[j] += pG
-
+            acc_s += pG
             pq = p * (1.0 - p)
-            H_k_out[i] += pq
-            pGG1 = p * G * (G - 1.0)
-            corr = pq * G * G
-            H_s_out[i] += pGG1 + corr
+            acc_hk += pq
+            acc_hs += p * G * (G - 1.0) + pq * G * G
+        k_out_hat[i] = acc_k
+        s_out_hat[i] = acc_s
+        H_k_out[i] = acc_hk
+        H_s_out[i] = acc_hs
 
     # ── Update θ_out and η_out ──
     theta_out_new = np.empty(N)
     eta_out_new = np.empty(N)
     F_k_out = np.empty(N)
     F_s_out = np.empty(N)
-
-    for i in range(N):
+    for i in numba.prange(N):
         F_k_out[i] = k_out_hat[i] - k_out[i]
         F_s_out[i] = s_out_hat[i] - s_out[i]
 
         hk = max(H_k_out[i], 1e-15)
         delta_theta = _clamp(F_k_out[i] / hk, -max_step, max_step)
-        if zero_k_out[i]:
-            theta_out_new[i] = THETA_MAX
-        else:
-            theta_out_new[i] = _clamp(theta_out[i] + delta_theta, -THETA_MAX, THETA_MAX)
+        theta_out_new[i] = THETA_MAX if zero_k_out[i] else _clamp(
+            theta_out[i] + delta_theta, -THETA_MAX, THETA_MAX
+        )
 
         hs = max(H_s_out[i], 1e-15)
         delta_eta = _clamp(F_s_out[i] / hs, -max_step, max_step)
@@ -673,77 +794,79 @@ def _decm_step_numba(
             eta_out_new[i] = ETA_MAX
         else:
             new_eta = eta_out[i] + delta_eta
-            # z-floor
-            min_in = ETA_MAX
-            for j in range(N):
-                if j != i and eta_in[j] < min_in:
-                    min_in = eta_in[j]
+            # z-floor: O(1) per node via precomputed min
+            min_in = val_2nd_eta_in if i == idx_min_eta_in else val_min_eta_in
             z_floor = max(Z_NEWTON_FLOOR, eta_out[i] * Z_NEWTON_FRAC)
-            min_allowed = z_floor - min_in
-            new_eta = max(new_eta, min_allowed)
+            new_eta = max(new_eta, z_floor - min_in)
             eta_out_new[i] = _clamp(new_eta, Z_G_CLAMP, ETA_MAX)
 
-    # ── Pass 2: recompute col sums with updated θ_out, η_out ──
-    k_in_hat2 = np.zeros(N)
-    s_in_hat2 = np.zeros(N)
-    H_k_in = np.zeros(N)
-    H_s_in = np.zeros(N)
+    # Precompute min of eta_out_new for in-direction z-floor
+    idx_min_eta_out_new, val_min_eta_out_new, val_2nd_eta_out_new = _min2(eta_out_new)
 
-    for i in range(N):
-        for j in range(N):
+    # ── Pass 2, col-sum (parallel over j): in-direction quantities ──
+    k_in_hat2 = np.empty(N)
+    s_in_hat2 = np.empty(N)
+    H_k_in = np.empty(N)
+    H_s_in = np.empty(N)
+    for j in numba.prange(N):
+        acc_k = 0.0
+        acc_s = 0.0
+        acc_hk = 0.0
+        acc_hs = 0.0
+        ti_j = theta_in[j]
+        ei_j = eta_in[j]
+        for i in range(N):
             if i == j:
                 continue
-            eta = eta_out_new[i] + eta_in[j]
+            eta = eta_out_new[i] + ei_j
             eta_safe = max(eta, Z_G_CLAMP)
             em1 = _expm1(eta_safe)
             G = 1.0 / em1 if em1 > 0 else 1e15
             log_q = -math.log(em1) if em1 > 1e-300 else 300.0
-            logit_p = -theta_out_new[i] - theta_in[j] + log_q
+            logit_p = -theta_out_new[i] - ti_j + log_q
             if logit_p >= 0:
                 p = 1.0 / (1.0 + math.exp(-logit_p))
             else:
                 ep = math.exp(logit_p)
                 p = ep / (1.0 + ep)
-
-            k_in_hat2[j] += p
-            s_in_hat2[j] += p * G
-
+            acc_k += p
+            pG = p * G
+            acc_s += pG
             pq = p * (1.0 - p)
-            H_k_in[j] += pq
-            H_s_in[j] += p * G * (G - 1.0) + pq * G * G
+            acc_hk += pq
+            acc_hs += p * G * (G - 1.0) + pq * G * G
+        k_in_hat2[j] = acc_k
+        s_in_hat2[j] = acc_s
+        H_k_in[j] = acc_hk
+        H_s_in[j] = acc_hs
 
     # ── Update θ_in and η_in ──
     theta_in_new = np.empty(N)
     eta_in_new = np.empty(N)
     F_k_in = np.empty(N)
     F_s_in = np.empty(N)
+    for j in numba.prange(N):
+        F_k_in[j] = k_in_hat2[j] - k_in[j]
+        F_s_in[j] = s_in_hat2[j] - s_in[j]
 
-    for i in range(N):
-        F_k_in[i] = k_in_hat[i] - k_in[i]
-        F_s_in[i] = s_in_hat[i] - s_in[i]
-
-    for j in range(N):
         hk = max(H_k_in[j], 1e-15)
-        delta_theta = _clamp((k_in_hat2[j] - k_in[j]) / hk, -max_step, max_step)
-        if zero_k_in[j]:
-            theta_in_new[j] = THETA_MAX
-        else:
-            theta_in_new[j] = _clamp(theta_in[j] + delta_theta, -THETA_MAX, THETA_MAX)
+        delta_theta = _clamp(F_k_in[j] / hk, -max_step, max_step)
+        theta_in_new[j] = THETA_MAX if zero_k_in[j] else _clamp(
+            theta_in[j] + delta_theta, -THETA_MAX, THETA_MAX
+        )
 
         hs = max(H_s_in[j], 1e-15)
-        delta_eta = _clamp((s_in_hat2[j] - s_in[j]) / hs, -max_step, max_step)
+        delta_eta = _clamp(F_s_in[j] / hs, -max_step, max_step)
         if zero_s_in[j]:
             eta_in_new[j] = ETA_MAX
         else:
             new_eta = eta_in[j] + delta_eta
-            min_out = ETA_MAX
-            for i in range(N):
-                if i != j and eta_out_new[i] < min_out:
-                    min_out = eta_out_new[i]
+            # z-floor: O(1) per node via precomputed min of eta_out_new
+            min_out = val_2nd_eta_out_new if j == idx_min_eta_out_new else val_min_eta_out_new
             z_floor = max(Z_NEWTON_FLOOR, eta_in[j] * Z_NEWTON_FRAC)
-            min_allowed = z_floor - min_out
-            new_eta = max(new_eta, min_allowed)
+            new_eta = max(new_eta, z_floor - min_out)
             eta_in_new[j] = _clamp(new_eta, Z_G_CLAMP, ETA_MAX)
 
     return (theta_out_new, theta_in_new, eta_out_new, eta_in_new,
             F_k_out, F_k_in, F_s_out, F_s_in)
+

@@ -579,6 +579,7 @@ class DECMModel:
         anderson_depth: int = 10,
         multi_start: bool = True,
         backend: str = "auto",
+        num_threads: int = 0,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -607,6 +608,9 @@ class DECMModel:
             backend:       Compute backend: ``"auto"`` (default), ``"pytorch"``,
                            or ``"numba"``.  ``"auto"`` uses PyTorch for
                            N ≤ 5 000 and Numba for larger networks.
+            num_threads:   Number of Numba parallel threads. 0 (default) leaves
+                           the global Numba thread count unchanged. Only has
+                           effect when Numba is selected as the backend.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -631,6 +635,7 @@ class DECMModel:
                 anderson_depth=anderson_depth,
                 max_time=max_time,
                 backend=backend,
+                num_threads=num_threads,
             )
 
         self.ic = self.initial_theta(ic)

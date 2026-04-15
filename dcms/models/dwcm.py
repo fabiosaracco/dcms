@@ -392,7 +392,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic:str='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto')-> SolverResult:
+    def solve_tool(self, ic:str='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -404,13 +404,16 @@ class DWCMModel:
             backend (str): Compute backend: ``"auto"`` (default), ``"pytorch"``,
                 or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
                 Numba for larger networks.
+            num_threads (int): Number of Numba parallel threads. 0 (default) leaves
+                the global Numba thread count unchanged. Only has effect when Numba
+                is selected as the backend.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
         """
         self.ic=self.initial_theta(ic)
         from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
-        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend)
+        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads)
         if len(self.sol.message)>0:
             print(self.sol.message)
             

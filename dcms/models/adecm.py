@@ -608,7 +608,7 @@ class ADECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto')-> SolverResult:
+    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -621,6 +621,9 @@ class ADECMModel:
             backend (str): Compute backend: ``"auto"`` (default), ``"pytorch"``,
                 or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
                 Numba for larger networks.
+            num_threads (int): Number of Numba parallel threads. 0 (default) leaves
+                the global Numba thread count unchanged. Only has effect when Numba
+                is selected as the backend.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
@@ -628,7 +631,7 @@ class ADECMModel:
         # Step 1: solve the DCM topology
         self.ic_topo=self.initial_theta_topo(ic_topo)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-        self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend)
+        self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads)
         
         if len(self.sol_topo.message)>0:
             print(f'Topology: {self.sol_topo.message}')
@@ -642,7 +645,7 @@ class ADECMModel:
         res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
 
         from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm  # lazy import to avoid circular dependency
-        self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend)
+        self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads)
         if len(self.sol_weights.message)>0:
             print(f'Weights: {self.sol_weights.message}')
 

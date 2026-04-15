@@ -17,7 +17,8 @@ class SolverResult:
         iterations: Number of update steps performed.
         residuals: History of the ℓ∞ residual norm, one entry per accepted step.
         elapsed_time: Wall-clock time in seconds.
-        peak_ram_bytes: Peak RAM usage in bytes (measured via tracemalloc).
+        peak_ram_bytes: Peak RSS increase in bytes during the solver run
+                        (measured via psutil, OS-level resident set size).
         message: Human-readable convergence message.
     """
 

@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import math
 import time
-import tracemalloc
 from typing import Callable
 
 import torch
@@ -47,6 +46,7 @@ import torch
 from dcms.models.parameters import DCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK
 from dcms.solvers.base import SolverResult
+from dcms.utils.profiling import _PeakRAMMonitor
 
 _ETA_MIN: float = 1e-10
 _ETA_MAX: float = 50.0
@@ -401,7 +401,8 @@ def solve_fixed_point_dcm(
     else:
         effective_chunk = chunk_size
 
-    tracemalloc.start()
+    _peak_ram_monitor = _PeakRAMMonitor()
+    _peak_ram_monitor.__enter__()
     t0 = time.perf_counter()
 
     n_iter = 0
@@ -613,8 +614,8 @@ def solve_fixed_point_dcm(
             theta = theta_next
     finally:
         elapsed = time.perf_counter() - t0
-        _, peak_ram = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+        _peak_ram_monitor.__exit__(None, None, None)
+        peak_ram = _peak_ram_monitor.peak_bytes
 
     return SolverResult(
         theta=best_theta.detach().numpy(),

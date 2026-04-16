@@ -58,6 +58,43 @@ AUTO_NUMBA_THRESHOLD: int = 50_000
 BackendStr = Literal["auto", "pytorch", "numba"]
 
 
+def get_available_cpu_count() -> int:
+    """Return the number of CPUs available to the current process.
+
+    Uses :func:`os.sched_getaffinity` on Linux (respects ``taskset`` /
+    ``cgroups`` / container CPU quotas).  Falls back to
+    :func:`os.cpu_count` on platforms where ``sched_getaffinity`` is not
+    available (macOS, Windows).
+
+    Returns:
+        Number of CPUs available to this process, at least 1.
+    """
+    import os
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def resolve_num_threads(num_threads: int) -> int:
+    """Resolve a ``num_threads`` request to a safe value.
+
+    Args:
+        num_threads: Requested number of threads.  ``0`` means *auto*
+            (use all CPUs available to the process).  Positive values are
+            clamped to :func:`get_available_cpu_count` to avoid
+            ``libgomp: Thread creation failed`` errors on shared / resource-
+            limited servers.
+
+    Returns:
+        A safe thread count in ``[1, get_available_cpu_count()]``.
+    """
+    avail = get_available_cpu_count()
+    if num_threads <= 0:
+        return avail
+    return min(num_threads, avail)
+
+
 def resolve_backend(
     backend: BackendStr = "auto",
     N: int = 0,

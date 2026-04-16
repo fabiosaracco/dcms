@@ -404,8 +404,11 @@ class DWCMModel:
             backend (str): Compute backend: ``"auto"`` (default), ``"pytorch"``,
                 or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
                 Numba for larger networks.
-            num_threads (int): Number of Numba parallel threads. 0 (default) leaves
-                the global Numba thread count unchanged. Only has effect when Numba
+            num_threads (int): Number of Numba parallel threads. 0 (default)
+                means *auto*: uses all CPUs available to the current process
+                (respects ``taskset``/cgroup quotas on Linux). Positive values
+                are clamped to the available CPU count to avoid thread-creation
+                errors on resource-limited servers. Only has effect when Numba
                 is selected as the backend.
 
         Returns:

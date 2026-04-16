@@ -592,10 +592,11 @@ def solve_fixed_point_decm(
     if _use_numba:
         import numpy as np
         from dcms.solvers._numba_kernels import _decm_step_numba
-        if num_threads > 0:
-            import numba as _numba_mod
-            _prev_numba_threads = _numba_mod.get_num_threads()
-            _numba_mod.set_num_threads(num_threads)
+        from dcms.utils.backend import resolve_num_threads as _rnt
+        _safe_threads = _rnt(num_threads)
+        import numba as _numba_mod
+        _prev_numba_threads = _numba_mod.get_num_threads()
+        _numba_mod.set_num_threads(_safe_threads)
 
     # Decide chunked vs dense (PyTorch path only)
     if chunk_size == 0:

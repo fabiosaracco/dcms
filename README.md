@@ -278,6 +278,7 @@ converged = model.solve_tool(
     variant="theta-newton", # "theta-newton" (default) or "gauss-seidel"
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
+    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -305,6 +306,7 @@ converged = model.solve_tool(
     variant="theta-newton",
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
+    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -345,6 +347,7 @@ converged = model.solve_tool(
     variant="theta-newton",
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
+    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
 )
 # solve_tool returns True if *both* topology and weight steps converged
 theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
@@ -386,6 +389,7 @@ converged = model.solve_tool(
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
+    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
@@ -484,13 +488,13 @@ result = solve_fixed_point_dcm(
 
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 
-### 3.8 Compute backend
+### 3.8 Compute backend and parallelism
 
 All solvers accept a `backend` parameter that controls which compute engine executes the N×N inner loops:
 
 | Value | Behaviour |
 |-------|-----------|
-| `"auto"` (default) | PyTorch dense for N ≤ 5 000; Numba scalar loops for N > 5 000. |
+| `"auto"` (default) | PyTorch dense/chunked for N ≤ 50 000; Numba parallel scalar loops for N > 50 000. |
 | `"pytorch"` | Always use PyTorch (dense or chunked depending on N). |
 | `"numba"` | Always use Numba JIT-compiled scalar loops. |
 
@@ -498,8 +502,17 @@ All solvers accept a `backend` parameter that controls which compute engine exec
 
 **Why two backends?**
 
-* **PyTorch** is a hard dependency and is always available.  For small N it is very fast because it materialises the full N×N matrix once and uses vectorised operations.  For large N the chunked variant avoids OOM but still allocates `chunk × N` temporary tensors.
-* **Numba** (optional: `pip install numba`) compiles the update loop to native code with O(N) peak memory.  For N > 5 000 it is typically faster and uses far less RAM than chunked PyTorch.
+* **PyTorch** is a hard dependency and is always available.  For small N it is very fast because it materialises the full N×N matrix once and uses vectorised operations.  For large N the chunked variant avoids OOM but still allocates `chunk × N` temporary tensors.  At N = 30 000 the chunked path uses ≈ 0.7 GB peak RAM and is ≈ 3.5× faster than Numba.
+* **Numba** (optional: `pip install numba`) compiles the update loop to native code with O(N) peak memory.  All kernels are parallelised with `prange` (OpenMP/TBB) so they can use multiple CPU cores.  For N > 50 000 it is the only option that keeps RAM under control.
+
+**Controlling the number of threads (Numba only).**  Each `solve_tool()` accepts a `num_threads` parameter:
+
+```python
+model.solve_tool(backend="numba", num_threads=4)   # use 4 threads
+model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to the process
+```
+
+`num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
 
 To install with Numba support:
 

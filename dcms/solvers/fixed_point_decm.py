@@ -719,9 +719,9 @@ def solve_fixed_point_decm(
                 )
                 print(
                     f"[{datetime.datetime.now():%H:%M:%S}] "
-                    f"iteration={n_iter}, "
-                    f"elapsed time={int(_elapsed // 3600):d}:{int((_elapsed % 3600) // 60):d}:{_elapsed % 60:.0f}, "
-                    f"MRE_topo={_mre_topo:.3e}, MRE_weights={_mre_weights:.3e}"
+                    f"iteration={n_iter:5d}, "
+                    f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
+                    f"MRE_topo={_mre_topo:.2e}, MRE_weights={_mre_weights:.2e}"
                 )
                 sys.stdout.flush()
 

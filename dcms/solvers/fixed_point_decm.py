@@ -670,9 +670,8 @@ def solve_fixed_point_decm(
     _and_r: list[torch.Tensor] = []
     _best_res_for_anderson: float = float("inf")
 
-    # Precompute verbose targets once (MRE = max |F_i| / constraint_i)
+    # Precompute verbose targets once (split into topo and weights parts)
     _v_targets = torch.cat([k_out, k_in, s_out, s_in])
-    _v_nonzero = _v_targets > 0
 
     try:
         for _ in range(max_iter):
@@ -705,15 +704,24 @@ def solve_fixed_point_decm(
 
             if verbose:
                 _elapsed = time.perf_counter() - t0
-                _mre = (
-                    (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
-                    if _v_nonzero.any() else float("nan")
+                _N = len(k_out)
+                _topo_targets = _v_targets[:2 * _N]
+                _topo_nz = _topo_targets > 0
+                _weights_targets = _v_targets[2 * _N:]
+                _weights_nz = _weights_targets > 0
+                _mre_topo = (
+                    (F_current[:2 * _N].abs()[_topo_nz] / _topo_targets[_topo_nz]).max().item()
+                    if _topo_nz.any() else float("nan")
+                )
+                _mre_weights = (
+                    (F_current[2 * _N:].abs()[_weights_nz] / _weights_targets[_weights_nz]).max().item()
+                    if _weights_nz.any() else float("nan")
                 )
                 print(
                     f"[{datetime.datetime.now():%H:%M:%S}] "
                     f"iteration={n_iter}, "
                     f"elapsed time={int(_elapsed // 3600):d}:{int((_elapsed % 3600) // 60):d}:{_elapsed % 60:.0f}, "
-                    f"MRE={_mre:.3e}"
+                    f"MRE_topo={_mre_topo:.3e}, MRE_weights={_mre_weights:.3e}"
                 )
                 sys.stdout.flush()
 

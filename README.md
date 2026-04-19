@@ -521,13 +521,17 @@ model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to
 **Verbose iteration logging.**  Each `solve_tool()` accepts a `verbose` parameter that, when set to `True`, prints a timestamped progress line at every iteration:
 
 ```python
+# DCM / DWCM / aDECM (single-type MRE per step)
 model.solve_tool(verbose=True)
-# [14:32:07] iteration=1, elapsed time=0:0:0, MRE=4.521e-02
-# [14:32:07] iteration=2, elapsed time=0:0:0, MRE=1.834e-03
-# ...
+# [14:32:07] iteration=1, elapsed time=0:0:0, MRE_topo=4.521e-02    ← DCM / aDECM topology step
+# [14:32:07] iteration=1, elapsed time=0:0:0, MRE_weights=3.210e-02  ← DWCM / aDECM weight step
+
+# DECM (both topology and weight MRE shown on every line)
+model_de.solve_tool(verbose=True)
+# [14:32:07] iteration=1, elapsed time=0:0:0, MRE_topo=4.521e-02, MRE_weights=3.210e-02
 ```
 
-Each line shows the wall-clock time, the current iteration count, total elapsed time and the **Maximum Relative Error** (MRE) defined as `max_i |F_i(θ)| / constraint_i`.  This is useful for monitoring convergence on large networks where each iteration may take several seconds.
+Each line shows the wall-clock time, iteration count, total elapsed time and the **Maximum Relative Error** (MRE = `max_i |F_i(θ)| / constraint_i`) split by constraint type: `MRE_topo` for degree constraints and `MRE_weights` for strength constraints.  This is useful for monitoring convergence on large networks where each iteration may take several seconds.
 
 To install with Numba support:
 

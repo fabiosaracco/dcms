@@ -519,7 +519,7 @@ def solve_fixed_point_dcm(
                     f"[{datetime.datetime.now():%H:%M:%S}] "
                     f"iteration={n_iter}, "
                     f"elapsed time={int(_elapsed // 3600):d}:{int((_elapsed % 3600) // 60):d}:{_elapsed % 60:.0f}, "
-                    f"MRE={_mre:.3e}"
+                    f"MRE_topo={_mre:.3e}"
                 )
                 sys.stdout.flush()
 

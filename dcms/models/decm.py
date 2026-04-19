@@ -580,6 +580,7 @@ class DECMModel:
         multi_start: bool = True,
         backend: str = "auto",
         num_threads: int = 0,
+        verbose: bool = False,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -615,6 +616,9 @@ class DECMModel:
                            CPU count to avoid thread-creation errors on
                            resource-limited servers. Only has effect when Numba
                            is selected as the backend.
+            verbose:       If ``True``, print a progress line at every iteration
+                           (timestamp, iteration count, elapsed time, MRE).
+                           Default=False.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -640,6 +644,7 @@ class DECMModel:
                 max_time=max_time,
                 backend=backend,
                 num_threads=num_threads,
+                verbose=verbose,
             )
 
         self.ic = self.initial_theta(ic)

@@ -37,7 +37,9 @@ Chunked implementation only — never materialises N×N matrix.
 """
 from __future__ import annotations
 
+import datetime
 import math
+import sys
 import time
 from typing import Callable
 
@@ -331,6 +333,7 @@ def solve_fixed_point_dcm(
     max_time: float = 0.0,
     backend: str = "auto",
     num_threads: int = 0,
+    verbose: bool = False,
 ) -> SolverResult:
     """Fixed-point iteration for the DCM binary model.
 
@@ -358,6 +361,8 @@ def solve_fixed_point_dcm(
         num_threads: Number of Numba parallel threads.  0 (default) leaves
                     the global Numba thread count unchanged.  Only takes
                     effect when ``backend="numba"`` (or ``"auto"`` at large N).
+        verbose:    If ``True``, print a progress line at every iteration
+                    showing timestamp, iteration count, elapsed time, and MRE.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -436,6 +441,10 @@ def solve_fixed_point_dcm(
     _fpgs_best_local: float = float("inf")
     _fpgs_stagnation_count: int = 0
 
+    # Precompute verbose targets once (MRE = max |F_i| / k_i)
+    _v_targets = torch.cat([k_out, k_in])
+    _v_nonzero = _v_targets > 0
+
     try:
         for _ in range(max_iter):
             if max_time > 0 and (time.perf_counter() - t0) > max_time:
@@ -499,6 +508,20 @@ def solve_fixed_point_dcm(
 
             n_iter += 1
             residuals.append(res_norm)
+
+            if verbose:
+                _elapsed = time.perf_counter() - t0
+                _mre = (
+                    (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                    if _v_nonzero.any() else float("nan")
+                )
+                print(
+                    f"[{datetime.datetime.now():%H:%M:%S}] "
+                    f"iteration={n_iter}, "
+                    f"elapsed time={int(_elapsed // 3600):d}:{int((_elapsed % 3600) // 60):d}:{_elapsed % 60:.0f}, "
+                    f"MRE={_mre:.3e}"
+                )
+                sys.stdout.flush()
 
             if res_norm < best_theta_res:
                 best_theta_res = res_norm

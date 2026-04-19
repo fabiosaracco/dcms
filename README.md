@@ -279,6 +279,7 @@ converged = model.solve_tool(
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
+    verbose=False,          # print iteration progress (timestamp, MRE, …)
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -307,6 +308,7 @@ converged = model.solve_tool(
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
+    verbose=False,          # print iteration progress (timestamp, MRE, …)
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -348,6 +350,7 @@ converged = model.solve_tool(
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
+    verbose=False,          # print iteration progress (timestamp, MRE, …)
 )
 # solve_tool returns True if *both* topology and weight steps converged
 theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
@@ -390,6 +393,7 @@ converged = model.solve_tool(
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
+    verbose=False,          # print iteration progress (timestamp, MRE, …)
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
@@ -513,6 +517,17 @@ model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to
 ```
 
 `num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
+
+**Verbose iteration logging.**  Each `solve_tool()` accepts a `verbose` parameter that, when set to `True`, prints a timestamped progress line at every iteration:
+
+```python
+model.solve_tool(verbose=True)
+# [14:32:07] iteration=1, elapsed time=0:0:0, MRE=4.521e-02
+# [14:32:07] iteration=2, elapsed time=0:0:0, MRE=1.834e-03
+# ...
+```
+
+Each line shows the wall-clock time, the current iteration count, total elapsed time and the **Maximum Relative Error** (MRE) defined as `max_i |F_i(θ)| / constraint_i`.  This is useful for monitoring convergence on large networks where each iteration may take several seconds.
 
 To install with Numba support:
 

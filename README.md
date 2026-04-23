@@ -280,6 +280,7 @@ converged = model.solve_tool(
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
+    monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -309,6 +310,7 @@ converged = model.solve_tool(
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
+    monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -351,6 +353,7 @@ converged = model.solve_tool(
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
+    monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
 )
 # solve_tool returns True if *both* topology and weight steps converged
 theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
@@ -394,6 +397,7 @@ converged = model.solve_tool(
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
+    monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
@@ -518,20 +522,31 @@ model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to
 
 `num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
 
-**Verbose iteration logging.**  Each `solve_tool()` accepts a `verbose` parameter that, when set to `True`, prints a timestamped progress line at every iteration:
+**Verbose iteration logging.**  Each `solve_tool()` accepts two related parameters: `verbose` and `monitor`.
 
 ```python
-# DCM / DWCM / aDECM (single-type MRE per step)
-model.solve_tool(verbose=True)
-# [14:32:07] iteration=1, elapsed time=0:0:0, MRE_topo=4.521e-02    ← DCM / aDECM topology step
-# [14:32:07] iteration=1, elapsed time=0:0:0, MRE_weights=3.210e-02  ← DWCM / aDECM weight step
+# Full log — a new line is printed at every iteration (default behaviour):
+model.solve_tool(verbose=True, monitor=False)
+# [14:32:07] iteration=    1, elapsed time=   0:00:00, MRE_topo=4.52e-02
+# [14:32:08] iteration=    2, elapsed time=   0:00:01, MRE_topo=8.13e-03
+# ...
 
-# DECM (both topology and weight MRE shown on every line)
-model_de.solve_tool(verbose=True)
-# [14:32:07] iteration=1, elapsed time=0:0:0, MRE_topo=4.521e-02, MRE_weights=3.210e-02
+# Live monitor — the line is overwritten in place (end='\r'), ideal for terminals:
+model.solve_tool(verbose=True, monitor=True)
+# [14:32:12] iteration=  128, elapsed time=   0:00:05, MRE_topo=1.07e-06   ← updates in place
+
+# DECM shows both MRE components on every line:
+model_de.solve_tool(verbose=True, monitor=True)
+# [14:32:12] iteration=   64, elapsed time=   0:00:10, MRE_topo=4.52e-04, MRE_weights=3.21e-05
 ```
 
-Each line shows the wall-clock time, iteration count, total elapsed time and the **Maximum Relative Error** (MRE = `max_i |F_i(θ)| / constraint_i`) split by constraint type: `MRE_topo` for degree constraints and `MRE_weights` for strength constraints.  This is useful for monitoring convergence on large networks where each iteration may take several seconds.
+| Parameter | Behaviour |
+|-----------|-----------|
+| `verbose=False` (default) | Silent — only prints the final convergence message. |
+| `verbose=True, monitor=False` | Prints one new line per iteration; useful for debugging or file logging. |
+| `verbose=True, monitor=True` | Overwrites the same terminal line (`end='\r'`); ideal for interactive monitoring of long runs. |
+
+Each line shows: wall-clock timestamp, iteration count, total elapsed time, and the **Maximum Relative Error** (MRE = `max_i |F_i(θ)| / constraint_i`) split by type: `MRE_topo` for degree constraints, `MRE_weights` for strength constraints.
 
 To install with Numba support:
 

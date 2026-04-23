@@ -334,6 +334,7 @@ def solve_fixed_point_dcm(
     backend: str = "auto",
     num_threads: int = 0,
     verbose: bool = False,
+    monitor: bool = False,
 ) -> SolverResult:
     """Fixed-point iteration for the DCM binary model.
 
@@ -363,6 +364,10 @@ def solve_fixed_point_dcm(
                     effect when ``backend="numba"`` (or ``"auto"`` at large N).
         verbose:    If ``True``, print a progress line at every iteration
                     showing timestamp, iteration count, elapsed time, and MRE.
+        monitor:    If ``True`` (and ``verbose=True``), overwrite the same
+                    terminal line at each iteration (``end='\\r'``) so only
+                    the latest status is visible.  Useful for long runs where
+                    per-iteration scrolling would be noisy.  Default=False.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -519,7 +524,8 @@ def solve_fixed_point_dcm(
                     f"[{datetime.datetime.now():%H:%M:%S}] "
                     f"iteration={n_iter:5d}, "
                     f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
-                    f"MRE_topo={_mre:.2e}"
+                    f"MRE_topo={_mre:.2e}",
+                    end="\r" if monitor else "\n",
                 )
                 sys.stdout.flush()
 

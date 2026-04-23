@@ -581,6 +581,7 @@ class DECMModel:
         backend: str = "auto",
         num_threads: int = 0,
         verbose: bool = False,
+        monitor: bool = False,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -619,6 +620,9 @@ class DECMModel:
             verbose:       If ``True``, print a progress line at every iteration
                            (timestamp, iteration count, elapsed time, MRE).
                            Default=False.
+            monitor:       If ``True`` (and ``verbose=True``), overwrite the
+                           same terminal line at each iteration (``end='\\r'``)
+                           so only the latest status is visible.  Default=False.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -645,6 +649,7 @@ class DECMModel:
                 backend=backend,
                 num_threads=num_threads,
                 verbose=verbose,
+                monitor=monitor,
             )
 
         self.ic = self.initial_theta(ic)

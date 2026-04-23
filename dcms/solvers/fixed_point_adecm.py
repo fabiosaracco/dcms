@@ -952,7 +952,7 @@ def solve_fixed_point_adecm(
 
             if res_norm < tol:
                 converged = True
-                message = f"Converged in {n_iter} iteration(s)."
+                message = f"Converged in {n_iter} iteration(s)."+" "*50
                 break
 
             # --- Stagnation detection ---

@@ -723,7 +723,7 @@ def solve_fixed_point_adecm(
         P:           Pre-computed DCM probability matrix, shape (N, N).
                      If ``None``, computed from ``theta_topo`` at the start.
                      Pass a pre-computed matrix to avoid recomputing every call.
-        tol:         Convergence tolerance on the ℓ∞ residual norm.
+        tol:         Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
         max_iter:    Maximum number of iterations.
         damping:     Damping factor α ∈ (0, 1] for the ``"gauss-seidel"`` and
                      ``"jacobi"`` variants.  α=1 → no damping.  Not used by
@@ -1005,7 +1005,11 @@ def solve_fixed_point_adecm(
             )
 
             # --- Convergence check using the step-computed residual ---
-            res_norm = F_current.abs().max().item()
+            # Relative: MRE = max|F_i|/target_i
+            res_norm = (
+                (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                if _v_nonzero.any() else 0.0
+            )
 
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
@@ -1204,7 +1208,7 @@ def solve_fixed_point_adecm(
                         torch.maximum(theta_nt_fp, _nt_floor),
                         theta_nt_fp,
                     ).clamp(-_ETA_MAX, _ETA_MAX)
-                    nt_res = F_nt.abs().max().item()
+                    nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
                     if nt_res < tol:
                         theta_nt = theta_nt_fp
                         break

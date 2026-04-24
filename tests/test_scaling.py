@@ -352,7 +352,7 @@ class TestScalingN1000:
             model_1k.residual, theta0, model_1k.k_out, model_1k.k_in,
             tol=1e-6, max_iter=10_000, variant="gauss-seidel",
         )
-        err = model_1k.constraint_error(result.theta)
+        err = model_1k.max_relative_error(result.theta)
         assert err < CONV_TOL, (
             f"Fixed-point GS N=1000: err={err:.3e} conv={result.converged} "
             f"iters={result.iterations}"
@@ -367,7 +367,7 @@ class TestScalingN1000:
             model_1k.residual, theta0, model_1k.k_out, model_1k.k_in,
             tol=1e-6, max_iter=5_000, variant="theta-newton", anderson_depth=10,
         )
-        err = model_1k.constraint_error(result.theta)
+        err = model_1k.max_relative_error(result.theta)
         assert err < CONV_TOL, (
             f"θ-Newton N=1000: err={err:.3e} conv={result.converged} "
             f"iters={result.iterations}"

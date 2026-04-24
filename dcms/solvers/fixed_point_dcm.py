@@ -344,7 +344,7 @@ def solve_fixed_point_dcm(
                     All entries should be strictly positive.
         k_out:      Observed out-degree sequence, shape (N,).
         k_in:       Observed in-degree sequence, shape (N,).
-        tol:        Convergence tolerance on the ℓ∞ residual norm.
+        tol:        Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
         max_iter:   Maximum number of iterations.
         damping:    Damping factor α ∈ (0, 1] for the ``"gauss-seidel"``
                     variant.  α=1 → no damping.
@@ -504,8 +504,11 @@ def solve_fixed_point_dcm(
                     -_ETA_MAX, _ETA_MAX
                 )
 
-            # Convergence check
-            res_norm = F_current.abs().max().item()
+            # Convergence check (relative: MRE = max|F_i|/target_i)
+            res_norm = (
+                (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                if _v_nonzero.any() else 0.0
+            )
 
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
@@ -629,7 +632,7 @@ def solve_fixed_point_dcm(
                         )
                     _nt_floor = torch.full_like(theta_nt, -_ETA_MAX)
                     theta_nt_fp = theta_nt_fp.clamp(-_ETA_MAX, _ETA_MAX)
-                    nt_res = F_nt.abs().max().item()
+                    nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
                     if nt_res < tol:
                         theta_nt = theta_nt_fp
                         break

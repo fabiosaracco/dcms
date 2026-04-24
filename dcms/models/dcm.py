@@ -337,6 +337,25 @@ class DCMModel:
         """
         return self.residual(theta).abs().max().item()
 
+    def max_relative_error(self, theta: _ArrayLike) -> float:
+        """Return the maximum relative error on all non-zero constraints.
+
+        Computes max_i |F_i(θ)| / k_i over nodes with k_i > 0.
+
+        Args:
+            theta: Parameter vector, shape (2N,).
+
+        Returns:
+            Max relative constraint error (MRE = max|F_i|/target_i), or 0.0
+            if all degrees are zero.
+        """
+        F = self.residual(theta).abs()
+        targets = torch.cat([self.k_out, self.k_in])
+        nonzero = targets > 0
+        if not nonzero.any():
+            return 0.0
+        return (F[nonzero] / targets[nonzero]).max().item()
+
     # ------------------------------------------------------------------
     # Using the solve function
     # ------------------------------------------------------------------

@@ -281,7 +281,7 @@ from dcms.models.dcm import DCMModel
 model = DCMModel(k_out, k_in)
 converged = model.solve_tool(
     ic="degrees",           # initial condition: "degrees" (default) or "random"
-    tol=1e-6,               # convergence tolerance (ℓ∞ residual)
+    tol=1e-6,               # convergence tolerance (ℓ∞ relative residual MRE)
     max_iter=2000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     variant="theta-newton", # "theta-newton" (default) or "gauss-seidel"
@@ -401,7 +401,7 @@ from dcms.models.decm import DECMModel
 model = DECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
     ic="degrees",           # initial condition: "degrees" (default) or "random"
-    tol=1e-6,               # convergence tolerance (ℓ∞ residual)
+    tol=1e-6,               # convergence tolerance (ℓ∞ relative residual MRE)
     max_iter=5000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     anderson_depth=10,
@@ -474,7 +474,7 @@ Calls `sample()` before `solve_tool()` raise `RuntimeError`.
 result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM, (4N,) for DECM
 result.converged       # bool
 result.iterations      # int
-result.residuals       # list[float] — ℓ∞ residual norm per accepted step
+result.residuals       # list[float] — ℓ∞ relative residual (MRE) per accepted step
 result.elapsed_time    # float — wall-clock seconds
 result.peak_ram_bytes  # int
 result.message         # str — warnings or error description

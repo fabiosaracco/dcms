@@ -248,7 +248,7 @@ def solve_fixed_point_dwcm(
                 All entries should be strictly positive.
         s_out:  Observed out-strength sequence, shape (N,).
         s_in:   Observed in-strength sequence, shape (N,).
-        tol:    Convergence tolerance on the ℓ∞ residual norm.
+        tol:    Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
         max_iter: Maximum number of iterations.
         damping: Damping factor α ∈ (0, 1] for the ``"gauss-seidel"``
             variant.  α=1 → no damping (pure FP update).
@@ -617,7 +617,11 @@ def solve_fixed_point_dwcm(
 
             # --- Convergence check using the step-computed residual ---
             # F_current = F(θ) at the *current* iterate (before update).
-            res_norm = F_current.abs().max().item()
+            # Relative: MRE = max|F_i|/target_i
+            res_norm = (
+                (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                if _v_nonzero.any() else 0.0
+            )
 
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
@@ -820,7 +824,7 @@ def solve_fixed_point_dwcm(
                         theta_nt_fp = torch.maximum(theta_nt_fp, _nt_floor).clamp(
                             _ETA_MIN, _ETA_MAX
                         )
-                    nt_res = F_nt.abs().max().item()
+                    nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
                     if nt_res < tol:
                         theta_nt = theta_nt_fp
                         break

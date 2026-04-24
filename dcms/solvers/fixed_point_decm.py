@@ -974,7 +974,7 @@ def solve_fixed_point_decm(
         k_in:           Observed in-degree sequence, shape (N,).
         s_out:          Observed out-strength sequence, shape (N,).
         s_in:           Observed in-strength sequence, shape (N,).
-        tol:            Convergence tolerance on the ℓ∞ residual norm.
+        tol:            Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
         max_iter:       Maximum number of iterations.
         variant:        Solver variant: ``"theta-newton"`` (default) or
                         ``"theta-newton-4step"``.
@@ -1139,6 +1139,7 @@ def solve_fixed_point_decm(
 
     # Precompute verbose targets once (split into topo and weights parts)
     _v_targets = torch.cat([k_out, k_in, s_out, s_in])
+    _v_nonzero = _v_targets > 0
 
     try:
         for _ in range(max_iter):
@@ -1160,7 +1161,11 @@ def solve_fixed_point_decm(
             )
             theta_fp = torch.cat([theta_fp[:2 * N], eta_part_new])
 
-            res_norm = F_current.abs().max().item()
+            # Relative: MRE = max|F_i|/target_i
+            res_norm = (
+                (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                if _v_nonzero.any() else 0.0
+            )
 
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."

@@ -95,6 +95,44 @@ _FPGS_NEWTON_STEPS: int = 30
 _FPGS_NEWTON_AND_DEPTH: int = 5
 
 
+def _apply_gauge_shift(
+    theta: torch.Tensor,
+    N: int,
+    gauge_pivot: "int | str",
+) -> torch.Tensor:
+    """Apply gauge normalisation to aDECM weight parameters.
+
+    The aDECM weight equations depend only on pairwise sums
+    z_ij = η_out_i + η_in_j.  Shifting all η_out by −γ and all η_in by +γ
+    leaves every residual unchanged.  This degree of freedom can be fixed at
+    each iteration to improve numerical conditioning.
+
+    Args:
+        theta:        Current parameter vector [η_out | η_in], shape (2N,).
+        N:            Number of nodes.
+        gauge_pivot:  Gauge choice.  ``int i`` → fix η_out[i] = 0.
+                      ``"min"`` → fix min(η_out) = 0.
+                      ``"mean"`` → centre η_out around 0 (mean = 0).
+
+    Returns:
+        Shifted tensor with the same pairwise sums.
+    """
+    eta_out = theta[:N]
+    if isinstance(gauge_pivot, int):
+        gamma = eta_out[gauge_pivot].item()
+    elif gauge_pivot == "min":
+        gamma = eta_out.min().item()
+    elif gauge_pivot == "mean":
+        gamma = eta_out.mean().item()
+    else:
+        raise ValueError(f"Unknown gauge_pivot {gauge_pivot!r}. "
+                         "Use an int, 'min', or 'mean'.")
+    shifted = theta.clone()
+    shifted[:N] = theta[:N] - gamma
+    shifted[N:] = theta[N:] + gamma
+    return shifted.clamp(-_ETA_MAX, _ETA_MAX)
+
+
 def _anderson_mixing(
     fp_outputs: list[torch.Tensor],
     residuals_hist: list[torch.Tensor],
@@ -672,6 +710,7 @@ def solve_fixed_point_adecm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    gauge_pivot: "int | str | None" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Fixed-point iteration for the aDECM weight step.
 
@@ -714,6 +753,12 @@ def solve_fixed_point_adecm(
         monitor:     If ``True`` (and ``verbose=True``), overwrite the same
                      terminal line at each iteration (``end='\\r'``) so only
                      the latest status is visible.  Default=False.
+        gauge_pivot: Gauge normalisation applied after each iteration.
+                     ``None`` (default) disables gauge fixing.  ``"min"`` fixes
+                     the node with the smallest η_out to 0; ``"mean"`` centres
+                     η_out around 0; an ``int`` i fixes η_out[i] = 0.  Requires
+                     ``variant="theta-newton"``.  A ``ValueError`` is raised
+                     if used with ``"gauss-seidel"`` or ``"jacobi"``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -727,6 +772,12 @@ def solve_fixed_point_adecm(
         raise ValueError(f"damping must be in (0, 1], got {damping}")
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+    if gauge_pivot is not None and variant != "theta-newton":
+        raise ValueError(
+            "gauge_pivot requires variant='theta-newton'; "
+            "β-space variants assume β_i < 1 (θ_i > 0) and are "
+            "incompatible with the negative θ values produced by gauge normalisation."
+        )
 
     # Convert inputs to tensors
     if not isinstance(s_out, torch.Tensor):
@@ -748,6 +799,15 @@ def solve_fixed_point_adecm(
 
     N = s_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)  # allow β>1 (negative θ)
+
+    # Resolve the gauge pivot: for "min" fix the pivot index at init
+    _gauge_pivot_idx: "int | str | None" = gauge_pivot
+    if gauge_pivot == "min":
+        _gauge_pivot_idx = int(theta[:N].argmin().item())
+
+    # Apply initial gauge normalisation
+    if _gauge_pivot_idx is not None:
+        theta = _apply_gauge_shift(theta, N, _gauge_pivot_idx)
 
     # Resolve compute backend
     from dcms.utils.backend import resolve_backend
@@ -1155,6 +1215,9 @@ def solve_fixed_point_adecm(
                 _best_res_for_anderson = float("inf")
 
             theta = theta_next
+            # Apply gauge normalisation after each step
+            if _gauge_pivot_idx is not None:
+                theta = _apply_gauge_shift(theta, N, _gauge_pivot_idx)
     finally:
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)
@@ -1162,6 +1225,12 @@ def solve_fixed_point_adecm(
         if _prev_numba_threads is not None:
             import numba as _numba_mod
             _numba_mod.set_num_threads(_prev_numba_threads)
+
+    # Gauge-normalise best_theta before returning: best_theta = theta_fp.clone()
+    # is saved from the Newton output (before gauge shift was applied), so we
+    # normalise it here to ensure the returned parameters are gauge-consistent.
+    if _gauge_pivot_idx is not None:
+        best_theta = _apply_gauge_shift(best_theta, N, _gauge_pivot_idx)
 
     return SolverResult(
         theta=best_theta.detach().numpy(),

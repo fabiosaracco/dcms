@@ -608,7 +608,10 @@ class DECMModel:
             max_iter:      Maximum iterations per attempt.
             max_time:      Wall-clock time limit in seconds per attempt
                            (0 = no limit).
-            variant:       Solver variant (only ``"theta-newton"`` is supported).
+            variant:       Solver variant: ``"theta-newton"`` (default) or
+                           ``"theta-newton-4step"`` (4-step GS scheme that
+                           updates each parameter block sequentially, sharing
+                           G/log_q across topology steps for efficiency).
             anderson_depth: Anderson acceleration depth.
             multi_start:   If ``True`` (default), retry with fallback ICs when
                            the primary IC does not converge.  Set to ``False``

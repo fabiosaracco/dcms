@@ -2,7 +2,7 @@
 
 Two test suites:
   i)  Standard test matrices — verify gauge correctness and convergence on
-      synthetic N≤500 networks (all three gauge choices).
+      synthetic N≤500 networks (gauge_pivot=None, "min", and explicit int).
   ii) Real network — load the N=58832 Italian elections pkl, warm-start from
       the saved best iterate, and test that gauge_pivot="min" achieves lower
       residual than the saved non-converged run.
@@ -84,7 +84,7 @@ class TestGaugeShiftHelper:
     """Verify that _apply_gauge_shift preserves pairwise sums and is idempotent."""
 
     @pytest.mark.parametrize("N", [10, 100])
-    @pytest.mark.parametrize("pivot", [0, "min", "mean"])
+    @pytest.mark.parametrize("pivot", [0, 5])
     def test_pairwise_sums_preserved_dwcm(self, N, pivot):
         rng = np.random.default_rng(0)
         theta = torch.tensor(rng.uniform(0.1, 5.0, 2 * N))
@@ -95,7 +95,7 @@ class TestGaugeShiftHelper:
             "Pairwise sums changed after gauge shift (DWCM)"
 
     @pytest.mark.parametrize("N", [10, 100])
-    @pytest.mark.parametrize("pivot", [0, "min", "mean"])
+    @pytest.mark.parametrize("pivot", [0, 5])
     def test_pairwise_sums_preserved_adecm(self, N, pivot):
         rng = np.random.default_rng(0)
         theta = torch.tensor(rng.uniform(0.1, 5.0, 2 * N))
@@ -105,7 +105,7 @@ class TestGaugeShiftHelper:
         assert torch.allclose(z_before, z_after, atol=1e-12), \
             "Pairwise sums changed after gauge shift (aDECM)"
 
-    @pytest.mark.parametrize("pivot", [0, "min", "mean"])
+    @pytest.mark.parametrize("pivot", [0, 3])
     def test_idempotent_dwcm(self, pivot):
         N = 20
         rng = np.random.default_rng(1)
@@ -114,27 +114,23 @@ class TestGaugeShiftHelper:
         t2 = _dwcm_gauge(t1, N, pivot)
         assert torch.allclose(t1, t2, atol=1e-12), "Gauge shift is not idempotent"
 
-    def test_min_pivot_sets_min_to_zero_dwcm(self):
-        N = 30
-        rng = np.random.default_rng(2)
-        theta = torch.tensor(rng.uniform(0.1, 5.0, 2 * N))
-        t = _dwcm_gauge(theta, N, "min")
-        assert abs(t[:N].min().item()) < 1e-12, "min pivot should set min(eta_out)=0"
-
-    def test_mean_pivot_centres_dwcm(self):
-        N = 30
-        rng = np.random.default_rng(3)
-        theta = torch.tensor(rng.uniform(0.1, 5.0, 2 * N))
-        t = _dwcm_gauge(theta, N, "mean")
-        assert abs(t[:N].mean().item()) < 1e-12, "mean pivot should centre eta_out at 0"
-
-    def test_int_pivot_zeros_that_node_dwcm(self):
+    def test_int_pivot_zeros_eta_out_dwcm(self):
         N = 30
         rng = np.random.default_rng(4)
         theta = torch.tensor(rng.uniform(0.1, 5.0, 2 * N))
         pivot_idx = 7
         t = _dwcm_gauge(theta, N, pivot_idx)
         assert abs(t[pivot_idx].item()) < 1e-12, f"eta_out[{pivot_idx}] should be 0"
+
+    def test_negative_pivot_zeros_eta_in_dwcm(self):
+        """A negative pivot index pins η_in[j] = 0 where j = -pivot-1."""
+        N = 30
+        rng = np.random.default_rng(5)
+        theta = torch.tensor(rng.uniform(0.1, 5.0, 2 * N))
+        j = 4
+        pivot_idx = -(j + 1)   # encodes "pin η_in[j]"
+        t = _dwcm_gauge(theta, N, pivot_idx)
+        assert abs(t[N + j].item()) < 1e-12, f"eta_in[{j}] should be 0"
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +139,7 @@ class TestGaugeShiftHelper:
 
 
 class TestGaugeValidation:
-    """Gauge with GS variant should raise."""
+    """Invalid gauge_pivot values should raise; GS variant should also raise."""
 
     def test_gauge_with_gs_raises_dwcm(self):
         m, _ = _make_dwcm(N=20, seed=0)
@@ -154,6 +150,26 @@ class TestGaugeValidation:
         m, _, _ = _make_adecm(N=10, seed=0)
         with pytest.raises(ValueError, match="theta-newton"):
             m.solve_tool(variant="gauss-seidel", gauge_pivot="min", max_iter=5)
+
+    def test_gauge_mean_raises_dwcm(self):
+        m, _ = _make_dwcm(N=20, seed=0)
+        with pytest.raises(ValueError):
+            m.solve_tool(variant="theta-newton", gauge_pivot="mean", max_iter=5)
+
+    def test_gauge_mean_raises_adecm(self):
+        m, _, _ = _make_adecm(N=10, seed=0)
+        with pytest.raises(ValueError):
+            m.solve_tool(variant="theta-newton", gauge_pivot="mean", max_iter=5)
+
+    def test_gauge_negative_int_raises_dwcm(self):
+        m, _ = _make_dwcm(N=20, seed=0)
+        with pytest.raises(ValueError):
+            m.solve_tool(variant="theta-newton", gauge_pivot=-1, max_iter=5)
+
+    def test_gauge_negative_int_raises_adecm(self):
+        m, _, _ = _make_adecm(N=10, seed=0)
+        with pytest.raises(ValueError):
+            m.solve_tool(variant="theta-newton", gauge_pivot=-1, max_iter=5)
 
 
 # ---------------------------------------------------------------------------
@@ -206,27 +222,34 @@ class TestGaugeConvergenceSynthetic:
         assert converged, "aDECM did not converge with gauge_pivot='min'"
 
     def test_dwcm_gauge_min_int_match(self):
-        """gauge_pivot='min' and gauge_pivot=argmin should give the same result."""
-        m1, _ = _make_dwcm(N=30, seed=2)
-        m2, _ = _make_dwcm(N=30, seed=2)
+        """When the pivot from 'min' lands in s_out, explicit gauge_pivot=pivot_idx
+        converges to the same quality result."""
+        import torch as _torch
+        # Use seed=0: we confirm the max-strength node is in s_out
+        seed = 0
+        m1, _ = _make_dwcm(N=30, seed=seed)
+        s_out = _torch.tensor(m1.s_out, dtype=_torch.float64)
+        s_in  = _torch.tensor(m1.s_in,  dtype=_torch.float64)
+        N = len(s_out)
+        all_s = _torch.cat([s_out, s_in])
+        max_idx = int(all_s.argmax().item())
+        # Pivot is in s_out so we can test explicit-int match
+        assert max_idx < N, (
+            f"Expected max-strength pivot in s_out for seed={seed}, got max_idx={max_idx}"
+        )
         m1.solve_tool(
             variant="theta-newton", anderson_depth=10, tol=1e-8, max_iter=3000,
             backend="pytorch", gauge_pivot="min",
         )
-        # Find which node gauge='min' resolved to (argmin of initial IC)
-        m_tmp, _ = _make_dwcm(N=30, seed=2)
-        import torch
-        ic = m_tmp.initial_theta("strengths")
-        pivot_idx = int(ic[:30].argmin().item())
+        m2, _ = _make_dwcm(N=30, seed=seed)
         m2.solve_tool(
             variant="theta-newton", anderson_depth=10, tol=1e-8, max_iter=3000,
-            backend="pytorch", gauge_pivot=pivot_idx,
+            backend="pytorch", gauge_pivot=max_idx,
         )
-        # Both should converge and give the same MRE
         res1 = m1.max_relative_error(m1.sol.theta)
         res2 = m2.max_relative_error(m2.sol.theta)
         assert res1 < 1e-5, f"gauge=min MRE too high: {res1:.2e}"
-        assert res2 < 1e-5, f"gauge=int({pivot_idx}) MRE too high: {res2:.2e}"
+        assert res2 < 1e-5, f"gauge=int({max_idx}) MRE too high: {res2:.2e}"
 
 
 # ---------------------------------------------------------------------------

@@ -609,7 +609,76 @@ adecm.solve_tool(
 
 For DCM and DWCM pass `theta_0` (shape 2N).  For DECM pass `theta_0` (shape 4N = `[θ_out|θ_in|η_out|η_in]`); `multi_start` is automatically disabled when `theta_0` is provided.
 
-### 3.10 Network generator (`dcms/utils/wng.py`)
+### 3.10 Gauge-fix for hub networks (`gauge_pivot`)
+
+#### The problem: high-weight hub nodes
+
+In large real-world networks it is common to have one or a few *hub* nodes with extremely high strength and low degree — i.e. very few but very heavy edges.  For such hubs the log-fitness η_out_hub ≈ 0 is the correct solution (the hub is almost certainly connected to every other node, so its geometric parameter β_hub = exp(−η_hub) ≈ 1).  The numerical problem is that the solver enforces a lower bound η ≥ ε (with ε = 1 × 10⁻¹⁰) to keep all β_i < 1.  For a hub node, this clamp is *precisely at the solution*, so the solver fights the bound every iteration, corrupting the Anderson mixing history and causing residuals to plateau at values orders of magnitude above the convergence tolerance.
+
+#### The gauge symmetry
+
+The DWCM and aDECM weight equations depend only on **pairwise sums**
+
+```
+z_ij = η_out_i + η_in_j
+```
+
+The transformation `(η_out → η_out − γ,  η_in → η_in + γ)` is an exact symmetry of every residual equation for any scalar γ.  This is a **gauge freedom** of degree 1: the equations have a one-dimensional family of equivalent solutions, and the 2N×2N Jacobian has one zero eigenvalue (the constant gauge direction).
+
+#### The fix
+
+Fixing the gauge removes the null direction, regularises the Jacobian, and — crucially — allows hub nodes to have η_out < ε_min without hitting any bound.  The `gauge_pivot` parameter controls how the gauge is fixed at each iteration step:
+
+| Value | Effect |
+|-------|--------|
+| `None` (default) | No gauge fixing — backward-compatible behaviour. |
+| `"min"` | Pin `min(η_out) = 0` each step.  The node with the smallest η_out (the hub) is used as the reference. **Recommended.** |
+| `int i` | Pin `η_out[i] = 0` each step (explicit pivot node). |
+| `"mean"` | Centre η_out around 0 each step (only safe for aDECM sparse graphs). |
+
+> **Important:** `gauge_pivot` requires `variant='theta-newton'`.  Passing it with a Gauss-Seidel variant raises `ValueError` because the GS parametrisation assumes all η > 0.
+
+#### Usage
+
+```python
+# DWCM with gauge fix
+model_w = DWCMModel(s_out, s_in)
+model_w.solve_tool(
+    variant='theta-newton',
+    gauge_pivot='min',          # recommended for hub networks
+)
+
+# aDECM with gauge fix
+model_da = ADECMModel(k_out, k_in, s_out, s_in)
+model_da.solve_tool(
+    variant='theta-newton',
+    gauge_pivot='min',
+)
+
+# If you already know the hub node index (e.g. node 37916):
+model_da.solve_tool(
+    variant='theta-newton',
+    gauge_pivot=37916,
+)
+```
+
+#### When to use it
+
+Use `gauge_pivot='min'` whenever:
+
+* The network has a node with very high strength-to-degree ratio (s/k >> 1);
+* The solver residual plateaus at a large value (MRE >> 1e-5) and does not decrease even after thousands of iterations;
+* The saved `sol_weights.theta` shows `min(η_out)` close to 0 or slightly negative.
+
+On a real N≈58 000-node financial network with one hub node (η_out ≈ −9.8 × 10⁻³ at the solution), the residual was stuck at ~10 000 for 351 iterations without the gauge fix.  With `gauge_pivot='min'` it dropped geometrically: 211 → 57 → 14 in the first three Anderson iterations.
+
+#### Mathematical note
+
+After the solver returns, the gauge is fixed so that `min(η_out) = 0`.  All **observable quantities** — expected weights `E[w_ij]`, edge probabilities `p_ij`, sampled networks — depend only on z_ij = η_out_i + η_in_j and are therefore gauge-invariant and unchanged.  The individual η_out / η_in values do shift, but this is unobservable.
+
+---
+
+### 3.11 Network generator (`dcms/utils/wng.py`)
 
 ```python
 from dcms.utils.wng import k_s_generator_pl

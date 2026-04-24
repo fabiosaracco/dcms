@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcms"
-version = "0.2.9"
+version = "0.3.0"
 description = "DCM, DWCM, aDECM and DECM solvers with selectable PyTorch/Numba backend"
 requires-python = ">=3.9"
 dependencies = [

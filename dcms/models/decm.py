@@ -655,7 +655,7 @@ class DECMModel:
         self.ic = self.initial_theta(ic)
         self.sol = _run_once(ic)
         if self.sol.message:
-            print(self.sol.message)
+            print(self.sol.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
         if multi_start and not self.sol.converged:
             for fallback in _FALLBACK_ICS:
@@ -663,7 +663,7 @@ class DECMModel:
                     continue
                 fb_result = _run_once(fallback)
                 if fb_result.message:
-                    print(fb_result.message)
+                    print(fb_result.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
                 if fb_result.residuals[-1] < self.sol.residuals[-1]:
                     self.sol = fb_result
                 if self.sol.converged:

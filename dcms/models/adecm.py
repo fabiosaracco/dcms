@@ -643,7 +643,7 @@ class ADECMModel:
         self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         
         if len(self.sol_topo.message)>0:
-            print(f'Topology: {self.sol_topo.message}')
+            print(f'Topology: {self.sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
        
 
@@ -656,7 +656,7 @@ class ADECMModel:
         from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm  # lazy import to avoid circular dependency
         self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         if len(self.sol_weights.message)>0:
-            print(f'Weights: {self.sol_weights.message}')
+            print(f'Weights: {self.sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
         return self.sol_topo.converged and self.sol_weights.converged
 

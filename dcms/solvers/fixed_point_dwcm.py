@@ -534,7 +534,7 @@ def solve_fixed_point_dwcm(
 
             if res_norm < tol:
                 converged = True
-                message = f"Converged in {n_iter} iteration(s)."+" "*50
+                message = f"Converged in {n_iter} iteration(s)."
                 break
 
             # --- Stagnation detection ---

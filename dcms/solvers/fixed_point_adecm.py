@@ -95,6 +95,41 @@ _FPGS_NEWTON_STEPS: int = 30
 _FPGS_NEWTON_AND_DEPTH: int = 5
 
 
+def _apply_gauge_shift(
+    theta: torch.Tensor,
+    N: int,
+    gauge_pivot_idx: int,
+) -> torch.Tensor:
+    """Apply gauge normalisation to aDECM weight parameters.
+
+    The aDECM weight equations depend only on pairwise sums
+    z_ij = η_out_i + η_in_j.  Shifting all η_out by −γ and all η_in by +γ
+    leaves every residual unchanged.  This degree of freedom is fixed using a
+    *data-determined* pivot node so all Anderson iterates live in the same frame.
+
+    Encoding of ``gauge_pivot_idx``:
+        * ``i ≥ 0``  — pin η_out[i] = 0  (γ = current η_out[i])
+        * ``i < 0``  — pin η_in[j] = 0 where j = −i − 1  (γ = −current η_in[j])
+
+    Args:
+        theta:           Current parameter vector [η_out | η_in], shape (2N,).
+        N:               Number of nodes.
+        gauge_pivot_idx: Signed integer pivot encoding (see above).
+
+    Returns:
+        Shifted tensor with the same pairwise sums, clamped to [−_ETA_MAX, _ETA_MAX].
+    """
+    if gauge_pivot_idx >= 0:
+        gamma = theta[gauge_pivot_idx].item()         # γ = η_out[i]
+    else:
+        j = -gauge_pivot_idx - 1
+        gamma = -theta[N + j].item()                  # γ = −η_in[j]
+    shifted = theta.clone()
+    shifted[:N] = theta[:N] - gamma
+    shifted[N:] = theta[N:] + gamma
+    return shifted.clamp(-_ETA_MAX, _ETA_MAX)
+
+
 def _anderson_mixing(
     fp_outputs: list[torch.Tensor],
     residuals_hist: list[torch.Tensor],
@@ -672,6 +707,7 @@ def solve_fixed_point_adecm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    gauge_pivot: "int | str | None" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Fixed-point iteration for the aDECM weight step.
 
@@ -714,6 +750,15 @@ def solve_fixed_point_adecm(
         monitor:     If ``True`` (and ``verbose=True``), overwrite the same
                      terminal line at each iteration (``end='\\r'``) so only
                      the latest status is visible.  Default=False.
+        gauge_pivot: Gauge normalisation applied after each iteration.
+                     ``None`` (default) disables gauge fixing (backward-compatible).
+                     ``"min"`` automatically selects the data-determined pivot: the
+                     node with the highest strength across *both* s_out and s_in is
+                     pinned to η = 0 at every step, keeping all Anderson iterates in
+                     the same gauge frame.
+                     An explicit ``int i ≥ 0`` fixes η_out[i] = 0 at every step.
+                     Requires ``variant="theta-newton"``.  A ``ValueError`` is raised
+                     if used with ``"gauss-seidel"`` or ``"jacobi"``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -727,6 +772,18 @@ def solve_fixed_point_adecm(
         raise ValueError(f"damping must be in (0, 1], got {damping}")
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+    if gauge_pivot is not None and variant != "theta-newton":
+        raise ValueError(
+            "gauge_pivot requires variant='theta-newton'; "
+            "β-space variants assume β_i < 1 (θ_i > 0) and are "
+            "incompatible with the negative θ values produced by gauge normalisation."
+        )
+    if gauge_pivot is not None and not (
+        gauge_pivot == "min" or (isinstance(gauge_pivot, int) and gauge_pivot >= 0)
+    ):
+        raise ValueError(
+            f"gauge_pivot must be None, 'min', or a non-negative int; got {gauge_pivot!r}"
+        )
 
     # Convert inputs to tensors
     if not isinstance(s_out, torch.Tensor):
@@ -748,6 +805,28 @@ def solve_fixed_point_adecm(
 
     N = s_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)  # allow β>1 (negative θ)
+
+    # Resolve gauge pivot to a fixed integer determined by the *data* (never the
+    # current iterate), so all Anderson iterates live in the same gauge frame.
+    # Encoding: i >= 0 → pin η_out[i] = 0; i < 0 → pin η_in[-i-1] = 0.
+    # "min" → argmax over cat(s_out, s_in): the node with the highest overall
+    # strength has the η closest to 0 at the solution and is the natural pivot.
+    _gauge_pivot_idx: "int | None"
+    if gauge_pivot is None:
+        _gauge_pivot_idx = None
+    elif gauge_pivot == "min":
+        all_s = torch.cat([s_out, s_in])
+        max_idx = int(all_s.argmax().item())
+        if max_idx < N:
+            _gauge_pivot_idx = max_idx              # pin η_out[max_idx] = 0
+        else:
+            _gauge_pivot_idx = -(max_idx - N) - 1  # pin η_in[max_idx-N] = 0
+    else:
+        _gauge_pivot_idx = int(gauge_pivot)         # explicit η_out index
+
+    # Apply initial gauge normalisation
+    if _gauge_pivot_idx is not None:
+        theta = _apply_gauge_shift(theta, N, _gauge_pivot_idx)
 
     # Resolve compute backend
     from dcms.utils.backend import resolve_backend
@@ -1155,6 +1234,9 @@ def solve_fixed_point_adecm(
                 _best_res_for_anderson = float("inf")
 
             theta = theta_next
+            # Apply gauge normalisation after each step
+            if _gauge_pivot_idx is not None:
+                theta = _apply_gauge_shift(theta, N, _gauge_pivot_idx)
     finally:
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)
@@ -1162,6 +1244,12 @@ def solve_fixed_point_adecm(
         if _prev_numba_threads is not None:
             import numba as _numba_mod
             _numba_mod.set_num_threads(_prev_numba_threads)
+
+    # Gauge-normalise best_theta before returning: best_theta = theta_fp.clone()
+    # is saved from the Newton output (before gauge shift was applied), so we
+    # normalise it here to ensure the returned parameters are gauge-consistent.
+    if _gauge_pivot_idx is not None:
+        best_theta = _apply_gauge_shift(best_theta, N, _gauge_pivot_idx)
 
     return SolverResult(
         theta=best_theta.detach().numpy(),

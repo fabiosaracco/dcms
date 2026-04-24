@@ -608,7 +608,7 @@ class ADECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', theta_topo_0=None, theta_weights_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
+    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', theta_topo_0=None, theta_weights_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, gauge_pivot=None)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -642,6 +642,10 @@ class ADECMModel:
             monitor (bool): If ``True`` (and ``verbose=True``), overwrite the
                 same terminal line at each iteration (``end='\\r'``) so only
                 the latest status is visible.  Default=False.
+            gauge_pivot: Gauge normalisation for the weight step.  ``None``
+                (default) disables gauge fixing.  ``"min"`` fixes the node with
+                the smallest η_out to 0; ``"mean"`` centres η_out around 0; an
+                ``int`` i fixes η_out[i] = 0.  Requires ``variant="theta-newton"``.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
@@ -670,7 +674,7 @@ class ADECMModel:
         res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
 
         from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm  # lazy import to avoid circular dependency
-        self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+        self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, gauge_pivot=gauge_pivot)
         if len(self.sol_weights.message)>0:
             print(f'Weights: {self.sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 

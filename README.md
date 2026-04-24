@@ -228,16 +228,7 @@ For the DECM, the coupling between degree and strength equations modifies the st
 ∂F_s_out_i / ∂η_out_i = −Σ_{j≠i} p_ij · G_ij² · (1 − p_ij + z_ij)
 ```
 
-which equals the aDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`.  The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously within each group.
-
-Two GS orderings are available as `variant`:
-
-| Variant | GS ordering | Notes |
-|---------|-------------|-------|
-| `"theta-newton"` (**default**) | (θ_out, η_out) → (θ_in, η_in) — grouped by *direction* | Two N×N passes per iteration; recommended |
-| `"theta-newton-4step"` | θ_out → θ_in → η_out → η_in — grouped by *type* | Three N×N passes (G shared for first three steps); available as an alternative but benchmark tests on N = 100–300 show it requires more iterations on average and is not faster in wall time |
-
-The 4-step variant is not available with the Numba backend (it falls back to PyTorch automatically).
+which equals the aDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`.  The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously within each group: pass 1 updates (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col sums.
 
 **The z-floor mechanism:** define `z_ij = θ_out_i + θ_in_j`.  When `z_ij → 0`, `G_ij → ∞` and the residual blows up.  The solver maintains per-node floors `z_min_out[i]` and `z_min_in[j]` (computed from significant pairs with `p_ij > 0.5/N`) and applies a global floor from `min(θ_in)` over non-zero-strength nodes.  This guarantees `z_ij > _Z_G_CLAMP = 1e-8` for all pairs after every Newton step.
 
@@ -248,7 +239,7 @@ The 4-step variant is not available with the Numba backend (it falls back to PyT
 - `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="theta-newton", anderson_depth=10)`
 - `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="theta-newton", anderson_depth=10)`
 - `dcms/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="theta-newton", anderson_depth=10)`
-- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (alternating out/in GS-Newton on 4N vector; also accepts `variant="theta-newton-4step"`)
+- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (alternating out/in GS-Newton on 4N vector)
 
 Internally, each file has a `_theta_newton_step_chunked` (and optionally `_theta_newton_step_dense`) function that computes the diagonal Jacobian and applies the clipped step without materialising the full Jacobian matrix (O(N) RAM).
 
@@ -743,7 +734,7 @@ Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per 
 
 Benchmarks over 5 seeds each (`k_s_generator_pl(N, rho=1e-3)`, `tol=1e-5`).
 
-The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.  `solve_tool()` uses `multi_start=True` by default: if the primary IC ("degrees") does not converge, it automatically retries with the "adecm" warm-start (run aDECM first and use its 4N solution as starting point) and then "random".  The default `variant="theta-newton"` (direction-grouped 2-pass) is recommended; a 4-type-grouped `variant="theta-newton-4step"` is also available but shows no systematic improvement in benchmarks.
+The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.  `solve_tool()` uses `multi_start=True` by default: if the primary IC ("degrees") does not converge, it automatically retries with the "adecm" warm-start (run aDECM first and use its 4N solution as starting point) and then "random".
 
 **N = 1 000**
 

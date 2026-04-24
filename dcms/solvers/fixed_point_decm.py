@@ -278,179 +278,6 @@ def _decm_step_dense(
 
 
 # -------------------------------------------------------------------------
-# Dense 4-step DECM step
-# -------------------------------------------------------------------------
-
-def _decm_step_dense_4step(
-    theta: torch.Tensor,
-    k_out: torch.Tensor,
-    k_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    zero_k_out: torch.Tensor,
-    zero_k_in: torch.Tensor,
-    zero_s_out: torch.Tensor,
-    zero_s_in: torch.Tensor,
-    max_step: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One 4-step alternating GS-Newton step for the DECM (dense N×N computation).
-
-    Performs four sequential steps sharing G and log_q (computed from old η)
-    across steps 1–3:
-    1. Update θ_out using row sums at the current state.
-    2. Update θ_in using col sums with updated θ_out (reuse G, log_q).
-    3. Update η_out using row sums with updated θ_out, θ_in (reuse G, log_q).
-    4. Update η_in using col sums with updated θ_out, θ_in, η_out (new G4).
-
-    The residual returned is evaluated at the *input* theta (before update).
-
-    Args:
-        theta:      Current 4N parameter vector [θ_out|θ_in|η_out|η_in].
-        k_out:      Observed out-degree sequence, shape (N,).
-        k_in:       Observed in-degree sequence, shape (N,).
-        s_out:      Observed out-strength sequence, shape (N,).
-        s_in:       Observed in-strength sequence, shape (N,).
-        zero_k_out: Boolean mask of zero-out-degree nodes.
-        zero_k_in:  Boolean mask of zero-in-degree nodes.
-        zero_s_out: Boolean mask of zero-out-strength nodes.
-        zero_s_in:  Boolean mask of zero-in-strength nodes.
-        max_step:   Maximum |Δθ| per node per step.
-
-    Returns:
-        ``(theta_new, F_current)`` where F_current is the 4N residual at the
-        input state.
-    """
-    N = k_out.shape[0]
-    theta_out = theta[:N]
-    theta_in = theta[N : 2 * N]
-    eta_out = theta[2 * N : 3 * N]
-    eta_in = theta[3 * N :]
-
-    # Shared G and log_q from old η — reused for steps 1, 2, 3.
-    eta = eta_out[:, None] + eta_in[None, :]       # (N, N)
-    eta_safe = eta.clamp(min=_Z_G_CLAMP)
-    G = -1.0 / torch.expm1(-eta_safe)
-    G.fill_diagonal_(0.0)
-    log_q = -torch.log(torch.expm1(eta_safe))
-    eta_for_min = eta_safe.clone()
-    eta_for_min.fill_diagonal_(float("inf"))
-
-    # ------- Step 1: row/col sums at current state; compute F_current; update θ_out -------
-    logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-    P = torch.sigmoid(logit_p)
-    P.fill_diagonal_(0.0)
-    W = P * G
-    pq = P * (1.0 - P)
-    pq.fill_diagonal_(0.0)
-
-    k_out_hat = P.sum(1)
-    k_in_hat = P.sum(0)
-    s_out_hat = W.sum(1)
-    s_in_hat = W.sum(0)
-    H_k_out = pq.sum(1).clamp(min=1e-15)
-
-    F_current = torch.cat(
-        [k_out_hat - k_out, k_in_hat - k_in,
-         s_out_hat - s_out, s_in_hat - s_in]
-    )
-
-    delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
-
-    # ------- Step 2: col sums with new θ_out, shared G, log_q; update θ_in -------
-    logit_p2 = -theta_out_new[:, None] - theta_in[None, :] + log_q
-    P2 = torch.sigmoid(logit_p2)
-    P2.fill_diagonal_(0.0)
-    pq2 = P2 * (1.0 - P2)
-    pq2.fill_diagonal_(0.0)
-
-    k_in_hat2 = P2.sum(0)
-    H_k_in2 = pq2.sum(0).clamp(min=1e-15)
-
-    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
-
-    # ------- Step 3: row sums with new θ_out, θ_in, shared G, log_q; update η_out -------
-    logit_p3 = -theta_out_new[:, None] - theta_in_new[None, :] + log_q
-    P3 = torch.sigmoid(logit_p3)
-    P3.fill_diagonal_(0.0)
-    W3 = P3 * G
-    W3.fill_diagonal_(0.0)
-    pq3 = P3 * (1.0 - P3)
-    pq3.fill_diagonal_(0.0)
-    PGG1_3 = P3 * G * (G - 1.0)
-    PGG1_3.fill_diagonal_(0.0)
-    CORR_3 = pq3 * G.pow(2)
-    CORR_3.fill_diagonal_(0.0)
-
-    s_out_hat3 = W3.sum(1)
-    H_s_out3 = (PGG1_3 + CORR_3).sum(1).clamp(min=1e-15)
-
-    delta_eta_out = ((s_out_hat3 - s_out) / H_s_out3).clamp(-max_step, max_step)
-
-    z_min_out = eta_for_min.min(1).values.clamp(min=_Z_G_CLAMP)
-    nz_in = s_in > 0
-    if nz_in.any():
-        z_min_out = torch.minimum(z_min_out, eta_out + eta_in[nz_in].min())
-
-    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
-    alpha_out = torch.where(
-        delta_eta_out < 0,
-        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
-    eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
-
-    # ------- Step 4: col sums with new θ_out, θ_in, η_out; new G4; update η_in -------
-    eta4 = eta_out_new[:, None] + eta_in[None, :]
-    eta4_safe = eta4.clamp(min=_Z_G_CLAMP)
-    G4 = -1.0 / torch.expm1(-eta4_safe)
-    G4.fill_diagonal_(0.0)
-    log_q4 = -torch.log(torch.expm1(eta4_safe))
-
-    logit_p4 = -theta_out_new[:, None] - theta_in_new[None, :] + log_q4
-    P4 = torch.sigmoid(logit_p4)
-    P4.fill_diagonal_(0.0)
-    W4 = P4 * G4
-    W4.fill_diagonal_(0.0)
-    pq4 = P4 * (1.0 - P4)
-    pq4.fill_diagonal_(0.0)
-    PGG1_4 = P4 * G4 * (G4 - 1.0)
-    PGG1_4.fill_diagonal_(0.0)
-    CORR_4 = pq4 * G4.pow(2)
-    CORR_4.fill_diagonal_(0.0)
-
-    s_in_hat4 = W4.sum(0)
-    H_s_in4 = (PGG1_4 + CORR_4).sum(0).clamp(min=1e-15)
-
-    delta_eta_in = ((s_in_hat4 - s_in) / H_s_in4).clamp(-max_step, max_step)
-
-    eta4_for_min = eta4_safe.clone()
-    eta4_for_min.fill_diagonal_(float("inf"))
-    z_min_in = eta4_for_min.min(0).values.clamp(min=_Z_G_CLAMP)
-    nz_out = s_out > 0
-    if nz_out.any():
-        z_min_in = torch.minimum(z_min_in, eta_out_new[nz_out].min() + eta_in)
-
-    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
-    alpha_in = torch.where(
-        delta_eta_in < 0,
-        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
-    eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
-
-    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
-    return theta_new, F_current
-
-
-# -------------------------------------------------------------------------
 # Chunked DECM step (for N > _LARGE_N_THRESHOLD)
 # -------------------------------------------------------------------------
 
@@ -665,266 +492,6 @@ def _decm_step_chunked(
 
 
 # -------------------------------------------------------------------------
-# Chunked 4-step DECM step
-# -------------------------------------------------------------------------
-
-def _decm_step_chunked_4step(
-    theta: torch.Tensor,
-    k_out: torch.Tensor,
-    k_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    zero_k_out: torch.Tensor,
-    zero_k_in: torch.Tensor,
-    zero_s_out: torch.Tensor,
-    zero_s_in: torch.Tensor,
-    chunk_size: int,
-    max_step: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked 4-step alternating GS-Newton step for the DECM.
-
-    Mirrors :func:`_decm_step_dense_4step` but processes the N×N matrices in
-    row chunks to keep memory usage at O(chunk_size × N).
-
-    Uses three loops:
-
-    * **Loop 1**: Compute G (old η) per chunk; accumulate row sums (k_out_hat,
-      s_out_hat) and col sums (k_in_hat, s_in_hat) for F_current; immediately
-      compute θ_out_new per chunk; then P2 col sums (k_in_hat2, H_k_in2) with
-      new θ_out and the same G.  After the loop: compute global θ_in_new.
-
-    * **Loop 2**: Recompute G (old η) per chunk; accumulate row sums
-      (s_out_hat3, H_s_out3, z_min_out) using new θ_out and θ_in.  After the
-      loop: compute global η_out_new.
-
-    * **Loop 3**: Compute new G4 (new η_out) per chunk; accumulate col sums
-      (s_in_hat4, H_s_in4, z_min_in) using new θ_out, θ_in and η_out.  After
-      the loop: compute global η_in_new.
-
-    Args:
-        theta:      Current 4N parameter vector.
-        k_out:      Observed out-degree sequence, shape (N,).
-        k_in:       Observed in-degree sequence, shape (N,).
-        s_out:      Observed out-strength sequence, shape (N,).
-        s_in:       Observed in-strength sequence, shape (N,).
-        zero_k_out: Boolean mask of zero-out-degree nodes.
-        zero_k_in:  Boolean mask of zero-in-degree nodes.
-        zero_s_out: Boolean mask of zero-out-strength nodes.
-        zero_s_in:  Boolean mask of zero-in-strength nodes.
-        chunk_size: Rows per processing chunk.
-        max_step:   Maximum |Δθ| per node per step.
-
-    Returns:
-        ``(theta_new, F_current)`` where F_current is evaluated at the input
-        state.
-    """
-    N = k_out.shape[0]
-    theta_out = theta[:N]
-    theta_in = theta[N : 2 * N]
-    eta_out = theta[2 * N : 3 * N]
-    eta_in = theta[3 * N :]
-
-    sig_log_thresh: float = math.log(0.5 / N) - math.log(1.0 - 0.5 / N)
-
-    # ------------------------------------------------------------------
-    # Loop 1: old-η row sums + col sums for F_current; θ_out_new per chunk;
-    #         then P2 col sums (new θ_out, same G) for θ_in update.
-    # ------------------------------------------------------------------
-    k_out_hat = torch.zeros(N, dtype=torch.float64)
-    k_in_hat = torch.zeros(N, dtype=torch.float64)
-    s_out_hat = torch.zeros(N, dtype=torch.float64)
-    s_in_hat = torch.zeros(N, dtype=torch.float64)
-    k_in_hat2 = torch.zeros(N, dtype=torch.float64)
-    H_k_in2 = torch.zeros(N, dtype=torch.float64)
-    theta_out_new = torch.empty_like(theta_out)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-
-        eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, N)
-        eta_safe = eta_chunk.clamp(min=_Z_G_CLAMP)
-        G_chunk = -1.0 / torch.expm1(-eta_safe)
-        log_q_chunk = -torch.log(torch.expm1(eta_safe))
-
-        # P1: old θ_out, θ_in
-        logit_p1_chunk = -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q_chunk
-        p1_chunk = torch.sigmoid(logit_p1_chunk)
-        w1_chunk = p1_chunk * G_chunk
-
-        p1_chunk[local_i, global_j] = 0.0
-        w1_chunk[local_i, global_j] = 0.0
-        G_chunk[local_i, global_j] = 0.0
-
-        pq1_chunk = p1_chunk * (1.0 - p1_chunk)
-
-        k_out_hat[i_start:i_end] = p1_chunk.sum(1)
-        k_in_hat += p1_chunk.sum(0)
-        s_out_hat[i_start:i_end] = w1_chunk.sum(1)
-        s_in_hat += w1_chunk.sum(0)
-
-        # Immediately compute θ_out_new for this chunk
-        H_k_out_chunk = pq1_chunk.sum(1).clamp(min=1e-15)
-        delta_to_chunk = (
-            (k_out_hat[i_start:i_end] - k_out[i_start:i_end]) / H_k_out_chunk
-        ).clamp(-max_step, max_step)
-        to_new_chunk = (theta_out[i_start:i_end] + delta_to_chunk).clamp(-_THETA_MAX, _THETA_MAX)
-        to_new_chunk = torch.where(
-            zero_k_out[i_start:i_end],
-            torch.full_like(to_new_chunk, _THETA_MAX),
-            to_new_chunk,
-        )
-        theta_out_new[i_start:i_end] = to_new_chunk
-
-        # P2: new θ_out, old θ_in, same G (diagonal already zeroed)
-        logit_p2_chunk = -to_new_chunk[:, None] - theta_in[None, :] + log_q_chunk
-        p2_chunk = torch.sigmoid(logit_p2_chunk)
-        p2_chunk[local_i, global_j] = 0.0
-        pq2_chunk = p2_chunk * (1.0 - p2_chunk)
-        pq2_chunk[local_i, global_j] = 0.0
-
-        k_in_hat2 += p2_chunk.sum(0)
-        H_k_in2 += pq2_chunk.sum(0)
-
-    F_current = torch.cat(
-        [k_out_hat - k_out, k_in_hat - k_in,
-         s_out_hat - s_out, s_in_hat - s_in]
-    )
-
-    H_k_in2 = H_k_in2.clamp(min=1e-15)
-    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_in_new = torch.where(
-        zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
-    )
-
-    # ------------------------------------------------------------------
-    # Loop 2: old-η, new θ_out and θ_in → row sums for η_out update.
-    # ------------------------------------------------------------------
-    s_out_hat3 = torch.zeros(N, dtype=torch.float64)
-    H_s_out3 = torch.zeros(N, dtype=torch.float64)
-    z_min_out = torch.full((N,), float("inf"), dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-
-        eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # old η
-        eta_safe = eta_chunk.clamp(min=_Z_G_CLAMP)
-        G_chunk = -1.0 / torch.expm1(-eta_safe)
-        log_q_chunk = -torch.log(torch.expm1(eta_safe))
-
-        logit_p3_chunk = (
-            -theta_out_new[i_start:i_end, None] - theta_in_new[None, :] + log_q_chunk
-        )
-        p3_chunk = torch.sigmoid(logit_p3_chunk)
-        w3_chunk = p3_chunk * G_chunk
-
-        p3_chunk[local_i, global_j] = 0.0
-        w3_chunk[local_i, global_j] = 0.0
-        G_chunk[local_i, global_j] = 0.0
-
-        pq3_chunk = p3_chunk * (1.0 - p3_chunk)
-        pq3_chunk[local_i, global_j] = 0.0
-        PGG1_3_chunk = p3_chunk * G_chunk * (G_chunk - 1.0)
-        CORR_3_chunk = pq3_chunk * G_chunk.pow(2)
-
-        s_out_hat3[i_start:i_end] = w3_chunk.sum(1)
-        H_s_out3[i_start:i_end] = (PGG1_3_chunk + CORR_3_chunk).sum(1)
-
-        sig_mask3 = logit_p3_chunk > sig_log_thresh
-        z_sig3 = torch.where(sig_mask3, eta_chunk, torch.full_like(eta_chunk, float("inf")))
-        z_min_out[i_start:i_end] = torch.minimum(
-            z_min_out[i_start:i_end], z_sig3.min(1).values
-        )
-
-    nz_in = s_in > 0
-    if nz_in.any():
-        min_eta_in_nz = eta_in[nz_in].min()
-        z_min_out = torch.minimum(z_min_out, eta_out + min_eta_in_nz)
-
-    H_s_out3 = H_s_out3.clamp(min=1e-15)
-    delta_eta_out = ((s_out_hat3 - s_out) / H_s_out3).clamp(-max_step, max_step)
-    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
-    alpha_out = torch.where(
-        delta_eta_out < 0,
-        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
-    eta_out_new = torch.where(
-        zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
-    )
-
-    # ------------------------------------------------------------------
-    # Loop 3: new η_out → col sums for η_in update.
-    # ------------------------------------------------------------------
-    s_in_hat4 = torch.zeros(N, dtype=torch.float64)
-    H_s_in4 = torch.zeros(N, dtype=torch.float64)
-    z_min_in = torch.full((N,), float("inf"), dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-
-        eta4_chunk = eta_out_new[i_start:i_end, None] + eta_in[None, :]
-        eta4_safe = eta4_chunk.clamp(min=_Z_G_CLAMP)
-        G4_chunk = -1.0 / torch.expm1(-eta4_safe)
-        log_q4_chunk = -torch.log(torch.expm1(eta4_safe))
-
-        logit_p4_chunk = (
-            -theta_out_new[i_start:i_end, None] - theta_in_new[None, :] + log_q4_chunk
-        )
-        p4_chunk = torch.sigmoid(logit_p4_chunk)
-        w4_chunk = p4_chunk * G4_chunk
-
-        p4_chunk[local_i, global_j] = 0.0
-        w4_chunk[local_i, global_j] = 0.0
-        G4_chunk[local_i, global_j] = 0.0
-
-        pq4_chunk = p4_chunk * (1.0 - p4_chunk)
-        pq4_chunk[local_i, global_j] = 0.0
-        PGG1_4_chunk = p4_chunk * G4_chunk * (G4_chunk - 1.0)
-        CORR_4_chunk = pq4_chunk * G4_chunk.pow(2)
-
-        s_in_hat4 += w4_chunk.sum(0)
-        H_s_in4 += (PGG1_4_chunk + CORR_4_chunk).sum(0)
-
-        sig_mask4 = logit_p4_chunk > sig_log_thresh
-        z_sig4 = torch.where(sig_mask4, eta4_chunk, torch.full_like(eta4_chunk, float("inf")))
-        z_min_in = torch.minimum(z_min_in, z_sig4.min(0).values)
-
-    nz_out = s_out > 0
-    if nz_out.any():
-        min_eta_out_new_nz = eta_out_new[nz_out].min()
-        z_min_in = torch.minimum(z_min_in, min_eta_out_new_nz + eta_in)
-
-    H_s_in4 = H_s_in4.clamp(min=1e-15)
-    delta_eta_in = ((s_in_hat4 - s_in) / H_s_in4).clamp(-max_step, max_step)
-    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
-    alpha_in = torch.where(
-        delta_eta_in < 0,
-        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
-    eta_in_new = torch.where(
-        zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
-    )
-
-    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
-    return theta_new, F_current
-
-
-# -------------------------------------------------------------------------
 # Main solver
 # -------------------------------------------------------------------------
 
@@ -949,18 +516,9 @@ def solve_fixed_point_decm(
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
-    Each iteration applies the alternating Newton step.  Two variants are
-    supported:
-
-    * ``"theta-newton"`` (default): 2-pass GS scheme — pass 1 updates
-      (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col
-      sums using the freshly updated values.
-
-    * ``"theta-newton-4step"``: 4-step GS scheme — step 1 updates θ_out,
-      step 2 updates θ_in (reusing G/log_q), step 3 updates η_out (reusing
-      G/log_q), step 4 updates η_in with a new G computed from the updated
-      η_out.  Each step sees the most recent values of all previously updated
-      parameters.
+    Each iteration applies a 2-pass GS-Newton step: pass 1 updates
+    (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col
+    sums using the freshly updated values.
 
     Anderson acceleration (depth ``anderson_depth``) is applied to the full
     4N vector with a feasibility guard that rejects infeasible mixes.
@@ -976,8 +534,7 @@ def solve_fixed_point_decm(
         s_in:           Observed in-strength sequence, shape (N,).
         tol:            Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
         max_iter:       Maximum number of iterations.
-        variant:        Solver variant: ``"theta-newton"`` (default) or
-                        ``"theta-newton-4step"``.
+        variant:        Solver variant: only ``"theta-newton"`` is supported.
         chunk_size:     If > 0, use chunked computation with this row-chunk
                         size.  If 0, auto-select: dense for
                         N ≤ ``_LARGE_N_THRESHOLD``, chunked otherwise.
@@ -988,8 +545,6 @@ def solve_fixed_point_decm(
                         or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000
                         and Numba for larger networks.  Falls back automatically
                         with a warning if the requested backend is unavailable.
-                        ``"theta-newton-4step"`` always uses PyTorch regardless
-                        of this setting.
         num_threads:    Number of Numba parallel threads.  0 (default) leaves
                         the global Numba thread count unchanged.  Only takes
                         effect when ``backend="numba"`` (or ``"auto"`` at large N).
@@ -1002,10 +557,10 @@ def solve_fixed_point_decm(
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
     """
-    if variant not in ("theta-newton", "theta-newton-4step"):
+    if variant not in ("theta-newton",):
         raise ValueError(
             f"Unknown variant {variant!r}. "
-            "Supported: 'theta-newton', 'theta-newton-4step'."
+            "Supported: 'theta-newton'."
         )
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
@@ -1084,22 +639,7 @@ def solve_fixed_point_decm(
                 np.concatenate([result[4], result[5], result[6], result[7]])
             )
             return theta_new, F_current
-    elif variant == "theta-newton-4step":
-        if effective_chunk > 0:
-            def _step(th):
-                return _decm_step_chunked_4step(
-                    th, k_out, k_in, s_out, s_in,
-                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                    effective_chunk, max_step,
-                )
-        else:
-            def _step(th):
-                return _decm_step_dense_4step(
-                    th, k_out, k_in, s_out, s_in,
-                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                    max_step,
-                )
-    elif effective_chunk > 0:
+    if effective_chunk > 0:
         def _step(th):
             return _decm_step_chunked(
                 th, k_out, k_in, s_out, s_in,

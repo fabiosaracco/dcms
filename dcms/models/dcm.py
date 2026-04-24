@@ -341,11 +341,15 @@ class DCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic:str='degrees', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
+    def solve_tool(self, ic:str='degrees', theta_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
             ic (str): the initial condition on theta. Default="degrees", another possible choice is "random".
+            theta_0: Custom initial parameter vector, shape ``(2N,)``.  If
+                provided, overrides ``ic`` entirely.  Useful for warm-starting
+                from a previous (partially converged) solution.  Can be a
+                numpy array, list, or :class:`torch.Tensor`.
             tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
             max_iter (int): the maximum number of iterations. Default=2000.
             variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
@@ -369,7 +373,11 @@ class DCMModel:
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
         """
-        self.ic=self.initial_theta(ic)
+        if theta_0 is not None:
+            import torch as _torch
+            self.ic = _torch.as_tensor(theta_0, dtype=_torch.float64)
+        else:
+            self.ic=self.initial_theta(ic)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
         self.sol = solve_fixed_point_dcm(self.residual, self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         if len(self.sol.message)>0:

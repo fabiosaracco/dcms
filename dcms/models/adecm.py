@@ -608,12 +608,21 @@ class ADECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
+    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', theta_topo_0=None, theta_weights_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
             ic_topo (str): the initial condition on theta for the topology. Default="degrees", another possible choice is "random".
             ic_wei (str): the initial condition on theta for the weights. Default="topology", another possible choice is "random".
+            theta_topo_0: Custom initial parameter vector for the topology step,
+                shape ``(2N,)``.  If provided, overrides ``ic_topo`` entirely.
+                Can be a numpy array, list, or :class:`torch.Tensor`.  Useful
+                for warm-starting from a previous :attr:`sol_topo`.theta.
+            theta_weights_0: Custom initial parameter vector for the weight step,
+                shape ``(2N,)``.  If provided, overrides ``ic_weights`` entirely.
+                Can be a numpy array, list, or :class:`torch.Tensor`.  Useful
+                for warm-starting from a previous :attr:`sol_weights`.theta
+                (e.g. best iterate from a prior run that did not converge).
             tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
             max_iter (int): the maximum number of iterations. Default=2000.
             variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
@@ -637,8 +646,12 @@ class ADECMModel:
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
         """
+        import torch as _torch
         # Step 1: solve the DCM topology
-        self.ic_topo=self.initial_theta_topo(ic_topo)
+        if theta_topo_0 is not None:
+            self.ic_topo = _torch.as_tensor(theta_topo_0, dtype=_torch.float64)
+        else:
+            self.ic_topo=self.initial_theta_topo(ic_topo)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
         self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         
@@ -648,7 +661,10 @@ class ADECMModel:
        
 
         # Step 2: solve the conditioned weight equations
-        self.ic_weig = self.initial_theta_weight(theta_topo = self.sol_topo.theta, method=ic_weights)
+        if theta_weights_0 is not None:
+            self.ic_weig = _torch.as_tensor(theta_weights_0, dtype=_torch.float64)
+        else:
+            self.ic_weig = self.initial_theta_weight(theta_topo = self.sol_topo.theta, method=ic_weights)
 
         # Build the residual function that fixes theta_topo
         res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)

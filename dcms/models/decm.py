@@ -572,6 +572,7 @@ class DECMModel:
     def solve_tool(
         self,
         ic: str = "degrees",
+        theta_0=None,
         tol: float = 1e-6,
         max_iter: int = 2000,
         max_time: float = 0,
@@ -598,6 +599,11 @@ class DECMModel:
         Args:
             ic:            Primary initial condition (``"degrees"``, ``"random"``,
                            ``"uniform"``, ``"adecm"``).
+            theta_0:       Custom initial parameter vector, shape ``(4N,)``
+                           ``[θ_out | θ_in | η_out | η_in]``.  If provided,
+                           overrides ``ic`` and disables ``multi_start``
+                           (a single run is performed from the given vector).
+                           Can be a numpy array, list, or :class:`torch.Tensor`.
             tol:           Convergence tolerance on the ℓ∞ residual.
             max_iter:      Maximum iterations per attempt.
             max_time:      Wall-clock time limit in seconds per attempt
@@ -606,7 +612,8 @@ class DECMModel:
             anderson_depth: Anderson acceleration depth.
             multi_start:   If ``True`` (default), retry with fallback ICs when
                            the primary IC does not converge.  Set to ``False``
-                           for clean per-IC benchmarking.
+                           for clean per-IC benchmarking.  Ignored when
+                           ``theta_0`` is provided.
             backend:       Compute backend: ``"auto"`` (default), ``"pytorch"``,
                            or ``"numba"``.  ``"auto"`` uses PyTorch for
                            N ≤ 5 000 and Numba for larger networks.
@@ -627,12 +634,17 @@ class DECMModel:
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
         """
+        import torch as _torch
         from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
         _FALLBACK_ICS = ["adecm", "random"]
 
-        def _run_once(ic_name: str):
-            theta0 = self.initial_theta(ic_name)
+        def _run_once(ic_name: str, theta0_override=None):
+            theta0 = (
+                _torch.as_tensor(theta0_override, dtype=_torch.float64)
+                if theta0_override is not None
+                else self.initial_theta(ic_name)
+            )
             return solve_fixed_point_decm(
                 residual_fn=self.residual,
                 theta0=theta0,
@@ -651,6 +663,13 @@ class DECMModel:
                 verbose=verbose,
                 monitor=monitor,
             )
+
+        if theta_0 is not None:
+            self.ic = _torch.as_tensor(theta_0, dtype=_torch.float64)
+            self.sol = _run_once(ic, theta0_override=theta_0)
+            if self.sol.message:
+                print(self.sol.message+" "*50)
+            return self.sol.converged
 
         self.ic = self.initial_theta(ic)
         self.sol = _run_once(ic)

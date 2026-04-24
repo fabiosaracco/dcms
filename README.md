@@ -345,6 +345,8 @@ model = ADECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
     ic_topo="degrees",      # topology init: "degrees" (default) or "random"
     ic_weights="topology",  # weight init: "topology" (default) or "topology_node"
+    theta_topo_0=None,      # custom topology IC (overrides ic_topo if given)
+    theta_weights_0=None,   # custom weight IC (overrides ic_weights if given)
     tol=1e-6,
     max_iter=2000,
     max_time=0,
@@ -522,7 +524,26 @@ model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to
 
 `num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
 
-**Verbose iteration logging.**  Each `solve_tool()` accepts two related parameters: `verbose` and `monitor`.
+**Custom initial conditions (warm restart).**  All `solve_tool()` methods accept a `theta_0` parameter (or `theta_topo_0` / `theta_weights_0` for aDECM) to supply a fully custom starting vector.  This is the recommended approach when a first run did not converge: save the best iterate and reuse it as the starting point for a second run with different hyperparameters.
+
+```python
+# First attempt (does not converge on a hard network)
+model = ADECMModel(k_out, k_in, s_out, s_in)
+model.solve_tool(max_iter=2000)
+
+# Warm-restart: reuse the best topology and weight iterates,
+# lower Anderson depth to reduce contamination
+model.solve_tool(
+    theta_topo_0=model.sol_topo.theta,      # skip topology re-solve
+    theta_weights_0=model.sol_weights.theta, # start weights from best seen
+    anderson_depth=3,
+    max_iter=5000,
+)
+```
+
+For DCM, DWCM, and DECM pass a single `theta_0` array of the appropriate shape (2N, 2N, or 4N respectively).  When `theta_0` is provided for aDECM, `theta_topo_0` is used for the topology step only if also provided; otherwise the topology is re-solved from `ic_topo`.  When `theta_0` is provided for DECM, `multi_start` is automatically disabled (a single run from the given vector is performed).
+
+
 
 ```python
 # Full log — a new line is printed at every iteration (default behaviour):

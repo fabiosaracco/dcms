@@ -65,6 +65,7 @@ _ANDERSON_MAX_NORM: float = 1e6
 # _Z_NEWTON_FLOOR) after each GS step; the Anderson feasibility guard projects any
 # infeasible mix back to z ≥ floor while keeping history intact for acceleration.
 _ANDERSON_BLOWUP_FACTOR: float = 5000.0  # clear Anderson history if F > 5000 × best
+_TN_RESET_WINDOW: int = 30  # clear Anderson + revert to best_theta if no TN improvement
 _Q_MAX: float = 0.9999  # maximum allowed product β_out * β_in
 
 # Minimum z_ij = θ_β_out_i + θ_β_in_j used in G_ij = 1/expm1(z_safe).
@@ -820,6 +821,10 @@ def solve_fixed_point_adecm(
     _fpgs_best_local: float = float("inf")
     _fpgs_stagnation_count: int = 0
 
+    # θ-Newton Anderson reset counter (revert to best_theta when stagnant)
+    _tn_best_local: float = float("inf")
+    _tn_stagnation_count: int = 0
+
     # Precompute verbose targets once (MRE = max |F_i| / s_i)
     _v_targets = torch.cat([s_out, s_in])
     _v_nonzero = _v_targets > 0
@@ -946,9 +951,10 @@ def solve_fixed_point_adecm(
                 sys.stdout.flush()
 
             # Keep a reference to the iterate with the minimum equation-residual.
+            # Save theta_fp (the Newton/FP output) since res_norm was measured on it.
             if res_norm < best_theta_res:
                 best_theta_res = res_norm
-                best_theta = theta.clone()
+                best_theta = theta_fp.clone()
 
             if res_norm < tol:
                 converged = True
@@ -988,8 +994,29 @@ def solve_fixed_point_adecm(
                         _and_g.clear()
                         _and_r.clear()
 
+            # θ-Newton Anderson reset: when Anderson has been stagnant for
+            # _TN_RESET_WINDOW iterations, clear its history and revert to
+            # best_theta so the next Newton step starts from the best-seen
+            # iterate rather than a contaminated Anderson mix.
+            _tn_revert_triggered = False
+            if variant == "theta-newton" and anderson_depth > 1:
+                if res_norm < _tn_best_local * 0.99:
+                    _tn_best_local = res_norm
+                    _tn_stagnation_count = 0
+                else:
+                    _tn_stagnation_count += 1
+                    if _tn_stagnation_count >= _TN_RESET_WINDOW and res_norm > tol:
+                        _tn_stagnation_count = 0
+                        _tn_best_local = float("inf")
+                        _and_g.clear()
+                        _and_r.clear()
+                        _tn_revert_triggered = True
+
             # --- Apply Anderson acceleration or plain update ---
-            if anderson_depth > 1:
+            if _tn_revert_triggered:
+                # Anderson was stagnant: restart next iteration from best_theta.
+                theta_next = best_theta.clone()
+            elif anderson_depth > 1:
                 # Blowup guard: when res_norm jumps > 100 × best_seen, Anderson
                 # history contains "blowup-phase" iterates that poison future
                 # mixes.  Clear the history but DO NOT revert to best_theta —

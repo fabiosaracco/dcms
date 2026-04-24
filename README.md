@@ -524,25 +524,7 @@ model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to
 
 `num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
 
-**Custom initial conditions (warm restart).**  All `solve_tool()` methods accept a `theta_0` parameter (or `theta_topo_0` / `theta_weights_0` for aDECM) to supply a fully custom starting vector.  This is the recommended approach when a first run did not converge: save the best iterate and reuse it as the starting point for a second run with different hyperparameters.
-
-```python
-# First attempt (does not converge on a hard network)
-model = ADECMModel(k_out, k_in, s_out, s_in)
-model.solve_tool(max_iter=2000)
-
-# Warm-restart: reuse the best topology and weight iterates,
-# lower Anderson depth to reduce contamination
-model.solve_tool(
-    theta_topo_0=model.sol_topo.theta,      # skip topology re-solve
-    theta_weights_0=model.sol_weights.theta, # start weights from best seen
-    anderson_depth=3,
-    max_iter=5000,
-)
-```
-
-For DCM, DWCM, and DECM pass a single `theta_0` array of the appropriate shape (2N, 2N, or 4N respectively).  When `theta_0` is provided for aDECM, `theta_topo_0` is used for the topology step only if also provided; otherwise the topology is re-solved from `ic_topo`.  When `theta_0` is provided for DECM, `multi_start` is automatically disabled (a single run from the given vector is performed).
-
+**Custom initial conditions (warm restart).**  See §3.9 for details and examples.
 
 
 ```python
@@ -577,7 +559,57 @@ pip install dcms[numba]          # installs numba as an optional extra
 pip install dcms numba           # equivalent
 ```
 
-### 3.9 Network generator (`dcms/utils/wng.py`)
+### 3.9 Custom initial conditions and warm restart
+
+Each model internally works with a *parameter vector* in log-space.  For DCM the entries are the Lagrange multipliers θ_i = −log(x_i) associated to degree constraints; for DWCM / aDECM (weight step) / DECM (weight part) they are η_i = −log(β_i), the log-fitnesses associated to strength constraints.  After `solve_tool()` finishes, the result is stored in `model.sol.theta` (or `model.sol_topo.theta` / `model.sol_weights.theta` for aDECM).
+
+**Shape of the parameter vectors**
+
+| Model | Attribute | Shape | Content |
+|-------|-----------|-------|---------|
+| DCM | `model.sol.theta` | (2N,) | `[θ_out₀ … θ_out_{N-1} | θ_in₀ … θ_in_{N-1}]` |
+| DWCM | `model.sol.theta` | (2N,) | `[η_out₀ … | η_in₀ …]` where `β_out_i = exp(−η_out_i)` |
+| aDECM | `model.sol_topo.theta` | (2N,) | DCM multipliers (same as DCM) |
+| aDECM | `model.sol_weights.theta` | (2N,) | DWCM-like multipliers `[η_out | η_in]` |
+| DECM | `model.sol.theta` | (4N,) | `[θ_out | θ_in | η_out | η_in]` |
+
+The entries are related to the model probabilities by `x_i = exp(−θ_i)` (topology) and `β_i = exp(−η_i)` (weights).  The feasibility constraint is `η_out_i + η_in_j > 0` for every pair (i, j) with a potential link (individual η can be negative as long as the pairwise sum stays positive).
+
+**Why custom ICs?**
+
+By default `solve_tool()` computes the starting point from the observed degree/strength sequences (the `ic` / `ic_topo` / `ic_weights` string choices).  On hard instances — networks with very high-weight hubs or extreme s/k ratios — the automatic starting point may be far from the solution and the solver may not converge within the iteration budget.  The new `theta_0` / `theta_topo_0` / `theta_weights_0` parameters let you supply any array as the starting point, enabling two practical strategies:
+
+1. **Warm restart** — if a first call did not converge, the best iterate found so far is always stored in `model.sol.theta` / `model.sol_weights.theta` (the solver internally tracks the iterate with the smallest residual, not just the last one).  Pass that array back as the starting point for a second call, possibly with a smaller `anderson_depth` to reduce Anderson contamination:
+
+```python
+model = ADECMModel(k_out, k_in, s_out, s_in)
+model.solve_tool(max_iter=5000, verbose=True, monitor=True)
+
+if not model.sol_weights.converged:
+    # Second attempt from best iterate, less aggressive Anderson mixing
+    model.solve_tool(
+        theta_topo_0=model.sol_topo.theta,       # topology already solved, reuse it
+        theta_weights_0=model.sol_weights.theta,  # start from best weight iterate
+        anderson_depth=3,                         # reduce Anderson depth
+        max_iter=10000,
+    )
+```
+
+2. **Transfer warm start** — use the DWCM solution as the starting point for the aDECM weight step (the weight equations are similar, and DWCM is easier to solve):
+
+```python
+dwcm = DWCMModel(s_out, s_in)
+dwcm.solve_tool()
+
+adecm = ADECMModel(k_out, k_in, s_out, s_in)
+adecm.solve_tool(
+    theta_weights_0=dwcm.sol.theta,   # DWCM solution as weight IC
+)
+```
+
+For DCM and DWCM pass `theta_0` (shape 2N).  For DECM pass `theta_0` (shape 4N = `[θ_out|θ_in|η_out|η_in]`); `multi_start` is automatically disabled when `theta_0` is provided.
+
+### 3.10 Network generator (`dcms/utils/wng.py`)
 
 ```python
 from dcms.utils.wng import k_s_generator_pl

@@ -421,6 +421,11 @@ def _theta_newton_step_dense(
 
     where G_ij = 1/expm1(θ_β_out_i + θ_β_in_j).
 
+    A per-node z-floor line-search (identical to the chunked path) ensures that
+    z_ij = θ_β_out_i + θ_β_in_j never drops below
+    max(z_min_ij * _Z_NEWTON_FRAC, _Z_NEWTON_FLOOR) after the step, preventing
+    the G = 1/expm1(z) computation from blowing up when z → 0⁺.
+
     Args:
         theta_weight: Current weight parameters [θ_β_out | θ_β_in], shape (2N,).
         P:            DCM probability matrix, shape (N, N), diagonal zero.
@@ -455,7 +460,29 @@ def _theta_newton_step_dense(
     neg_H_out = (-H_out).clamp(min=1e-15)
     delta_out = F_out / neg_H_out                     # = -ΔF/|H|
     delta_out = delta_out.clamp(-max_step, max_step)
-    theta_b_out_new = (theta_b_out + delta_out).clamp(-_ETA_MAX, _ETA_MAX)
+
+    # Per-node z-floor line-search (out-direction): prevent z from dropping
+    # below max(z_min * _Z_NEWTON_FRAC, _Z_NEWTON_FLOOR).
+    # z_min_out[i] = min_{j≠i, s_in_j>0} (theta_b_out_i + theta_b_in_j).
+    # The full z matrix is already materialised, so we can compute the exact
+    # row-wise minimum, masking out the diagonal (self-loop, excluded from G)
+    # and zero-s_in nodes.
+    nz_in_mask = s_in > 0
+    _z_ls_out = z.clone()          # shape (N, N): z[i,j] = theta_b_out[i] + theta_b_in[j]
+    _z_ls_out.fill_diagonal_(float("inf"))          # exclude self-loop
+    if not nz_in_mask.all():
+        _z_ls_out[:, ~nz_in_mask] = float("inf")   # exclude zero-s_in nodes
+    z_min_out = _z_ls_out.min(dim=1).values         # (N,); inf if no valid j
+    z_floor_out = torch.clamp(z_min_out * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
+    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
+    needed_out = delta_out.abs().clamp(min=1e-30)
+    alpha_out = torch.where(
+        delta_out < 0,
+        (available_out / needed_out).clamp(max=1.0),
+        torch.ones(N, dtype=theta_b_out.dtype),
+    )
+
+    theta_b_out_new = (theta_b_out + alpha_out * delta_out).clamp(-_ETA_MAX, _ETA_MAX)
     # Zero-strength nodes: β = 0 exactly → θ = _ETA_MAX
     theta_b_out_new = torch.where(
         s_out == 0, torch.full_like(theta_b_out_new, _ETA_MAX), theta_b_out_new
@@ -476,7 +503,27 @@ def _theta_newton_step_dense(
     neg_H_in = (-H_in).clamp(min=1e-15)
     delta_in = F_in / neg_H_in
     delta_in = delta_in.clamp(-max_step, max_step)
-    theta_b_in_new = (theta_b_in + delta_in).clamp(-_ETA_MAX, _ETA_MAX)
+
+    # Per-node z-floor line-search (in-direction): uses the updated theta_b_out_new.
+    # z_min_in[j] = min_{i≠j, s_out_i>0} (theta_b_out_new[i] + theta_b_in[j]).
+    # Use the exact column-wise minimum from z2 (already materialised),
+    # masking out the diagonal and zero-s_out nodes.
+    nz_out_mask = s_out > 0
+    _z_ls_in = z2.clone()          # shape (N, N): z2[i,j] = theta_b_out_new[i] + theta_b_in[j]
+    _z_ls_in.fill_diagonal_(float("inf"))          # exclude self-loop
+    if not nz_out_mask.all():
+        _z_ls_in[~nz_out_mask, :] = float("inf")  # exclude zero-s_out nodes
+    z_min_in = _z_ls_in.min(dim=0).values           # (N,); inf if no valid i
+    z_floor_in = torch.clamp(z_min_in * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
+    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
+    needed_in = delta_in.abs().clamp(min=1e-30)
+    alpha_in = torch.where(
+        delta_in < 0,
+        (available_in / needed_in).clamp(max=1.0),
+        torch.ones(N, dtype=theta_b_in.dtype),
+    )
+
+    theta_b_in_new = (theta_b_in + alpha_in * delta_in).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_in_new = torch.where(
         s_in == 0, torch.full_like(theta_b_in_new, _ETA_MAX), theta_b_in_new
     )

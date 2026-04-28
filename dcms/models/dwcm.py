@@ -392,7 +392,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic:str='strengths', theta_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, gauge_pivot=None)-> SolverResult:
+    def solve_tool(self, ic:str='strengths', theta_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -420,11 +420,6 @@ class DWCMModel:
             monitor (bool): If ``True`` (and ``verbose=True``), overwrite the
                 same terminal line at each iteration (``end='\\r'``) so only
                 the latest status is visible.  Default=False.
-            gauge_pivot: Gauge normalisation applied after each iteration.
-                ``None`` (default) disables gauge fixing.  ``"min"`` fixes the
-                node with the smallest η_out to 0; ``"mean"`` centres η_out
-                around 0; an ``int`` i fixes η_out[i] = 0.  Requires
-                ``variant="theta-newton"``.  See the README for details.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
@@ -435,7 +430,7 @@ class DWCMModel:
         else:
             self.ic=self.initial_theta(ic)
         from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
-        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, gauge_pivot=gauge_pivot)
+        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         if len(self.sol.message)>0:
             print(self.sol.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
             

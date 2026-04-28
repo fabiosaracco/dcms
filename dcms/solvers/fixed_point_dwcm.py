@@ -102,54 +102,6 @@ _FPGS_NEWTON_STEPS: int = 30
 _FPGS_NEWTON_AND_DEPTH: int = 5
 
 
-def _apply_gauge_shift(
-    theta: torch.Tensor,
-    N: int,
-    gauge_pivot_idx: int,
-) -> torch.Tensor:
-    """Apply a gauge normalisation to the weight-space iterate θ = [η_out | η_in].
-
-    The DWCM equations depend only on pairwise sums z_ij = η_out_i + η_in_j,
-    so shifting η_out by −γ and η_in by +γ leaves every residual unchanged.
-    This degree of freedom is fixed at each step using a *data-determined* pivot
-    node, keeping all iterates in the same gauge frame so Anderson mixing is valid.
-
-    Encoding of ``gauge_pivot_idx``:
-        * ``i ≥ 0``  — pin η_out[i] = 0  (γ = current η_out[i])
-        * ``i < 0``  — pin η_in[j] = 0 where j = −i − 1  (γ = −current η_in[j])
-
-    After the shift the pairwise feasibility constraint
-    min(η_out) + min(η_in) ≥ _ETA_MIN is enforced by clamping the *opposite*
-    half-vector from below (the pinned half already satisfies its bound by
-    construction).
-
-    Args:
-        theta:           Parameter vector [η_out | η_in], shape (2N,).
-        N:               Number of nodes.
-        gauge_pivot_idx: Signed integer pivot encoding (see above).
-
-    Returns:
-        Shifted tensor with the same pairwise sums.
-    """
-    if gauge_pivot_idx >= 0:
-        gamma = theta[gauge_pivot_idx]            # γ = η_out[i]
-    else:
-        j = -gauge_pivot_idx - 1
-        gamma = -theta[N + j]                     # γ = −η_in[j]  →  η_in[j] + γ = 0
-    eta_out = theta[:N] - gamma
-    eta_in  = theta[N:] + gamma
-    if gauge_pivot_idx >= 0:
-        # Pinned η_out: min(η_out) = 0; clamp η_in so min sum ≥ _ETA_MIN
-        in_lower = _ETA_MIN - eta_out.min()
-        eta_in  = eta_in.clamp(min=in_lower)
-    else:
-        # Pinned η_in: min(η_in) = 0; clamp η_out so min sum ≥ _ETA_MIN
-        out_lower = _ETA_MIN - eta_in.min()
-        eta_out = eta_out.clamp(min=out_lower)
-    eta_out = eta_out.clamp(-_ETA_MAX, _ETA_MAX)
-    eta_in  = eta_in.clamp(max=_ETA_MAX)
-    return torch.cat([eta_out, eta_in])
-
 
 def _anderson_mixing(
     fp_outputs: list[torch.Tensor],
@@ -238,7 +190,6 @@ def solve_fixed_point_dwcm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
-    gauge_pivot: "int | str | None" = None,  # type: ignore[name-defined]
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -286,16 +237,6 @@ def solve_fixed_point_dwcm(
         monitor: If ``True`` (and ``verbose=True``), overwrite the same
             terminal line at each iteration (``end='\\r'``) so only the
             latest status is visible.  Default=False.
-        gauge_pivot: Gauge normalisation applied after each iteration.
-            ``None`` (default) disables gauge fixing (backward-compatible).
-            ``"min"`` automatically selects the data-determined pivot: the node
-            with the highest strength across *both* s_out and s_in is pinned to
-            η = 0 at every step.  Because the pivot is fixed from the data, all
-            Anderson iterates live in the same gauge frame.
-            An explicit ``int i ≥ 0`` fixes η_out[i] = 0 at every step.
-            Only meaningful with ``variant="theta-newton"``; a ``ValueError``
-            is raised if used with ``"gauss-seidel"``.
-            See §3.10 of the README for details.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -307,21 +248,6 @@ def solve_fixed_point_dwcm(
     if not (0.0 < damping <= 1.0):
         raise ValueError(f"damping must be in (0, 1], got {damping}")
     if chunk_size < 0:
-        raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
-    if gauge_pivot is not None and variant != "theta-newton":
-        raise ValueError(
-            "gauge_pivot requires variant='theta-newton'; "
-            "the β-space Gauss-Seidel step assumes β_i < 1 (θ_i > 0) and is "
-            "incompatible with negative θ values produced by gauge normalisation."
-        )
-    if gauge_pivot is not None and not (
-        gauge_pivot == "min" or (isinstance(gauge_pivot, int) and gauge_pivot >= 0)
-    ):
-        raise ValueError(
-            f"gauge_pivot must be None, 'min', or a non-negative int; got {gauge_pivot!r}"
-        )
-
-    if not isinstance(s_out, torch.Tensor):
         s_out = torch.tensor(s_out, dtype=torch.float64)
     else:
         s_out = s_out.to(dtype=torch.float64)
@@ -338,30 +264,8 @@ def solve_fixed_point_dwcm(
         theta = theta0.clone().to(dtype=torch.float64)
 
     # Clamp initial theta to feasible range
-    _eta_lo = -_ETA_MAX if gauge_pivot is not None else _ETA_MIN
+    _eta_lo = _ETA_MIN
     theta = theta.clamp(_eta_lo, _ETA_MAX)
-
-    # Resolve gauge pivot to a fixed integer determined by the *data* (never the
-    # current iterate), so all Anderson iterates live in the same gauge frame.
-    # Encoding: i >= 0 → pin η_out[i] = 0; i < 0 → pin η_in[-i-1] = 0.
-    # "min" → argmax over cat(s_out, s_in): the node with the highest overall
-    # strength has the η closest to 0 at the solution and is the natural pivot.
-    _gauge_pivot_idx: "int | None"
-    if gauge_pivot is None:
-        _gauge_pivot_idx = None
-    elif gauge_pivot == "min":
-        all_s = torch.cat([s_out, s_in])
-        max_idx = int(all_s.argmax().item())
-        if max_idx < N:
-            _gauge_pivot_idx = max_idx          # pin η_out[max_idx] = 0
-        else:
-            _gauge_pivot_idx = -(max_idx - N) - 1   # pin η_in[max_idx-N] = 0
-    else:
-        _gauge_pivot_idx = int(gauge_pivot)     # explicit η_out index
-
-    # Apply initial gauge normalisation
-    if _gauge_pivot_idx is not None:
-        theta = _apply_gauge_shift(theta, N, _gauge_pivot_idx)
 
     # Resolve compute backend
     from dcms.utils.backend import resolve_backend
@@ -454,12 +358,12 @@ def solve_fixed_point_dwcm(
                 elif effective_chunk > 0:
                     theta_fp, F_current = _theta_newton_step_chunked(
                         theta, s_out, s_in, effective_chunk, max_step,
-                        eta_lo=-_ETA_MAX if _gauge_pivot_idx is not None else _ETA_MIN,
+                        eta_lo=_ETA_MIN,
                     )
                 else:
                     theta_fp, F_current = _theta_newton_step_dense(
                         theta, s_out, s_in, max_step,
-                        eta_lo=-_ETA_MAX if _gauge_pivot_idx is not None else _ETA_MIN,
+                        eta_lo=_ETA_MIN,
                     )
             else:
                 # β-space fixed-point iteration (Gauss-Seidel or Jacobi)
@@ -595,25 +499,8 @@ def solve_fixed_point_dwcm(
             # (e.g. θ=0.5, δ=−0.5 → 0 → ETA_MIN → β≈1 → 5×10⁹ residual).
             # The floor applies whether or not Anderson is active, so it guards
             # both the plain-step path (len < 2) and the Anderson path.
-            # In gauge mode we allow negative θ, so the individual _ETA_MIN
-            # lower bound is replaced by a pairwise lower bound (enforced by
-            # _apply_gauge_shift after each step); only a symmetric floor is kept.
-            if _gauge_pivot_idx is not None:
-                # Gauge mode: prevent large downward jumps relative to current θ,
-                # but allow negative values.  Use abs to make the floor symmetric.
-                _step_floor = (theta.abs() * _ANDERSON_THETA_FLOOR).clamp(min=1e-15)
-                # Only apply the floor for nodes whose current θ_fp is below their
-                # current θ (i.e., moving in the negative direction), to allow the
-                # gauge freedom while still guarding against overshoot.
-                _step_floor_signed = torch.sign(theta_fp) * _step_floor
-                theta_fp = torch.where(
-                    theta_fp < _step_floor_signed,
-                    torch.maximum(theta_fp, _step_floor_signed),
-                    theta_fp,
-                )
-            else:
-                _step_floor = (theta * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
-                theta_fp = torch.maximum(theta_fp, _step_floor)
+            _step_floor = (theta * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
+            theta_fp = torch.maximum(theta_fp, _step_floor)
 
             # --- Convergence check using the step-computed residual ---
             # F_current = F(θ) at the *current* iterate (before update).
@@ -768,17 +655,12 @@ def solve_fixed_point_dwcm(
                         # nodes can change by up to max_step per iteration, so the
                         # floor (10 % of current θ) is not restrictive and
                         # correctly prevents the β≈1 blowups.
-                        if _gauge_pivot_idx is not None:
-                            # In gauge mode allow negative θ; pairwise feasibility
-                            # is enforced by _apply_gauge_shift after each step.
-                            theta_next = theta_next.clamp(-_ETA_MAX, _ETA_MAX)
-                        else:
-                            theta_floor = (theta * _ANDERSON_THETA_FLOOR).clamp(
-                                min=_ETA_MIN
-                            )
-                            effective_floor = torch.minimum(theta_floor, theta_fp)
-                            theta_next = torch.maximum(theta_next, effective_floor)
-                            theta_next = theta_next.clamp(_ETA_MIN, _ETA_MAX)
+                        theta_floor = (theta * _ANDERSON_THETA_FLOOR).clamp(
+                            min=_ETA_MIN
+                        )
+                        effective_floor = torch.minimum(theta_floor, theta_fp)
+                        theta_next = torch.maximum(theta_next, effective_floor)
+                        theta_next = theta_next.clamp(_ETA_MIN, _ETA_MAX)
                     else:
                         theta_next = theta_fp
             else:
@@ -809,21 +691,18 @@ def solve_fixed_point_dwcm(
                     elif effective_chunk > 0:
                         theta_nt_fp, F_nt = _theta_newton_step_chunked(
                             theta_nt, s_out, s_in, effective_chunk, max_step,
-                            eta_lo=-_ETA_MAX if _gauge_pivot_idx is not None else _ETA_MIN,
+                            eta_lo=_ETA_MIN,
                         )
                     else:
                         theta_nt_fp, F_nt = _theta_newton_step_dense(
                             theta_nt, s_out, s_in, max_step,
-                            eta_lo=-_ETA_MAX if _gauge_pivot_idx is not None else _ETA_MIN,
+                            eta_lo=_ETA_MIN,
                         )
                     # Per-step floor (same as main loop)
-                    if _gauge_pivot_idx is not None:
-                        theta_nt_fp = theta_nt_fp.clamp(-_ETA_MAX, _ETA_MAX)
-                    else:
-                        _nt_floor = (theta_nt * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
-                        theta_nt_fp = torch.maximum(theta_nt_fp, _nt_floor).clamp(
-                            _ETA_MIN, _ETA_MAX
-                        )
+                    _nt_floor = (theta_nt * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
+                    theta_nt_fp = torch.maximum(theta_nt_fp, _nt_floor).clamp(
+                        _ETA_MIN, _ETA_MAX
+                    )
                     nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
                     if nt_res < tol:
                         theta_nt = theta_nt_fp
@@ -839,15 +718,12 @@ def solve_fixed_point_dwcm(
                         _nt_and_r.pop(0)
                     if len(_nt_and_g) >= 2:
                         theta_nt_next = _anderson_mixing(_nt_and_g, _nt_and_r)
-                        if _gauge_pivot_idx is not None:
-                            theta_nt_next = theta_nt_next.clamp(-_ETA_MAX, _ETA_MAX)
-                        else:
-                            eff_floor = torch.minimum(
-                                _nt_floor, theta_nt_fp
-                            )
-                            theta_nt_next = torch.maximum(theta_nt_next, eff_floor).clamp(
-                                _ETA_MIN, _ETA_MAX
-                            )
+                        eff_floor = torch.minimum(
+                            _nt_floor, theta_nt_fp
+                        )
+                        theta_nt_next = torch.maximum(theta_nt_next, eff_floor).clamp(
+                            _ETA_MIN, _ETA_MAX
+                        )
                     else:
                         theta_nt_next = theta_nt_fp
                     theta_nt = theta_nt_next
@@ -857,10 +733,6 @@ def solve_fixed_point_dwcm(
                 _best_res_for_anderson = float("inf")
 
             theta = theta_next
-            # Apply gauge normalisation: shifts η_out and η_in by a constant
-            # so the chosen pivot node stays at η_out[pivot] = 0 each step.
-            if _gauge_pivot_idx is not None:
-                theta = _apply_gauge_shift(theta, N, _gauge_pivot_idx)
     finally:
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)

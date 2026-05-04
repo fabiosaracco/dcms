@@ -132,8 +132,13 @@ class qDECMModel:
 
         The expected weight of arc i→j in the qDECM approximation is:
 
-            W_ij = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
-                 = p_ij / expm1(θ_β_out_i + θ_β_in_j)
+            W_ij = p_ij · G_ij
+                 = p_ij / (1 − β_out_i · β_in_j)
+                 = −p_ij / expm1(−(θ_β_out_i + θ_β_in_j))
+
+        where G_ij = 1/(1−z_ij) and z_ij = β_out_i · β_in_j.  The numerator is
+        p_ij (not p_ij · z_ij) because E[w_ij] = p_ij · E[w_ij | a_ij=1] and the
+        conditional mean weight is E[w_ij | a_ij=1] = 1/(1−z_ij) = G_ij.
 
         Diagonal entries are zero (no self-loops).
 

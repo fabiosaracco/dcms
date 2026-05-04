@@ -2,24 +2,29 @@
 
 The qDECM weight equations (conditioned on a fixed DCM topology ``p_ij``) are:
 
-    s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
-    s_in_i  = Σ_{j≠i} p_ji · β_out_j · β_in_i / (1 − β_out_j · β_in_i)
+    s_out_i = Σ_{j≠i} p_ij / (1 − β_out_i · β_in_j)
+    s_in_i  = Σ_{j≠i} p_ji / (1 − β_out_j · β_in_i)
+
+where z_ij = β_out_i · β_in_j and G_ij = 1/(1-z_ij) is the geometric-distribution
+correction factor.  Note: the numerator is p_ij (not p_ij · z_ij), because
+E[w_ij] = p_ij · E[w_ij | a_ij=1] = p_ij · G_ij.
 
 Two variants are implemented:
 
-* **Gauss-Seidel** — β-space fixed-point; out-multipliers are updated first
-  using the update:
+* **Gauss-Seidel** — multiplicative β-space fixed-point; out-multipliers are
+  updated first using the scaling rule:
 
-      β_out_i^{new} = s_out_i / D_out_i
+      β_out_i^{new} = β_out_i · s_out_i / s_out_hat_i
 
-  where D_out_i = Σ_{j≠i} p_ij · β_in_j / (1 − β_out_i · β_in_j).
+  where s_out_hat_i = Σ_{j≠i} p_ij · G_ij (computed at current β).  This is
+  a valid fixed-point iteration: at convergence s_out_hat_i = s_out_i.
 
   Fresh β_out values are immediately used when computing the in-multiplier
   update:
 
-      β_in_i^{new} = s_in_i / D_in_i
+      β_in_i^{new} = β_in_i · s_in_i / s_in_hat_i
 
-  where D_in_i = Σ_{j≠i} p_ji · β_out_j / (1 − β_out_j · β_in_i).
+  where s_in_hat_i = Σ_{j≠i} p_ji · G_ji (at updated β_out).
 
 * **θ-Newton** — θ-space Gauss-Seidel Newton steps (analogous to the DWCM
   θ-Newton variant).  Out-multipliers are updated first (pass 1), then
@@ -31,10 +36,12 @@ Two variants are implemented:
 
   where:
       F_out_i  = Σ_{j≠i} p_ij · G_ij − s_out_i
-      F′_out_i = −Σ_{j≠i} p_ij · G_ij · (1 + G_ij)
-      G_ij     = 1 / expm1(θ_β_out_i + θ_β_in_j)
+      F′_out_i = −Σ_{j≠i} p_ij · G_ij · (G_ij − 1)   [= ∂F_out/∂θ_β_out_i]
+      G_ij     = −1 / expm1(−(θ_β_out_i + θ_β_in_j))  [= 1/(1−exp(−z))]
 
-  Pass 2 mirrors this for the in-multipliers using the updated θ_β_out.
+  Note: G_ij > 1 for all z_ij > 0, so F′_out_i < 0 (the system is
+  well-conditioned for Newton in θ-space).  Pass 2 mirrors this for the
+  in-multipliers using the updated θ_β_out.
   The per-node step is clipped to ``[−max_step, +max_step]``.
 
 **Anderson acceleration** is available for all variants (depth 0 = plain FP).
@@ -383,9 +390,9 @@ def _theta_newton_step_dense(
     """One θ-space coordinate Newton step for the qDECM weight equations (dense).
 
     For each node i:
-        Δθ_β_out_i = (Σ_{j≠i} p_ij G_ij − s_out_i) / Σ_{j≠i} p_ij G_ij(1+G_ij)
+        Δθ_β_out_i = (Σ_{j≠i} p_ij G_ij − s_out_i) / Σ_{j≠i} p_ij G_ij(G_ij−1)
 
-    where G_ij = 1/expm1(θ_β_out_i + θ_β_in_j).
+    where G_ij = −1/expm1(−(θ_β_out_i + θ_β_in_j)) = 1/(1−exp(−z_ij)).
 
     A per-node z-floor line-search (identical to the chunked path) ensures that
     z_ij = θ_β_out_i + θ_β_in_j never drops below

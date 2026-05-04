@@ -37,8 +37,8 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
   ```
   k_out_i = Σ_{j≠i} (x_i * y_j) / (1 + x_i * y_j)
   k_in_i  = Σ_{j≠i} (x_j * y_i) / (1 + x_j * y_i) [come nel DCM]
-  s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 - β_out_i · β_in_j)
-  s_in_i  = analoga
+  s_out_i = Σ_{j≠i} p_ij / (1 - β_out_i · β_in_j)
+  s_in_i  = analoga  [E[w_ij] = p_ij · 1/(1-z_ij), non p_ij · z_ij/(1-z_ij)]
   ```
 - Dimensione: 4N equazioni in 4N incognite
 - In pratica, prima si risolve il DCM (riusare le routine esistenti), poi si risolve un DWCM condizionato alla topologia del DCM.
@@ -131,7 +131,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Codice: `src/solvers/fixed_point_dwcm.py` (varianti "gauss-seidel", "theta-newton")
 
 ### Fase 5: qDECM ✅ COMPLETATA
-- Modello: `src/models/qdecm.py` — equazioni condizionate W_ij = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
+- Modello: `src/models/qdecm.py` — equazioni condizionate W_ij = p_ij / (1 − β_out_i · β_in_j)
 - Two-step solver: `src/solvers/qdecm_solver.py` — DCM → conditioned DWCM (θ-Newton Anderson)
 - FP solver per la parte pesata: `src/solvers/fixed_point_qdecm.py` — varianti FP-GS, Jacobi, θ-Newton + Anderson
 - Metodi joint su 4N variabili: `residual_joint`, `neg_log_likelihood_joint`, `constraint_error_joint`

@@ -80,9 +80,11 @@ The qDECM constrains *four* sequences per node: **out-degree**, **in-degree**, *
 2. **Weight step** — solve a DWCM conditioned on the DCM topology to find `2N` additional multipliers `(β_out_i, β_in_i)` reproducing the strength sequences:
 
 ```
-s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
-s_in_i  = Σ_{j≠i} p_ji · β_out_j · β_in_i / (1 − β_out_j · β_in_i)
+s_out_i = Σ_{j≠i} p_ij / (1 − β_out_i · β_in_j)
+s_in_i  = Σ_{j≠i} p_ji / (1 − β_out_j · β_in_i)
 ```
+
+The expected weight of arc i→j conditioned on the DCM topology is `E[w_ij] = p_ij · E[w_ij | a_ij=1]` where the conditional mean weight is `E[w_ij | a_ij=1] = 1 / (1 − β_out_i · β_in_j)`.  Hence the numerator is `p_ij`, not `p_ij · β_out_i · β_in_j`.
 
 The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight multipliers.
 
@@ -153,10 +155,16 @@ The **Gauss-Seidel** ordering updates `θ_out` first and immediately uses the fr
 
 Convergence is guaranteed when ρ < 1.  For sparse, homogeneous networks this holds comfortably.  For power-law networks with high-degree hubs, some nodes have ρ ≥ 1 and plain FP-GS stagnates; a node-level Newton fallback and the blowup-reset logic handle those cases (see Implementation details below).
 
-For the DWCM and qDECM weight step, the fixed-point map in β-space is:
+For the DWCM and qDECM weight step, the fixed-point map in β-space is a multiplicative scaling rule.  For the **DWCM** (where `p_ij = 1`):
 
 ```
-β_out_i^new = s_out_i / D_out_i,   D_out_i = Σ_{j≠i} p_ij · β_in_j / (1 - β_out_i · β_in_j)²
+β_out_i^new = β_out_i · s_out_i / s_out_hat_i,   s_out_hat_i = Σ_{j≠i} β_in_j / (1 - β_out_i · β_in_j)
+```
+
+For the **qDECM weight step** (conditioned DWCM with `p_ij` from the DCM):
+
+```
+β_out_i^new = β_out_i · s_out_i / s_out_hat_i,   s_out_hat_i = Σ_{j≠i} p_ij / (1 - β_out_i · β_in_j)
 ```
 
 Here the spectral radius depends on the inverse of `(1 - β·β)`, which grows rapidly as `β → 1` (hub nodes with `s/k → ∞`).  This is the main failure mode of FP-GS at large N and high heterogeneity.

@@ -45,13 +45,13 @@ from typing import Callable
 
 import torch
 
-from dcms.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import qDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
 from dcms.solvers.base import SolverResult
 from dcms.utils.profiling import _PeakRAMMonitor
 
 # -------------------------------------------------------------------------
-# Numerical constants (mirrors fixed_point_adecm.py)
+# Numerical constants (mirrors fixed_point_qdecm.py)
 # -------------------------------------------------------------------------
 _ANDERSON_MAX_NORM: float = 1e6
 _ANDERSON_BLOWUP_FACTOR: float = 50.0
@@ -69,7 +69,7 @@ _STAGNATION_RTOL: float = 0.01
 
 
 # -------------------------------------------------------------------------
-# Anderson mixing (identical to the version in fixed_point_adecm.py)
+# Anderson mixing (identical to the version in fixed_point_qdecm.py)
 # -------------------------------------------------------------------------
 
 def _anderson_mixing(

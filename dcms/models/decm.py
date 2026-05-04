@@ -9,7 +9,7 @@ The physical multipliers are:
     x_i      = exp(-θ_out_i),   y_j = exp(-θ_in_j)    (topology)
     β_out_i  = exp(-η_out_i),   β_in_j = exp(-η_in_j) (weight)
 
-Unlike the aDECM (where p_ij uses only the topology parameters), the DECM
+Unlike the qDECM (where p_ij uses only the topology parameters), the DECM
 connection probability **couples** topology and weight parameters:
 
     q_ij     = 1 / expm1(η_out_i + η_in_j)
@@ -41,7 +41,7 @@ from typing import Union
 
 import torch
 
-from dcms.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import qDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
 from dcms.solvers.base import SolverResult
 
@@ -458,7 +458,7 @@ class DECMModel:
               for weights.
             * ``"random"``: uniform random in [0.1, 2.0] for all components.
             * ``"uniform"``: fixed value 1.0 for all components.
-            * ``"adecm"``: solve aDECM first (DCM topology + conditioned DWCM
+            * ``"qdecm"``: solve qDECM first (DCM topology + conditioned DWCM
               weights) and use the concatenated 4N solution as warm-start.
               More expensive to compute but lands in a much better basin for
               networks with extreme s/k ratios or heterogeneous hubs.
@@ -474,17 +474,17 @@ class DECMModel:
         """
         N = self.N
 
-        if method == "adecm":
+        if method == "qdecm":
             # Late import to avoid circular dependency at module level.
             import io, contextlib
-            from dcms.models.adecm import ADECMModel
-            adecm = ADECMModel(self.k_out, self.k_in, self.s_out, self.s_in)
+            from dcms.models.qdecm import qDECMModel
+            qdecm = qDECMModel(self.k_out, self.k_in, self.s_out, self.s_in)
             # Suppress solver progress messages — this is an IC computation,
             # not a user-facing solve.
             with contextlib.redirect_stdout(io.StringIO()):
-                adecm.solve_tool(ic_topo="degrees", ic_weights="topology")
-            theta_topo = torch.as_tensor(adecm.sol_topo.theta, dtype=torch.float64)
-            theta_weight = torch.as_tensor(adecm.sol_weights.theta, dtype=torch.float64)
+                qdecm.solve_tool(ic_topo="degrees", ic_weights="topology")
+            theta_topo = torch.as_tensor(qdecm.sol_topo.theta, dtype=torch.float64)
+            theta_weight = torch.as_tensor(qdecm.sol_weights.theta, dtype=torch.float64)
             return torch.cat([theta_topo, theta_weight])
 
         if method in ("degrees", "random", "uniform"):
@@ -587,7 +587,7 @@ class DECMModel:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
         If the primary IC does not converge and ``multi_start=True``,
-        automatically retries with ``"adecm"`` and ``"random"`` warm-starts.
+        automatically retries with ``"qdecm"`` and ``"random"`` warm-starts.
         Each fallback attempt uses the same ``max_iter`` budget.  The result
         stored in ``self.sol`` is always the iterate with the lowest residual
         found across all attempts.
@@ -598,7 +598,7 @@ class DECMModel:
 
         Args:
             ic:            Primary initial condition (``"degrees"``, ``"random"``,
-                           ``"uniform"``, ``"adecm"``).
+                           ``"uniform"``, ``"qdecm"``).
             theta_0:       Custom initial parameter vector, shape ``(4N,)``
                            ``[θ_out | θ_in | η_out | η_in]``.  If provided,
                            overrides ``ic`` and disables ``multi_start``
@@ -637,7 +637,7 @@ class DECMModel:
         import torch as _torch
         from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
-        _FALLBACK_ICS = ["adecm", "random"]
+        _FALLBACK_ICS = ["qdecm", "random"]
 
         def _run_once(ic_name: str, theta0_override=None):
             theta0 = (

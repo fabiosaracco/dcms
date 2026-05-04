@@ -143,21 +143,21 @@ class TestDWCMSample:
         assert (np.abs(s_in_mean[nz_in]   - s_in[nz_in])   / s_in[nz_in]).max()  < 0.25
 
 
-# ── aDECM ────────────────────────────────────────────────────────────────────
+# ── qDECM ────────────────────────────────────────────────────────────────────
 
-class TestADECMSample:
+class TestQDECMSample:
     def _fitted(self):
-        from dcms.models.adecm import ADECMModel
+        from dcms.models.qdecm import qDECMModel
         k_out, k_in, s_out, s_in = _setup()
-        m = ADECMModel(k_out, k_in, s_out, s_in)
+        m = qDECMModel(k_out, k_in, s_out, s_in)
         m.solve_tool(tol=1e-6)
         return m
 
     def test_raises_before_solve(self):
-        from dcms.models.adecm import ADECMModel
+        from dcms.models.qdecm import qDECMModel
         k_out, k_in, s_out, s_in = _setup()
         with pytest.raises(RuntimeError):
-            ADECMModel(k_out, k_in, s_out, s_in).sample()
+            qDECMModel(k_out, k_in, s_out, s_in).sample()
 
     def test_returns_list(self):
         assert isinstance(self._fitted().sample(seed=0), list)

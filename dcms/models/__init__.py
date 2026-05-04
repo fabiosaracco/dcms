@@ -1,7 +1,7 @@
 """Model equations for MaxEnt network models."""
 from .dcm import DCMModel
 from .dwcm import DWCMModel
-from .adecm import ADECMModel
+from .qdecm import qDECMModel
 from .decm import DECMModel
 
-__all__ = ["DCMModel", "DWCMModel", "ADECMModel", "DECMModel"]
+__all__ = ["DCMModel", "DWCMModel", "qDECMModel", "DECMModel"]

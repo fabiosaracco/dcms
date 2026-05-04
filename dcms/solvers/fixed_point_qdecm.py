@@ -1,6 +1,6 @@
-"""Fixed-point iteration solver for the aDECM weight step.
+"""Fixed-point iteration solver for the qDECM weight step.
 
-The aDECM weight equations (conditioned on a fixed DCM topology ``p_ij``) are:
+The qDECM weight equations (conditioned on a fixed DCM topology ``p_ij``) are:
 
     s_out_i = Σ_{j≠i} p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
     s_in_i  = Σ_{j≠i} p_ji · β_out_j · β_in_i / (1 − β_out_j · β_in_i)
@@ -52,7 +52,7 @@ from typing import Callable
 
 import torch
 
-from dcms.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import qDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 from dcms.solvers.base import SolverResult
 from dcms.utils.profiling import _PeakRAMMonitor
@@ -168,7 +168,7 @@ def _fp_step_dense(
     theta: torch.Tensor | None = None,
     max_step: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One dense fixed-point update step for the aDECM weight equations.
+    """One dense fixed-point update step for the qDECM weight equations.
 
     Args:
         beta_out: Current β_out values, shape (N,).
@@ -253,7 +253,7 @@ def _fp_step_chunked(
     theta: torch.Tensor | None = None,
     max_step: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Chunked fixed-point update for aDECM weight equations.
+    """Chunked fixed-point update for qDECM weight equations.
 
     Avoids materialising the full N×N P and β matrices.
 
@@ -380,7 +380,7 @@ def _theta_newton_step_dense(
     s_in: torch.Tensor,
     max_step: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One θ-space coordinate Newton step for the aDECM weight equations (dense).
+    """One θ-space coordinate Newton step for the qDECM weight equations (dense).
 
     For each node i:
         Δθ_β_out_i = (Σ_{j≠i} p_ij G_ij − s_out_i) / Σ_{j≠i} p_ij G_ij(1+G_ij)
@@ -506,7 +506,7 @@ def _theta_newton_step_chunked(
     chunk_size: int,
     max_step: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked θ-space Gauss-Seidel Newton step for aDECM weight equations.
+    """Chunked θ-space Gauss-Seidel Newton step for qDECM weight equations.
 
     Two passes over the (N, N) product matrix, mirroring the DWCM chunked
     Newton step:
@@ -701,7 +701,7 @@ def _theta_newton_step_chunked(
     return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
 
 
-def solve_fixed_point_adecm(
+def solve_fixed_point_qdecm(
     residual_fn: Callable[[torch.Tensor], torch.Tensor],
     theta0: "ArrayLike",  # type: ignore[name-defined]
     s_out: "ArrayLike",  # type: ignore[name-defined]
@@ -721,7 +721,7 @@ def solve_fixed_point_adecm(
     verbose: bool = False,
     monitor: bool = False,
 ) -> SolverResult:
-    """Fixed-point iteration for the aDECM weight step.
+    """Fixed-point iteration for the qDECM weight step.
 
     Args:
         residual_fn: Function F_w(θ_β) → strength residual tensor (2N,).
@@ -805,8 +805,8 @@ def solve_fixed_point_adecm(
     if _use_numba:
         import numpy as np
         from dcms.solvers._numba_kernels import (
-            _adecm_theta_newton_numba,
-            _adecm_fp_gs_numba,
+            _qdecm_theta_newton_numba,
+            _qdecm_fp_gs_numba,
         )
         from dcms.utils.backend import resolve_num_threads as _rnt
         _safe_threads = _rnt(num_threads)
@@ -891,7 +891,7 @@ def solve_fixed_point_adecm(
                 if _use_numba:
                     tbo = theta[:N].numpy()
                     tbi = theta[N:].numpy()
-                    tbo_new, tbi_new, fo, fi = _adecm_theta_newton_numba(
+                    tbo_new, tbi_new, fo, fi = _qdecm_theta_newton_numba(
                         tbo, tbi,
                         theta_topo_out_chunked.numpy(),
                         theta_topo_in_chunked.numpy(),
@@ -920,7 +920,7 @@ def solve_fixed_point_adecm(
                 if _use_numba:
                     bo = torch.exp(-theta[:N]).numpy()
                     bi = torch.exp(-theta[N:]).numpy()
-                    bon, bin_, fo, fi = _adecm_fp_gs_numba(
+                    bon, bin_, fo, fi = _qdecm_fp_gs_numba(
                         bo, bi,
                         theta_topo_out_chunked.numpy(),
                         theta_topo_in_chunked.numpy(),
@@ -1146,7 +1146,7 @@ def solve_fixed_point_adecm(
                     if _use_numba:
                         tbo = theta_nt[:N].numpy()
                         tbi = theta_nt[N:].numpy()
-                        tbo_new, tbi_new, fo, fi = _adecm_theta_newton_numba(
+                        tbo_new, tbi_new, fo, fi = _qdecm_theta_newton_numba(
                             tbo, tbi,
                             theta_topo_out_chunked.numpy(),
                             theta_topo_in_chunked.numpy(),

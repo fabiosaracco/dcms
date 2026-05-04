@@ -4,7 +4,7 @@ Tests cover:
 - resolve_backend: auto/pytorch/numba selection, fallback, and error handling.
 - DCM: Numba and PyTorch produce identical results on a small network.
 - DWCM: Numba and PyTorch produce identical results on a small network.
-- aDECM: Numba and PyTorch produce identical results on a small network.
+- qDECM: Numba and PyTorch produce identical results on a small network.
 - DECM: Numba and PyTorch produce identical results on a small network.
 """
 from __future__ import annotations
@@ -117,9 +117,9 @@ def _make_dwcm_data(N: int = 6, seed: int = 42):
     return model, theta_true
 
 
-def _make_adecm_data(N: int = 6, seed: int = 42):
-    """Create a small aDECM model."""
-    from dcms.models.adecm import ADECMModel
+def _make_qdecm_data(N: int = 6, seed: int = 42):
+    """Create a small qDECM model."""
+    from dcms.models.qdecm import qDECMModel
     rng = np.random.default_rng(seed)
     theta_topo = rng.uniform(0.5, 2.0, 2 * N)
     x = np.exp(-theta_topo[:N])
@@ -137,7 +137,7 @@ def _make_adecm_data(N: int = 6, seed: int = 42):
     W = p / (1.0 - np.clip(bxy, 0, 0.9999))
     s_out = W.sum(axis=1)
     s_in = W.sum(axis=0)
-    model = ADECMModel(k_out=k_out, k_in=k_in, s_out=s_out, s_in=s_in)
+    model = qDECMModel(k_out=k_out, k_in=k_in, s_out=s_out, s_in=s_in)
     return model
 
 
@@ -248,16 +248,16 @@ class TestDWCMParity:
         assert err_nb < CONV_TOL
 
 
-class TestADECMParity:
-    """aDECM backend parity tests."""
+class TestQDECMParity:
+    """qDECM backend parity tests."""
 
     def test_solve_pytorch(self):
-        model = _make_adecm_data(N=6)
+        model = _make_qdecm_data(N=6)
         ok = model.solve_tool(backend="pytorch")
         assert ok
 
     def test_solve_numba(self):
-        model = _make_adecm_data(N=6)
+        model = _make_qdecm_data(N=6)
         ok = model.solve_tool(variant="theta-newton", backend="numba")
         assert ok
 
@@ -292,10 +292,10 @@ class TestBackendDefault:
         sig = inspect.signature(solve_fixed_point_dwcm)
         assert sig.parameters["backend"].default == "auto"
 
-    def test_adecm_default(self):
-        from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm
+    def test_qdecm_default(self):
+        from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm
         import inspect
-        sig = inspect.signature(solve_fixed_point_adecm)
+        sig = inspect.signature(solve_fixed_point_qdecm)
         assert sig.parameters["backend"].default == "auto"
 
     def test_decm_default(self):

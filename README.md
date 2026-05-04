@@ -6,7 +6,7 @@ Two solvers are provided for every model, both proven to scale reliably to N = 5
 
 | Solver | Algorithm | When to prefer |
 |--------|-----------|----------------|
-| **FP-GS Anderson(10)** | Gauss-Seidel fixed-point + Anderson(10) acceleration | DWCM/aDECM where the contraction condition holds (mild heterogeneity) |
+| **FP-GS Anderson(10)** | Gauss-Seidel fixed-point + Anderson(10) acceleration | DWCM/qDECM where the contraction condition holds (mild heterogeneity) |
 | **θ-Newton Anderson(10)** | Coordinate-wise Newton in log-space + Anderson(10) acceleration | Default choice — most robust, fastest at large N |
 
 Park, J. & Newman, M.E.J. (2004). Statistical mechanics of networks. *Physical Review E*, **70**, 066117.
@@ -71,9 +71,9 @@ where `β = exp(-θ)`.  **Feasibility constraint:** `β_out_i · β_in_j < 1` fo
 
 **Implementation:** `dcms/models/dwcm.py` — `DWCMModel`
 
-### 1.3 aDECM — Approximated Directed Enhanced Configuration Model (binary + weighted)
+### 1.3 qDECM — Quasi Directed Enhanced Configuration Model (binary + weighted)
 
-The aDECM constrains *four* sequences per node: **out-degree**, **in-degree**, **out-strength** and **in-strength**.  It is solved in two sequential steps:
+The qDECM constrains *four* sequences per node: **out-degree**, **in-degree**, **out-strength** and **in-strength**.  It is solved in two sequential steps:
 
 1. **Topology step** — solve the DCM to find `2N` multipliers `(x_i, y_i)` reproducing the degree sequences.  The resulting link probability is `p_ij = x_i · y_j / (1 + x_i · y_j)`.
 
@@ -88,11 +88,11 @@ The total number of unknowns is `4N`: `2N` topology multipliers + `2N` weight mu
 
 **Feasibility constraint:** `β_out_i · β_in_j < 1` for all `i ≠ j`.
 
-**Implementation:** `dcms/models/adecm.py` — `ADECMModel`
+**Implementation:** `dcms/models/qdecm.py` — `qDECMModel`
 
 ### 1.4 DECM — Directed Enhanced Configuration Model (binary + weighted, fully coupled)
 
-The DECM constrains the same four sequences as the aDECM but is the **exact** maximum-entropy model: the weight multipliers `(β_out_i, β_in_i)` enter directly into the connection probability, making all four constraint equations **coupled**.
+The DECM constrains the same four sequences as the qDECM but is the **exact** maximum-entropy model: the weight multipliers `(β_out_i, β_in_i)` enter directly into the connection probability, making all four constraint equations **coupled**.
 
 For each directed pair `(i,j)`, `i ≠ j`, the partition function is:
 
@@ -120,7 +120,7 @@ s_in_i  = Σ_{j≠i} p_ji · G_ji
 
 **Feasibility constraint:** `η_out_i + η_in_j > 0` for all `i ≠ j`.
 
-**Key difference from aDECM:** in the aDECM approximation, `p_ij = x_i y_j/(1+x_i y_j)` is decoupled from `β`; in the exact DECM, `p_ij` depends on both `(θ, η)` simultaneously.
+**Key difference from qDECM:** in the qDECM approximation, `p_ij = x_i y_j/(1+x_i y_j)` is decoupled from `β`; in the exact DECM, `p_ij` depends on both `(θ, η)` simultaneously.
 
 **Implementation:** `dcms/models/decm.py` — `DECMModel`
 
@@ -153,7 +153,7 @@ The **Gauss-Seidel** ordering updates `θ_out` first and immediately uses the fr
 
 Convergence is guaranteed when ρ < 1.  For sparse, homogeneous networks this holds comfortably.  For power-law networks with high-degree hubs, some nodes have ρ ≥ 1 and plain FP-GS stagnates; a node-level Newton fallback and the blowup-reset logic handle those cases (see Implementation details below).
 
-For the DWCM and aDECM weight step, the fixed-point map in β-space is:
+For the DWCM and qDECM weight step, the fixed-point map in β-space is:
 
 ```
 β_out_i^new = s_out_i / D_out_i,   D_out_i = Σ_{j≠i} p_ij · β_in_j / (1 - β_out_i · β_in_j)²
@@ -179,7 +179,7 @@ The coefficients `c` are found by a small `m×m` least-squares system (O(m²) pe
 
 - `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="gauss-seidel", anderson_depth=10)`
 - `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="gauss-seidel", anderson_depth=10)`
-- `dcms/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="gauss-seidel", anderson_depth=10)`
+- `dcms/solvers/fixed_point_qdecm.py` — `solve_fixed_point_qdecm(..., variant="gauss-seidel", anderson_depth=10)`
 - `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (DECM only uses θ-Newton; see §2.2)
 
 All four files share the same algorithmic skeleton:
@@ -214,7 +214,7 @@ This is equivalent to a **Gauss-Seidel Newton** step: update `θ_out_i` node by 
 
 **Key advantage over FP-GS:** the step size is `O(|F_i| / Σ p(1-p))`, which naturally adapts to the curvature of the likelihood surface.  Hub nodes — where FP-GS oscillates or diverges because ρ ≥ 1 — are handled gracefully: their large residual produces a large numerator, but the large denominator (many connections) stabilises the step.
 
-For the DWCM/aDECM weight step, the coordinate Newton formula becomes:
+For the DWCM/qDECM weight step, the coordinate Newton formula becomes:
 
 ```
 Δη_out_i = (s_hat_out_i - s_out_i) / Σ_{j≠i} p_ij · G_ij · (G_ij - 1)
@@ -228,7 +228,7 @@ For the DECM, the coupling between degree and strength equations modifies the st
 ∂F_s_out_i / ∂η_out_i = −Σ_{j≠i} p_ij · G_ij² · (1 − p_ij + z_ij)
 ```
 
-which equals the aDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`.  The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously within each group: pass 1 updates (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col sums.
+which equals the qDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`.  The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously within each group: pass 1 updates (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col sums.
 
 **The z-floor mechanism:** define `z_ij = θ_out_i + θ_in_j`.  When `z_ij → 0`, `G_ij → ∞` and the residual blows up.  The solver maintains per-node floors `z_min_out[i]` and `z_min_in[j]` (computed from significant pairs with `p_ij > 0.5/N`) and applies a global floor from `min(θ_in)` over non-zero-strength nodes.  This guarantees `z_ij > _Z_G_CLAMP = 1e-8` for all pairs after every Newton step.
 
@@ -238,7 +238,7 @@ which equals the aDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_
 
 - `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="theta-newton", anderson_depth=10)`
 - `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="theta-newton", anderson_depth=10)`
-- `dcms/solvers/fixed_point_adecm.py` — `solve_fixed_point_adecm(..., variant="theta-newton", anderson_depth=10)`
+- `dcms/solvers/fixed_point_qdecm.py` — `solve_fixed_point_qdecm(..., variant="theta-newton", anderson_depth=10)`
 - `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (alternating out/in GS-Newton on 4N vector)
 
 Internally, each file has a `_theta_newton_step_chunked` (and optionally `_theta_newton_step_dense`) function that computes the diagonal Jacobian and applies the clipped step without materialising the full Jacobian matrix (O(N) RAM).
@@ -336,12 +336,12 @@ Additional model methods:
 | `"uniform"` | All β equal to the median of the `"strengths"` approximation |
 | `"random"` | Uniform random `θ ∈ [0.1, 2.0]` |
 
-### 3.3 aDECM — `ADECMModel`
+### 3.3 qDECM — `qDECMModel`
 
 ```python
-from dcms.models.adecm import ADECMModel
+from dcms.models.qdecm import qDECMModel
 
-model = ADECMModel(k_out, k_in, s_out, s_in)
+model = qDECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
     ic_topo="degrees",      # topology init: "degrees" (default) or "random"
     ic_weights="topology",  # weight init: "topology" (default) or "topology_node"
@@ -375,9 +375,9 @@ Additional model methods:
 | `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative error over all 4N constraints |
 | `model.initial_theta_topo(method)` | `(2N,)` tensor | Topology initial guess (`"degrees"` or `"random"`) |
 | `model.initial_theta_weight(theta_topo, method)` | `(2N,)` tensor | Weight initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted aDECM (see §3.7) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted qDECM (see §3.7) |
 
-`initial_theta_weight` methods for aDECM:
+`initial_theta_weight` methods for qDECM:
 
 | Method | Description |
 |--------|-------------|
@@ -445,7 +445,7 @@ The output format and the underlying sampling distribution differ by model:
 |-------|--------|-----------------------|
 | `DCMModel` | `[[i, j], ...]` | `A_ij ~ Bernoulli(p_ij)` independently for each `i ≠ j` |
 | `DWCMModel` | `[[i, j, w], ...]` | `w_ij ~ Geom(1 − β_ij) − 1` (starts at 0); pairs with `w=0` omitted |
-| `ADECMModel` | `[[i, j, w], ...]` | Step 1: `A_ij ~ Bernoulli(p_ij)`; step 2 if link: `w_ij ~ Geom(1 − β_ij)` (starts at 1) |
+| `qDECMModel` | `[[i, j, w], ...]` | Step 1: `A_ij ~ Bernoulli(p_ij)`; step 2 if link: `w_ij ~ Geom(1 − β_ij)` (starts at 1) |
 | `DECMModel` | `[[i, j, w], ...]` | Same two steps, but `p_ij` uses the full coupled DECM formula |
 
 where `β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)` and `p_ij` is the relevant model's link probability.
@@ -453,13 +453,13 @@ where `β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)` and `p_ij` is th
 The geometric distributions follow Mastrandrea et al. (2014) / Vallarano et al. (2021):
 
 - **DWCM**: integer weights `w ≥ 0`, `P(w=k) = (1−β_ij) β_ij^k`.  The expected weight is `β_ij / (1−β_ij)`, matching the constraint `s_out_i = Σ_j ⟨w_ij⟩`.
-- **aDECM / DECM**: integer weights `w ≥ 1` conditional on the link existing, `P(w=k|A=1) = (1−β_ij) β_ij^{k−1}`.  The unconditional expected weight is `p_ij / (1−β_ij)`.
+- **qDECM / DECM**: integer weights `w ≥ 1` conditional on the link existing, `P(w=k|A=1) = (1−β_ij) β_ij^{k−1}`.  The unconditional expected weight is `p_ij / (1−β_ij)`.
 
 Calls `sample()` before `solve_tool()` raise `RuntimeError`.
 
 ### 3.6 SolverResult
 
-`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM/DECM, `model.sol_topo` / `model.sol_weights` for aDECM.  The `SolverResult` dataclass fields are:
+`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM/DECM, `model.sol_topo` / `model.sol_weights` for qDECM.  The `SolverResult` dataclass fields are:
 
 ```python
 result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM, (4N,) for DECM
@@ -478,7 +478,7 @@ The underlying solvers can be called directly without the model wrapper, e.g. to
 ```python
 from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm
+from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm
 from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
 result = solve_fixed_point_dcm(
@@ -494,7 +494,7 @@ result = solve_fixed_point_dcm(
 )
 ```
 
-`solve_fixed_point_dwcm` and `solve_fixed_point_adecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; aDECM additionally requires `theta_topo`).
+`solve_fixed_point_dwcm` and `solve_fixed_point_qdecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; qDECM additionally requires `theta_topo`).
 
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 
@@ -561,7 +561,7 @@ pip install dcms numba           # equivalent
 
 ### 3.9 Custom initial conditions and warm restart
 
-Each model internally works with a *parameter vector* in log-space.  For DCM the entries are the Lagrange multipliers θ_i = −log(x_i) associated to degree constraints; for DWCM / aDECM (weight step) / DECM (weight part) they are η_i = −log(β_i), the log-fitnesses associated to strength constraints.  After `solve_tool()` finishes, the result is stored in `model.sol.theta` (or `model.sol_topo.theta` / `model.sol_weights.theta` for aDECM).
+Each model internally works with a *parameter vector* in log-space.  For DCM the entries are the Lagrange multipliers θ_i = −log(x_i) associated to degree constraints; for DWCM / qDECM (weight step) / DECM (weight part) they are η_i = −log(β_i), the log-fitnesses associated to strength constraints.  After `solve_tool()` finishes, the result is stored in `model.sol.theta` (or `model.sol_topo.theta` / `model.sol_weights.theta` for qDECM).
 
 **Shape of the parameter vectors**
 
@@ -569,8 +569,8 @@ Each model internally works with a *parameter vector* in log-space.  For DCM the
 |-------|-----------|-------|---------|
 | DCM | `model.sol.theta` | (2N,) | `[θ_out₀ … θ_out_{N-1} | θ_in₀ … θ_in_{N-1}]` |
 | DWCM | `model.sol.theta` | (2N,) | `[η_out₀ … | η_in₀ …]` where `β_out_i = exp(−η_out_i)` |
-| aDECM | `model.sol_topo.theta` | (2N,) | DCM multipliers (same as DCM) |
-| aDECM | `model.sol_weights.theta` | (2N,) | DWCM-like multipliers `[η_out | η_in]` |
+| qDECM | `model.sol_topo.theta` | (2N,) | DCM multipliers (same as DCM) |
+| qDECM | `model.sol_weights.theta` | (2N,) | DWCM-like multipliers `[η_out | η_in]` |
 | DECM | `model.sol.theta` | (4N,) | `[θ_out | θ_in | η_out | η_in]` |
 
 The entries are related to the model probabilities by `x_i = exp(−θ_i)` (topology) and `β_i = exp(−η_i)` (weights).  The feasibility constraint is `η_out_i + η_in_j > 0` for every pair (i, j) with a potential link (individual η can be negative as long as the pairwise sum stays positive).
@@ -582,7 +582,7 @@ By default `solve_tool()` computes the starting point from the observed degree/s
 1. **Warm restart** — if a first call did not converge, the best iterate found so far is always stored in `model.sol.theta` / `model.sol_weights.theta` (the solver internally tracks the iterate with the smallest residual, not just the last one).  Pass that array back as the starting point for a second call, possibly with a smaller `anderson_depth` to reduce Anderson contamination:
 
 ```python
-model = ADECMModel(k_out, k_in, s_out, s_in)
+model = qDECMModel(k_out, k_in, s_out, s_in)
 model.solve_tool(max_iter=5000, verbose=True, monitor=True)
 
 if not model.sol_weights.converged:
@@ -595,14 +595,14 @@ if not model.sol_weights.converged:
     )
 ```
 
-2. **Transfer warm start** — use the DWCM solution as the starting point for the aDECM weight step (the weight equations are similar, and DWCM is easier to solve):
+2. **Transfer warm start** — use the DWCM solution as the starting point for the qDECM weight step (the weight equations are similar, and DWCM is easier to solve):
 
 ```python
 dwcm = DWCMModel(s_out, s_in)
 dwcm.solve_tool()
 
-adecm = ADECMModel(k_out, k_in, s_out, s_in)
-adecm.solve_tool(
+qdecm = qDECMModel(k_out, k_in, s_out, s_in)
+qdecm.solve_tool(
     theta_weights_0=dwcm.sol.theta,   # DWCM solution as weight IC
 )
 ```
@@ -650,7 +650,7 @@ Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`.
 
 > The z-floor and Anderson blowup-reset mechanisms make both methods reliable even on hard seeds (high s/k hubs) that previously caused divergence.  θ-Newton is more consistent (lower variance in time and iterations).
 
-### aDECM — N = 5 000
+### qDECM — N = 5 000
 
 Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per solver.
 
@@ -659,13 +659,13 @@ Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per 
 | FP-GS Anderson(10) | 0% | — | — | — |
 | **θ-Newton Anderson(10)** | **100%** | **44 ± 10** | **36.1 ± 17.3** | **7.6e-08 ± 1.4e-07** |
 
-> FP-GS Anderson(10) fails for aDECM at N = 5 000 because the conditioned weight equations have spectral radius > 1 for power-law hubs: each `p_ij < 1` factor forces `β_i β_j` closer to 1 to satisfy the strength constraint, amplifying the fixed-point Jacobian.  The θ-Newton approach bypasses this limitation by working in log-space where the diagonal Hessian always stabilises the step.
+> FP-GS Anderson(10) fails for qDECM at N = 5 000 because the conditioned weight equations have spectral radius > 1 for power-law hubs: each `p_ij < 1` factor forces `β_i β_j` closer to 1 to satisfy the strength constraint, amplifying the fixed-point Jacobian.  The θ-Newton approach bypasses this limitation by working in log-space where the diagonal Hessian always stabilises the step.
 
 ### DECM — N = 1 000 and N = 5 000
 
 Benchmarks over 5 seeds each (`k_s_generator_pl(N, rho=1e-3)`, `tol=1e-5`).
 
-The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.  `solve_tool()` uses `multi_start=True` by default: if the primary IC ("degrees") does not converge, it automatically retries with the "adecm" warm-start (run aDECM first and use its 4N solution as starting point) and then "random".
+The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.  `solve_tool()` uses `multi_start=True` by default: if the primary IC ("degrees") does not converge, it automatically retries with the "qdecm" warm-start (run qDECM first and use its 4N solution as starting point) and then "random".
 
 **N = 1 000**
 
@@ -679,7 +679,7 @@ The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which
 |--------|------:|----------------:|-----------------:|--------------------:|
 | **θ-Newton Anderson(10)** | **100%** | **67 ± 20** | **77.9 ± 22.8** | **1.50e-07 ± 2.58e-07** |
 
-> The coupling between degree and strength equations makes the DECM more expensive per iteration than the aDECM (two passes over the N×N grid instead of one), but the alternating GS-Newton strategy with multi-start achieves 100% convergence across all tested seeds.  Hard seeds (high s/k hubs) that the "degrees" IC cannot handle are resolved by the "adecm" warm-start fallback.
+> The coupling between degree and strength equations makes the DECM more expensive per iteration than the qDECM (two passes over the N×N grid instead of one), but the alternating GS-Newton strategy with multi-start achieves 100% convergence across all tested seeds.  Hard seeds (high s/k hubs) that the "degrees" IC cannot handle are resolved by the "qdecm" warm-start fallback.
 
 ---
 
@@ -687,13 +687,13 @@ The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which
 
 | Method | Model | Convergence | RAM per iteration | Scales to large N? |
 |--------|-------|-------------|-------------------|--------------------|
-| FP-GS Anderson(10) | DCM, DWCM, aDECM | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 2 000) |
-| θ-Newton Anderson(10) | DCM, DWCM, aDECM | superlinear | O(chunk × N) | ✓ (same chunked path) |
+| FP-GS Anderson(10) | DCM, DWCM, qDECM | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 2 000) |
+| θ-Newton Anderson(10) | DCM, DWCM, qDECM | superlinear | O(chunk × N) | ✓ (same chunked path) |
 | Alternating GS-Newton Anderson(10) | DECM | superlinear | O(chunk × N) | ✓ (2 passes per iteration) |
 
 All methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path (N ≤ 2 000) materialises the full N×N matrix once per step; for N > 2 000 rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
 
-The DECM solver performs 2 passes per iteration (out-group and in-group), compared to 1 pass for DCM/DWCM and 2 passes for aDECM.  This makes the per-iteration cost approximately equal to aDECM.
+The DECM solver performs 2 passes per iteration (out-group and in-group), compared to 1 pass for DCM/DWCM and 2 passes for qDECM.  This makes the per-iteration cost approximately equal to qDECM.
 
 ---
 
@@ -718,11 +718,11 @@ python -m dcms.benchmarks.dwcm_comparison --sizes 1000 --n_seeds 10 --fast
 # DWCM at N=5000
 python -m dcms.benchmarks.dwcm_comparison --sizes 5000 --n_seeds 5 --fast
 
-# aDECM comparison (N=1000)
-python -m dcms.benchmarks.adecm_comparison --sizes 1000 --n_seeds 10 --fast
+# qDECM comparison (N=1000)
+python -m dcms.benchmarks.qdecm_comparison --sizes 1000 --n_seeds 10 --fast
 
-# aDECM at N=5000 (θ-Newton only reliable method)
-python -m dcms.benchmarks.adecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
+# qDECM at N=5000 (θ-Newton only reliable method)
+python -m dcms.benchmarks.qdecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
 
 # DECM comparison (N=1000, 10 seeds)
 python -m dcms.benchmarks.decm_comparison --phase6

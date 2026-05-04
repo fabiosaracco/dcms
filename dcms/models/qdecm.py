@@ -1,6 +1,6 @@
-"""Approximated Directed Enhanced Configuration Model (aDECM).
+"""Quasi Directed Enhanced Configuration Model (qDECM).
 
-The aDECM fixes *four* sequences per node: out-degree, in-degree,
+The qDECM fixes *four* sequences per node: out-degree, in-degree,
 out-strength and in-strength (k_out, k_in, s_out, s_in).  It is solved in
 two sequential steps:
 
@@ -50,7 +50,7 @@ from dcms.models.dcm import DCMModel, _THETA_MAX
 # Type alias for inputs: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
 
-from dcms.models.parameters import aDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import qDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 
 
@@ -67,8 +67,8 @@ def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tenso
     return torch.tensor(x, dtype=dtype, device="cpu")
 
 
-class ADECMModel:
-    """Encapsulates the aDECM weight-step equations for a network of *N* nodes.
+class qDECMModel:
+    """Encapsulates the qDECM weight-step equations for a network of *N* nodes.
 
     The topology step (DCM) is handled separately via the ``DCMModel`` class.
     This class provides residuals, Jacobians and initialisations for the
@@ -130,7 +130,7 @@ class ADECMModel:
     ) -> torch.Tensor:
         """Return the N×N conditioned expected-weight matrix.
 
-        The expected weight of arc i→j in the aDECM approximation is:
+        The expected weight of arc i→j in the qDECM approximation is:
 
             W_ij = p_ij · β_out_i · β_in_j / (1 − β_out_i · β_in_j)
                  = p_ij / expm1(θ_β_out_i + θ_β_in_j)
@@ -441,7 +441,7 @@ class ADECMModel:
 
         All strategies are topology-aware: they use the observed degree sequences
         (and optionally the DCM probability matrix p_ij) to estimate β values
-        consistent with the aDECM weight equation E[w_ij] = p_ij/(1−β_out_i β_in_j).
+        consistent with the qDECM weight equation E[w_ij] = p_ij/(1−β_out_i β_in_j).
 
         * ``"topology"`` (default): β = sqrt(1 − k/s) per node, derived from the
           mean-field identity s_i/k_i ≈ 1/(1−β²).
@@ -669,17 +669,17 @@ class ADECMModel:
         # Build the residual function that fixes theta_topo
         res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
 
-        from dcms.solvers.fixed_point_adecm import solve_fixed_point_adecm  # lazy import to avoid circular dependency
-        self.sol_weights = solve_fixed_point_adecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+        from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm  # lazy import to avoid circular dependency
+        self.sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         if len(self.sol_weights.message)>0:
             print(f'Weights: {self.sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
         return self.sol_topo.converged and self.sol_weights.converged
 
     def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
-        """Sample a weighted directed network from the fitted aDECM.
+        """Sample a weighted directed network from the fitted qDECM.
 
-        Two-step procedure mirroring the aDECM factorisation:
+        Two-step procedure mirroring the qDECM factorisation:
 
         1. **Topology** — draw ``A_ij ~ Bernoulli(p_ij)`` where
            ``p_ij = x_i y_j / (1 + x_i y_j)`` comes from the DCM solution.

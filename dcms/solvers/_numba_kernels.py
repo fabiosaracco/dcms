@@ -22,7 +22,7 @@ would be written by multiple threads).
 
 Z-floor optimisation
 --------------------
-The aDECM and DECM kernels need ``min_{j≠i}(θ_in[j])`` for each node ``i``.
+The qDECM and DECM kernels need ``min_{j≠i}(θ_in[j])`` for each node ``i``.
 The naïve O(N) inner search per node makes the update step O(N²).  We instead
 precompute the global minimum *and* second minimum in O(N), so each node can
 look up the answer in O(1).
@@ -458,11 +458,11 @@ def _dwcm_fp_gs_numba(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# aDECM kernels
+# qDECM kernels
 # ═══════════════════════════════════════════════════════════════════════════
 
 @numba.njit(cache=True, fastmath=False, parallel=True)
-def _adecm_theta_newton_numba(
+def _qdecm_theta_newton_numba(
     theta_beta_out: np.ndarray,
     theta_beta_in: np.ndarray,
     theta_topo_out: np.ndarray,
@@ -476,7 +476,7 @@ def _adecm_theta_newton_numba(
     Z_NEWTON_FLOOR: float,
     Z_NEWTON_FRAC: float,
 ) -> tuple:  # pragma: no cover
-    """θ-Newton GS step for the aDECM weight equations (parallel scalar loops).
+    """θ-Newton GS step for the qDECM weight equations (parallel scalar loops).
 
     Returns ``(theta_beta_out_new, theta_beta_in_new, F_out, F_in)``.
     """
@@ -586,7 +586,7 @@ def _adecm_theta_newton_numba(
 
 
 @numba.njit(cache=True, fastmath=False, parallel=True)
-def _adecm_fp_gs_numba(
+def _qdecm_fp_gs_numba(
     beta_out: np.ndarray,
     beta_in: np.ndarray,
     theta_topo_out: np.ndarray,
@@ -602,7 +602,7 @@ def _adecm_fp_gs_numba(
     FP_NEWTON_FALLBACK_DELTA: float,
     use_newton_fallback: bool,
 ) -> tuple:  # pragma: no cover
-    """Gauss-Seidel FP step for the aDECM weight equations (parallel scalar loops).
+    """Gauss-Seidel FP step for the qDECM weight equations (parallel scalar loops).
 
     Returns ``(beta_out_new, beta_in_new, F_out, F_in)``.
     """

@@ -268,6 +268,38 @@ Walker, H.F. & Ni, P. (2011). Anderson acceleration for fixed-point iterations. 
 
 ---
 
+### 2.3 Hub bisection — exact 1D solve for high s/k nodes
+
+For networks with a few nodes whose **strength-to-degree ratio** `s_i / k_i ≫ 1` (e.g. a node with 2 out-links but total out-strength of 150), the global Newton step tends to drive `β_i → 1` (qDECM) or `η_i → 0` (DECM) and becomes numerically unstable.  Mathematically a solution always exists; the issue is purely numerical.
+
+The `hub_sk_threshold` parameter activates an exact per-node solver for those nodes.  At each outer iteration, before or after the global Newton step:
+
+1. **Identify hub nodes**: any node `i` with `s_i / k_i > hub_sk_threshold` (independently for out and in directions).
+2. **1D bisection** (60 steps, precision ≈ 2⁻⁶⁰): for each hub out-node `i`, find `β_i` (qDECM) or `η_i` (DECM) exactly such that the strength equation is satisfied, treating all other parameters as fixed.
+   - *qDECM*: `f(β_out_i) = Σ_j p_ij / (1 − β·β_in_j) = s_out_i`.  `f` is strictly increasing in `β` → unique root on `[0, 1/max(β_in_j))`.
+   - *DECM*: `f(η_out_i) = Σ_j p_ij(η) · G_ij(η) = s_out_i`.  `f` is strictly decreasing in `η` (both `p_ij → 0` and `G_ij → 1` as `η → ∞`) → unique root on `[_ETA_MIN, _ETA_MAX]`.
+3. **3-sweep Gauss-Seidel consistency**: after bisecting all out-hubs with current `β_in` / `η_in`, bisect all in-hubs with the fresh `β_out` / `η_out`, then repeat for a total of 3 passes.  This ensures that nodes appearing in *both* the out-hub and in-hub lists have a fully consistent solution.
+4. **Anderson interaction guard**: hub components of the Anderson residual `r_k` are zeroed (so mixing weights focus on non-hub convergence), and after mixing the hub components of `θ_next` are overwritten with the bisection values (preventing Anderson from corrupting them).
+
+**When to use:** networks where `max(s/k)` exceeds ~5 and the solver stagnates at MRE around 0.5–0.9.  `hub_sk_threshold=5` captures all meaningful hubs on real-world networks tested.  The default `hub_sk_threshold=0.0` disables the feature entirely, leaving the solver unchanged for standard cases.
+
+**Performance note:** each bisection call is O(N) per hub node; with 3 sweeps and typically O(1–100) hubs the overhead is negligible compared to the main O(N²) matrix computation.  Recommended `tol=1e-4` (rather than the default `1e-6`) since oscillation near the solution is expected at very fine scales.
+
+**Example — real-world network with high s/k hubs:**
+
+```python
+model = qDECMModel(k_out, k_in, s_out, s_in)
+converged = model.solve_tool(
+    hub_sk_threshold=5,   # activate bisection for nodes with s/k > 5
+    tol=1e-4,             # looser tolerance; bisection converges to ~1e-4
+    max_time=600,         # hard time limit
+    verbose=True,
+)
+print(model.sol_weights.best_MRE)
+```
+
+---
+
 ## 3. API Reference
 
 All three models expose a unified `solve_tool()` method.  Instantiate with the observed sequences, call `solve_tool()`, and inspect the stored result.
@@ -364,6 +396,7 @@ converged = model.solve_tool(
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
+    hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
 )
 # solve_tool returns True if *both* topology and weight steps converged
 theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
@@ -408,6 +441,7 @@ converged = model.solve_tool(
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
+    hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
@@ -668,6 +702,8 @@ Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per 
 | **θ-Newton Anderson(10)** | **100%** | **44 ± 10** | **36.1 ± 17.3** | **7.6e-08 ± 1.4e-07** |
 
 > FP-GS Anderson(10) fails for qDECM at N = 5 000 because the conditioned weight equations have spectral radius > 1 for power-law hubs: each `p_ij < 1` factor forces `β_i β_j` closer to 1 to satisfy the strength constraint, amplifying the fixed-point Jacobian.  The θ-Newton approach bypasses this limitation by working in log-space where the diagonal Hessian always stabilises the step.
+
+**Hard instances (s/k ≫ 1):** for real-world networks with a handful of nodes whose strength-to-degree ratio greatly exceeds 5, even θ-Newton can stagnate.  Use `hub_sk_threshold=5` (see §2.3); tested on a directed network with N=22 754 where the standard solver stalled at MRE≈0.47 and the bisection option achieved **best_MRE=9.5×10⁻⁵** in 46 iterations.
 
 ### DECM — N = 1 000 and N = 5 000
 

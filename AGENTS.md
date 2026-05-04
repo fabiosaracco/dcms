@@ -47,17 +47,19 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 
 ### Modello 4: DECM (Directed Enhanced Configuration Model) — binario + pesato
 - Vincoli: sequenza di gradi E strengths (k_out_i, k_in_i, s_out_i, s_in_i)
-- Incognite: 4N moltiplicatori (x_i, y_i, β_out_i, β_in_i)
-- Equazioni:
+- Incognite: 4N moltiplicatori (θ_out_i, θ_in_i, η_out_i, η_in_i) con x_i=e^{-θ}, β_i=e^{-η}
+- Equazioni (accoppiate — η entra in p_ij):
   ```
-  k_out_i = Σ_{j≠i} (x_i * y_j) / (1 + x_i * y_j * (1/(1 - β_out_i * β_in_j) - 1))
+  p_ij    = sigmoid(-θ_out_i - θ_in_j - log(expm1(η_out_i + η_in_j)))
+  G_ij    = 1 / (1 - β_out_i * β_in_j)      [fattore peso, β = e^{-η}]
+  k_out_i = Σ_{j≠i} p_ij
   k_in_i  = analoga
-  s_out_i = Σ_{j≠i} [valore atteso del peso condizionato alla topologia]
+  s_out_i = Σ_{j≠i} p_ij * G_ij             [E[w_ij] = p_ij / (1 - β_out_i β_in_j)]
   s_in_i  = analoga
   ```
 - Dimensione: 4N equazioni in 4N incognite
-- Questo è il modello più difficile da far convergere: le equazioni di grado e strength sono **accoppiate** (β entra nelle equazioni di k)
-- **Status: DA FARE**
+- Questo è il modello più difficile da far convergere: le equazioni di grado e strength sono **accoppiate** (η entra in p_ij)
+- **Status: ✅ COMPLETATO** — alternating GS-Newton Anderson(10), 100% convergenza fino a N=5k
 
 ## Metodi di risoluzione
 
@@ -139,30 +141,23 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Benchmark N=1k: `src/benchmarks/qdecm_comparison.py`
 - README aggiornato con sezione qDECM (modello 1.3 + tabella N=1k)
 
-### Fase 6: DECM — DA FARE (il più difficile)
-1. Implementare le equazioni del DECM in `src/models/decm.py`
-   - 4N incognite: (x_i, y_i, β_out_i, β_in_i)
-   - Le equazioni di grado e di strength sono **accoppiate** — non separabili come nel qDECM
-   - Equazione di grado: il termine `1/(1 - β_out_i * β_in_j)` entra nel denominatore di k_out_i
-   - Implementare: `residual`, `neg_log_likelihood`, `hessian_diag`, `jacobian` (per N piccolo), `initial_theta`, `constraint_error`, `max_relative_error`
-2. Implementare il solver in `src/solvers/fixed_point_decm.py`:
-   - **Strategia consigliata:** FP-GS alternato
-     - Aggiornare (x, y) con le equazioni di grado tenendo (β_out, β_in) fissi
-     - Aggiornare (β_out, β_in) con θ-Newton tenendo (x, y) fissi
-     - Ripetere fino a convergenza globale
-     - Anderson acceleration sul vettore completo (4N)
-3. ATTENZIONE: le equazioni di grado del DECM sono diverse da quelle del DCM — il termine β entra nel denominatore
-4. ATTENZIONE al vincolo β_out_i * β_in_j < 1
-5. Testare prima su N=10 con soluzione nota, poi N=100, 1k, 5k
-6. Se non converge con la Strategia consigliata, provare:
-   - Damping aggressivo (α=0.1-0.3) sulle prime 50 iterazioni, poi rilasciare
-   - Continuazione: risolvere prima il qDECM, poi usare quella soluzione come init per il DECM
-   - Anderson depth più alto (20-30)
-7. Benchmark: creare `src/benchmarks/decm_comparison.py`
+### Fase 6: DECM ✅ COMPLETATA
+- Modello: `dcms/models/decm.py` — equazioni accoppiate (η entra in p_ij)
+- Solver: `dcms/solvers/fixed_point_decm.py` — alternating GS-Newton Anderson(10) su 4N variabili
+- Multi-start: se "degrees" IC non converge, retry con "qdecm" warm-start e "random"
+- Hub bisection: `hub_sk_threshold` per nodi con s/k >> 1 (stessa logica del qDECM)
+- Benchmark N=1k e N=5k: 100% convergenza su tutti i seed testati
+- Test: `tests/test_decm.py`
 
-### Fase 7: Report finale — DA FARE
-1. Aggiornare il README con le sezioni DECM (modello, API, tabelle di performance)
-2. Tabella comparativa per tutti i modelli: convergenza, iterazioni, tempo, RAM per N=1k, 5k, 10k
+### Fase 7: Hub bisection ✅ COMPLETATA
+- Problema: nodi con s_i/k_i >> 1 causano β_i → 1 e instabilità numerica nel global Newton step
+- Soluzione: per i nodi "hub" (s/k > threshold), trovare η esattamente via bisection 1D per iterazione
+- qDECM (file: `dcms/solvers/fixed_point_qdecm.py`): bisection su β ∈ [0, 1/max(β_other)); funzione crescente
+- DECM (file: `dcms/solvers/fixed_point_decm.py`): bisection su η ∈ [_ETA_MIN, _ETA_MAX]; funzione decrescente
+- 3 sweep GS per iterazione garantiscono consistenza se un nodo è sia out-hub che in-hub
+- Anderson: r_k zerate per componenti hub (esclusione); θ_next ripristinato a valori bisection (freeze)
+- Parametro: `hub_sk_threshold=0.0` (default, disabilitato) in `solve_tool()` per qDECM e DECM
+- Test: quirinale_dico4 (N=22754): best_MRE=9.5e-5 con threshold=5 in 46 iter (~8 min)
 3. Raccomandazione finale: quale metodo per quale modello a quale scala
 
 ## Lezioni apprese (Fasi 1-5)

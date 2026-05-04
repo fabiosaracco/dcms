@@ -1215,6 +1215,10 @@ def solve_fixed_point_qdecm(
             import numba as _numba_mod
             _numba_mod.set_num_threads(_prev_numba_threads)
 
+    # Ensure residuals[-1] matches the residual at the returned best_theta.
+    if residuals and residuals[-1] > best_theta_res:
+        residuals.append(best_theta_res)
+
     return SolverResult(
         theta=best_theta.detach().numpy(),
         converged=converged,

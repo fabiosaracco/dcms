@@ -741,6 +741,13 @@ def solve_fixed_point_dwcm(
             import numba as _numba_mod
             _numba_mod.set_num_threads(_prev_numba_threads)
 
+    # Ensure residuals[-1] matches the residual at the returned best_theta.
+    # When the solver stops via stagnation or max_iter (not convergence), the
+    # last entry in `residuals` is the residual at the *last processed* iterate,
+    # which may be worse than best_theta_res.
+    if residuals and residuals[-1] > best_theta_res:
+        residuals.append(best_theta_res)
+
     return SolverResult(
         theta=best_theta.detach().numpy(),
         converged=converged,

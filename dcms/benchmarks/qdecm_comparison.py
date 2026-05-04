@@ -168,15 +168,15 @@ def _run_topo_step(
 
     if r1.converged:
         result = SolverResult(
-            theta=r1.theta, converged=True, iterations=r1.iterations,
+            theta=r1.theta, best_theta=r1.best_theta, converged=True, iterations=r1.iterations,
             residuals=r1.residuals, elapsed_time=time.perf_counter() - t_start,
             peak_ram_bytes=r1.peak_ram_bytes, message=r1.message,
         )
-        return torch.tensor(r1.theta, dtype=torch.float64), result
+        return torch.tensor(r1.best_theta, dtype=torch.float64), result
 
     # Stage 2: θ-Newton Anderson(10), warm-started from best FP result
     remaining = max(5.0, timeout - (time.perf_counter() - t_start))
-    theta1 = torch.tensor(r1.theta, dtype=torch.float64)
+    theta1 = torch.tensor(r1.best_theta, dtype=torch.float64)
     r2 = solve_fixed_point_dcm(
         dcm.residual, theta1,
         k_out=k_out, k_in=k_in,
@@ -189,14 +189,14 @@ def _run_topo_step(
                                    (r1.residuals[-1] if r1.residuals else float("inf")))  \
            else r1
     result = SolverResult(
-        theta=best.theta, converged=best.converged,
+        theta=best.theta, best_theta=best.best_theta, converged=best.converged,
         iterations=r1.iterations + r2.iterations,
         residuals=best.residuals,
         elapsed_time=time.perf_counter() - t_start,
         peak_ram_bytes=max(r1.peak_ram_bytes, r2.peak_ram_bytes),
         message=best.message,
     )
-    return torch.tensor(best.theta, dtype=torch.float64), result
+    return torch.tensor(best.best_theta, dtype=torch.float64), result
 
 
 def _fp_weight_multistart(
@@ -278,7 +278,7 @@ def _fp_weight_multistart(
         )
         total_iters += r.iterations
         peak_ram = max(peak_ram, r.peak_ram_bytes)
-        err = model.constraint_error_strength(theta_topo, r.theta)
+        err = model.constraint_error_strength(theta_topo, r.best_theta)
         if err < best_err:
             best_err = err
             best_result = r
@@ -289,6 +289,7 @@ def _fp_weight_multistart(
     elapsed = _t.perf_counter() - t_start
     return _SR(
         theta=best_result.theta,
+        best_theta=best_result.best_theta,
         converged=best_result.converged,
         iterations=total_iters,
         residuals=best_result.residuals,
@@ -415,7 +416,7 @@ def run_comparison(
     print("  Step 1: Solving DCM topology...")
     theta_topo, topo_res = _run_topo_step(model, tol=tol, timeout=300.0,
                                           theta_topo0=theta_topo0)
-    topo_err = model._dcm.constraint_error(topo_res.theta)
+    topo_err = model._dcm.constraint_error(topo_res.best_theta)
     print(f"  Topo: converged={topo_res.converged}, err={topo_err:.2e}, "
           f"iters={topo_res.iterations}, t={topo_res.elapsed_time:.3f}s")
     print()
@@ -433,7 +434,7 @@ def run_comparison(
 
     for name, fn in _make_solvers(model, theta_topo, theta_weight0, tol):
         result: SolverResult = fn()
-        mre = model.max_relative_error(topo_res.theta, result.theta)
+        mre = model.max_relative_error(topo_res.best_theta, result.best_theta)
         conv_str = "YES" if result.converged else "NO"
         print(
             f"{name:<{col[0]}} {conv_str:>{col[1]}} {result.iterations:>{col[2]}} "
@@ -511,7 +512,7 @@ def _run_single_network(
         t_start = time.perf_counter()
         try:
             sr: SolverResult = _call_with_timeout(fn, per_solver_timeout)
-            mre = model.max_relative_error(topo_sr.theta, sr.theta)
+            mre = model.max_relative_error(topo_sr.best_theta, sr.best_theta)
             results[name] = dict(
                 converged=sr.converged,
                 iterations=sr.iterations,

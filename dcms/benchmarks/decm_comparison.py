@@ -181,7 +181,7 @@ def run_comparison(
     for m in _ALL_METHODS:
         try:
             sr = _run_one(model, m, tol=tol, max_iter=5000, timeout=SOLVER_TIMEOUT)
-            mre = model.max_relative_error(sr.theta)
+            mre = model.max_relative_error(sr.best_theta)
             conv_str = "YES" if sr.converged else "NO"
             print(
                 f"{m['name']:<{col[0]}} {conv_str:>{col[1]}} {sr.iterations:>{col[2]}} "
@@ -234,7 +234,7 @@ def _run_single_network(
         t_start = time.perf_counter()
         try:
             sr = _run_one(model, m, tol=tol, max_iter=5000, timeout=per_solver_timeout)
-            mre = model.max_relative_error(sr.theta)
+            mre = model.max_relative_error(sr.best_theta)
             results[m["name"]] = dict(
                 converged=sr.converged,
                 iterations=sr.iterations,

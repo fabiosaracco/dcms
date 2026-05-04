@@ -310,7 +310,7 @@ class TestFixedPointDWCM:
             model.residual, theta0, model.s_out, model.s_in,
             tol=1e-10, max_iter=5000, damping=1.0, variant="gauss-seidel",
         )
-        err = model.constraint_error(result.theta)
+        err = model.constraint_error(result.best_theta)
         assert err < CONV_TOL, f"N={N} GS error={err:.3e}"
 
     def test_result_has_residual_history(self) -> None:
@@ -390,7 +390,7 @@ class TestThetaNewtonDWCM:
             model.residual, theta0, model.s_out, model.s_in,
             tol=1e-10, max_iter=5000, variant="theta-newton", max_step=1.0,
         )
-        err = model.constraint_error(result.theta)
+        err = model.constraint_error(result.best_theta)
         assert err < CONV_TOL, f"N={N} theta-newton error={err:.3e}"
 
     @pytest.mark.parametrize("N,seed", [(4, 2), (10, 3)])
@@ -403,7 +403,7 @@ class TestThetaNewtonDWCM:
             tol=1e-10, max_iter=5000, variant="theta-newton",
             max_step=1.0, anderson_depth=10,
         )
-        err = model.constraint_error(result.theta)
+        err = model.constraint_error(result.best_theta)
         assert err < CONV_TOL, f"N={N} theta-newton+Anderson error={err:.3e}"
 
     def test_zero_strength_nodes_pinned(self) -> None:
@@ -428,7 +428,7 @@ class TestThetaNewtonDWCM:
             model.residual, theta0, model.s_out, model.s_in,
             tol=1e-8, max_iter=200, variant="theta-newton", max_step=1.0,
         )
-        theta_arr = result.theta
+        theta_arr = result.best_theta
         assert theta_arr[0] == pytest.approx(_ETA_MAX, abs=1e-12), \
             f"Zero s_out node θ_out[0] should be _ETA_MAX, got {theta_arr[0]}"
         assert theta_arr[N + N - 1] == pytest.approx(_ETA_MAX, abs=1e-12), \

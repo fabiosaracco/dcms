@@ -367,7 +367,7 @@ class TestDECMSolverConvergence:
             f"N={N}, seed={seed}: not converged after {model.sol.iterations} iters. "
             f"Final residual: {model.sol.residuals[-1]:.3e}"
         )
-        assert model.constraint_error(model.sol.theta) < CONV_TOL * 10
+        assert model.constraint_error(model.sol.best_theta) < CONV_TOL * 10
 
     @pytest.mark.parametrize("seed", [0, 1, 2])
     def test_solve_tool_n4_multiple_seeds(self, seed: int):
@@ -403,7 +403,7 @@ class TestDECMSolverConvergence:
         # relative convergence harder than for integer-degree networks. Check
         # that the solver found a reasonable solution via MRE rather than the
         # implementation-specific convergence flag.
-        mre = model.max_relative_error(result.theta)
+        mre = model.max_relative_error(result.best_theta)
         assert mre < 0.05, (
             f"DECM solver (N={N}, seed=5): MRE={mre:.3e} — solver did not find a good solution"
         )
@@ -419,7 +419,7 @@ class TestDECMSolverConvergence:
         assert hasattr(model.sol, "residuals")
         assert hasattr(model.sol, "elapsed_time")
         assert hasattr(model.sol, "peak_ram_bytes")
-        assert model.sol.theta.shape == (16,)  # 4 * N with N=4
+        assert model.sol.best_theta.shape == (16,)  # 4 * N with N=4
         assert isinstance(model.sol.residuals, list)
         assert model.sol.elapsed_time > 0
 
@@ -428,5 +428,5 @@ class TestDECMSolverConvergence:
         model, _ = make_decm_model(N=6)
         model.solve_tool(tol=1e-12, max_iter=100)
         # Even if not converged, the best iterate should be reasonable
-        err = model.constraint_error(model.sol.theta)
+        err = model.constraint_error(model.sol.best_theta)
         assert err < 1.0  # sanity check: not wildly wrong

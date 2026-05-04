@@ -194,7 +194,7 @@ def run_comparison(
 
     for name, fn in _make_solvers(model, theta0, tol, fast=fast):
         result: SolverResult = fn()
-        max_err = model.constraint_error(result.theta)
+        max_err = model.constraint_error(result.best_theta)
         conv_str = "YES" if result.converged else "NO"
         print(
             f"{name:<{col[0]}} {conv_str:>{col[1]}} {result.iterations:>{col[2]}} "
@@ -240,7 +240,7 @@ def _run_single_network(
     for name, fn in _make_solvers(model, theta0, tol, fast=fast):
         try:
             result: SolverResult = _call_with_timeout(fn, effective_timeout)
-            max_abs = model.constraint_error(result.theta)
+            max_abs = model.constraint_error(result.best_theta)
             ref = float(model.k_out.abs().mean().clamp(min=1e-15))
             max_rel = max_abs / ref
             results[name] = {

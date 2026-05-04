@@ -196,7 +196,7 @@ class TestZeroDegreeBehavior:
             model.residual, theta0, model.k_out, model.k_in,
             tol=1e-10, max_iter=5000, variant="theta-newton", anderson_depth=10,
         )
-        err = model.constraint_error(result.theta)
+        err = model.constraint_error(result.best_theta)
         assert err < 1e-5, f"θ-Newton error with zero-degree nodes: {err:.3e}"
 
 
@@ -293,5 +293,5 @@ class TestSaturatedNodeBehavior:
             model.residual, theta0, model.k_out, model.k_in,
             tol=1e-10, max_iter=5000, variant="theta-newton", anderson_depth=10,
         )
-        err = model.constraint_error(result.theta)
+        err = model.constraint_error(result.best_theta)
         assert err < 1e-5, f"θ-Newton error with saturated nodes: {err:.3e}"

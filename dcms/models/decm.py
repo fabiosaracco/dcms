@@ -483,8 +483,8 @@ class DECMModel:
             # not a user-facing solve.
             with contextlib.redirect_stdout(io.StringIO()):
                 qdecm.solve_tool(ic_topo="degrees", ic_weights="topology")
-            theta_topo = torch.as_tensor(qdecm.sol_topo.theta, dtype=torch.float64)
-            theta_weight = torch.as_tensor(qdecm.sol_weights.theta, dtype=torch.float64)
+            theta_topo = torch.as_tensor(qdecm.sol_topo.best_theta, dtype=torch.float64)
+            theta_weight = torch.as_tensor(qdecm.sol_weights.best_theta, dtype=torch.float64)
             return torch.cat([theta_topo, theta_weight])
 
         if method in ("degrees", "random", "uniform"):
@@ -721,7 +721,7 @@ class DECMModel:
         import numpy as np
         rng = np.random.default_rng(seed)
         N = self.N
-        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
         theta_out = theta[:N]
         theta_in  = theta[N : 2 * N]
         eta_out   = theta[2 * N : 3 * N]

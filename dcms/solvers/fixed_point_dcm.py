@@ -663,7 +663,8 @@ def solve_fixed_point_dcm(
             _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
-        theta=best_theta.detach().numpy(),
+        theta=theta.detach().numpy(),
+        best_theta=best_theta.detach().numpy(),
         converged=converged,
         iterations=n_iter,
         residuals=residuals,

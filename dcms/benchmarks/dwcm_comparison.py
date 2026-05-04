@@ -209,7 +209,7 @@ def _make_solvers(
         t0_wall = _t.perf_counter()
         for t0_cand in inits:
             if best is not None and not best.converged:
-                t0_cand = torch.tensor(best.theta, dtype=torch.float64)
+                t0_cand = torch.tensor(best.best_theta, dtype=torch.float64)
             r = solve_fixed_point_dwcm(
                 res_fn, t0_cand, model.s_out, model.s_in,
                 tol=tol, damping=1.0, variant="gauss-seidel",
@@ -218,7 +218,7 @@ def _make_solvers(
             )
             total_iters += r.iterations
             peak_ram = max(peak_ram, r.peak_ram_bytes)
-            err = model.max_relative_error(r.theta)
+            err = model.max_relative_error(r.best_theta)
             if err < best_err:
                 best_err = err
                 best = r
@@ -227,6 +227,7 @@ def _make_solvers(
         assert best is not None
         return _SR(
             theta=best.theta,
+            best_theta=best.best_theta,
             converged=best.converged,
             iterations=total_iters,
             residuals=best.residuals,
@@ -254,7 +255,7 @@ def _make_solvers(
         t0_wall = _t.perf_counter()
         for t0_cand in inits:
             if best is not None and not best.converged:
-                t0_cand = torch.tensor(best.theta, dtype=torch.float64)
+                t0_cand = torch.tensor(best.best_theta, dtype=torch.float64)
             r = solve_fixed_point_dwcm(
                 res_fn, t0_cand, model.s_out, model.s_in,
                 tol=tol, variant="theta-newton",
@@ -263,7 +264,7 @@ def _make_solvers(
             )
             total_iters += r.iterations
             peak_ram = max(peak_ram, r.peak_ram_bytes)
-            err = model.max_relative_error(r.theta)
+            err = model.max_relative_error(r.best_theta)
             if err < best_err:
                 best_err = err
                 best = r
@@ -272,6 +273,7 @@ def _make_solvers(
         assert best is not None
         return _SR(
             theta=best.theta,
+            best_theta=best.best_theta,
             converged=best.converged,
             iterations=total_iters,
             residuals=best.residuals,
@@ -326,7 +328,7 @@ def run_comparison(N: int = 50, seed: Optional[int] = None, tol: float = DEFAULT
 
     for name, fn in _make_solvers(model, theta0, tol):
         result: SolverResult = fn()
-        max_rel_err = model.max_relative_error(result.theta)
+        max_rel_err = model.max_relative_error(result.best_theta)
         conv_str = "YES" if result.converged else "NO"
         print(
             f"{name:<{col[0]}} {conv_str:>{col[1]}} {result.iterations:>{col[2]}} "
@@ -379,7 +381,7 @@ def _run_single_network(
         try:
             sr: SolverResult = _call_with_timeout(fn, timeout)
             elapsed = time.perf_counter() - t_start
-            max_rel_err = model.max_relative_error(sr.theta)
+            max_rel_err = model.max_relative_error(sr.best_theta)
             results[name] = dict(
                 converged=sr.converged, iterations=sr.iterations,
                 max_rel_err=max_rel_err,

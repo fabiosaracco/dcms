@@ -202,8 +202,8 @@ class TestDCMParity:
         model_nb.solve_tool(variant="theta-newton", backend="numba")
         assert model_pt.sol.converged
         assert model_nb.sol.converged
-        err_pt = model_pt.constraint_error(model_pt.sol.theta)
-        err_nb = model_nb.constraint_error(model_nb.sol.theta)
+        err_pt = model_pt.constraint_error(model_pt.sol.best_theta)
+        err_nb = model_nb.constraint_error(model_nb.sol.best_theta)
         assert err_pt < CONV_TOL
         assert err_nb < CONV_TOL
 
@@ -214,8 +214,8 @@ class TestDCMParity:
         model_nb.solve_tool(variant="gauss-seidel", anderson_depth=5, backend="numba")
         assert model_pt.sol.converged
         assert model_nb.sol.converged
-        err_pt = model_pt.constraint_error(model_pt.sol.theta)
-        err_nb = model_nb.constraint_error(model_nb.sol.theta)
+        err_pt = model_pt.constraint_error(model_pt.sol.best_theta)
+        err_nb = model_nb.constraint_error(model_nb.sol.best_theta)
         assert err_pt < CONV_TOL
         assert err_nb < CONV_TOL
 
@@ -242,8 +242,8 @@ class TestDWCMParity:
         model_nb.solve_tool(variant="theta-newton", backend="numba")
         assert model_pt.sol.converged
         assert model_nb.sol.converged
-        err_pt = model_pt.constraint_error(model_pt.sol.theta)
-        err_nb = model_nb.constraint_error(model_nb.sol.theta)
+        err_pt = model_pt.constraint_error(model_pt.sol.best_theta)
+        err_nb = model_nb.constraint_error(model_nb.sol.best_theta)
         assert err_pt < CONV_TOL
         assert err_nb < CONV_TOL
 

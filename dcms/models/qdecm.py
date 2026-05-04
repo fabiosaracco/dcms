@@ -664,13 +664,13 @@ class qDECMModel:
         if theta_weights_0 is not None:
             self.ic_weig = _torch.as_tensor(theta_weights_0, dtype=_torch.float64)
         else:
-            self.ic_weig = self.initial_theta_weight(theta_topo = self.sol_topo.theta, method=ic_weights)
+            self.ic_weig = self.initial_theta_weight(theta_topo = self.sol_topo.best_theta, method=ic_weights)
 
         # Build the residual function that fixes theta_topo
-        res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.theta)
+        res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.best_theta)
 
         from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm  # lazy import to avoid circular dependency
-        self.sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+        self.sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         if len(self.sol_weights.message)>0:
             print(f'Weights: {self.sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
@@ -705,10 +705,10 @@ class qDECMModel:
         import numpy as np
         rng = np.random.default_rng(seed)
         N = self.N
-        theta_topo = np.asarray(self.sol_topo.theta, dtype=np.float64)
+        theta_topo = np.asarray(self.sol_topo.best_theta, dtype=np.float64)
         theta_out  = theta_topo[:N]
         theta_in   = theta_topo[N:]
-        theta_w   = np.asarray(self.sol_weights.theta, dtype=np.float64)
+        theta_w   = np.asarray(self.sol_weights.best_theta, dtype=np.float64)
         beta_out  = np.exp(-theta_w[:N])
         beta_in   = np.exp(-theta_w[N:])
         edges: list = []

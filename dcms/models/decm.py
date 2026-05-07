@@ -583,6 +583,7 @@ class DECMModel:
         num_threads: int = 0,
         verbose: bool = False,
         monitor: bool = False,
+        hub_sk_threshold: float = 0.0,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -630,6 +631,13 @@ class DECMModel:
             monitor:       If ``True`` (and ``verbose=True``), overwrite the
                            same terminal line at each iteration (``end='\\r'``)
                            so only the latest status is visible.  Default=False.
+            hub_sk_threshold: When > 0, nodes with observed s_i/k_hat_i above
+                           this value are treated as hub nodes and solved
+                           exactly each iteration via 1D bisection over η
+                           rather than the global Newton step.  Use for
+                           networks with nodes having very high s/k ratios
+                           (e.g. ``s/k > 5``) that cause stagnation.
+                           Default=0.0 (disabled).
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -662,6 +670,7 @@ class DECMModel:
                 num_threads=num_threads,
                 verbose=verbose,
                 monitor=monitor,
+                hub_sk_threshold=hub_sk_threshold,
             )
 
         if theta_0 is not None:

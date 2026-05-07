@@ -708,6 +708,63 @@ def _theta_newton_step_chunked(
     return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
 
 
+# ---------------------------------------------------------------------------
+# 1D bisection for hub nodes (high s/k ratio)
+# ---------------------------------------------------------------------------
+
+def _bisect_hub_beta(
+    p_row: "np.ndarray",
+    beta_other: "np.ndarray",
+    s_target: float,
+    n_bisect: int = 60,
+) -> float:
+    """Find β such that Σ_j p_j / (1 − β·b_j) = s_target via bisection.
+
+    Used for hub nodes where s/k >> 1, requiring β close to 1.  The function
+
+        f(β) = Σ_j p_j / (1 − β·b_j)
+
+    is strictly increasing in β ∈ [0, β_max) where β_max = 1/max(b_j).
+    For a hub node f(0) = Σ p_j ≈ k_hat << s_target, so the root is
+    well-bracketed.  60 bisection steps give relative precision ≈ 2⁻⁶⁰.
+
+    Args:
+        p_row:      Connection probabilities to neighbours (length N, diagonal
+                    entry excluded and assumed zero).
+        beta_other: Current β values of the other side (β_in for an out-hub,
+                    β_out for an in-hub), length N.
+        s_target:   Observed strength to match (must be positive).
+        n_bisect:   Number of bisection iterations (default 60).
+
+    Returns:
+        Scalar β* such that f(β*) ≈ s_target.
+    """
+    import numpy as _np
+
+    pos = p_row > 0.0
+    if not pos.any():
+        return 0.0
+
+    max_b = beta_other[pos].max()
+    if max_b <= 0.0:
+        return 0.0
+
+    beta_lo = 0.0
+    beta_hi = (1.0 / max_b) * (1.0 - 1e-9)
+
+    for _ in range(n_bisect):
+        beta_mid = 0.5 * (beta_lo + beta_hi)
+        z = beta_mid * beta_other
+        z = _np.minimum(z, 1.0 - 1e-12)
+        f = (p_row / (1.0 - z)).sum() - s_target
+        if f < 0.0:
+            beta_lo = beta_mid
+        else:
+            beta_hi = beta_mid
+
+    return 0.5 * (beta_lo + beta_hi)
+
+
 def solve_fixed_point_qdecm(
     residual_fn: Callable[[torch.Tensor], torch.Tensor],
     theta0: "ArrayLike",  # type: ignore[name-defined]
@@ -727,6 +784,7 @@ def solve_fixed_point_qdecm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    hub_sk_threshold: float = 0.0,
 ) -> SolverResult:
     """Fixed-point iteration for the qDECM weight step.
 
@@ -769,6 +827,12 @@ def solve_fixed_point_qdecm(
         monitor:     If ``True`` (and ``verbose=True``), overwrite the same
                      terminal line at each iteration (``end='\\r'``) so only
                      the latest status is visible.  Default=False.
+        hub_sk_threshold: When > 0, nodes whose observed s_i / k_hat_i exceeds
+                     this threshold are treated as *hub nodes* and have their
+                     β updated by an exact 1D bisection instead of the global
+                     Newton/FP step.  k_hat_i = Σ_j p_ij is the expected degree
+                     from the DCM topology.  Typical value: 20–50.  Default 0
+                     (disabled).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -845,6 +909,81 @@ def solve_fixed_point_qdecm(
     else:
         theta_topo_out_chunked = theta_topo[:N]
         theta_topo_in_chunked = theta_topo[N:]
+
+    # --- Hub bisection pre-computation ---
+    # Identify hub nodes (s/k_hat > hub_sk_threshold) and precompute their
+    # full p-rows/columns (one row per out-hub, one col per in-hub).
+    # Hub β values are solved exactly via 1D bisection each iteration instead
+    # of the global Newton/FP step, which stagnates when z_ij ≈ 0.
+    _hub_active = (hub_sk_threshold > 0.0) and (not _use_numba)
+    _hub_out_idx: list[int] = []
+    _hub_in_idx: list[int] = []
+    _hub_P_out_rows: list[torch.Tensor] = []  # p_ij row for each out-hub
+    _hub_P_in_cols: list[torch.Tensor] = []   # p_ij col for each in-hub
+    if _hub_active:
+        import numpy as _hub_np
+        # Compute expected degree k_hat = sum_j p_ij for each node
+        if effective_chunk == 0:
+            k_hat_out = P_mat.sum(1)   # (N,)
+            k_hat_in  = P_mat.sum(0)   # (N,)
+        else:
+            k_hat_out = torch.zeros(N, dtype=torch.float64)
+            k_hat_in  = torch.zeros(N, dtype=torch.float64)
+            _tto = theta_topo_out_chunked
+            _tti = theta_topo_in_chunked
+            for _i0 in range(0, N, effective_chunk):
+                _i1 = min(_i0 + effective_chunk, N)
+                _log_xy = -_tto[_i0:_i1, None] - _tti[None, :]
+                _p_chunk = torch.sigmoid(_log_xy)
+                _p_chunk[:, _i0:_i1].fill_diagonal_(0.0)
+                k_hat_out[_i0:_i1] = _p_chunk.sum(1)
+                k_hat_in += _p_chunk.sum(0)
+
+        hub_out_mask = (
+            (s_out > 0)
+            & (k_hat_out > 0)
+            & (s_out / k_hat_out.clamp(min=1e-10) > hub_sk_threshold)
+        )
+        hub_in_mask = (
+            (s_in > 0)
+            & (k_hat_in > 0)
+            & (s_in / k_hat_in.clamp(min=1e-10) > hub_sk_threshold)
+        )
+        _hub_out_idx = hub_out_mask.nonzero(as_tuple=True)[0].tolist()
+        _hub_in_idx  = hub_in_mask.nonzero(as_tuple=True)[0].tolist()
+
+        # Precompute the full p-row / p-col for each hub (small number of rows)
+        if effective_chunk == 0:
+            for _i in _hub_out_idx:
+                _hub_P_out_rows.append(P_mat[_i].clone())
+            for _j in _hub_in_idx:
+                _hub_P_in_cols.append(P_mat[:, _j].clone())
+        else:
+            _tto = theta_topo_out_chunked
+            _tti = theta_topo_in_chunked
+            # Accumulate full row/col for each hub across chunks
+            _hub_out_rows_acc = [torch.zeros(N, dtype=torch.float64) for _ in _hub_out_idx]
+            _hub_in_cols_acc  = [torch.zeros(N, dtype=torch.float64) for _ in _hub_in_idx]
+            for _i0 in range(0, N, effective_chunk):
+                _i1 = min(_i0 + effective_chunk, N)
+                _log_xy = -_tto[_i0:_i1, None] - _tti[None, :]
+                _p_chunk = torch.sigmoid(_log_xy)
+                _p_chunk[:, _i0:_i1].fill_diagonal_(0.0)
+                # Row contribution: out-hub i in range [i0, i1) → direct slice
+                for _k, _i in enumerate(_hub_out_idx):
+                    if _i0 <= _i < _i1:
+                        _hub_out_rows_acc[_k] = _p_chunk[_i - _i0].clone()
+                # Col contribution: accumulate from column slice
+                for _k, _j in enumerate(_hub_in_idx):
+                    _hub_in_cols_acc[_k][_i0:_i1] += _p_chunk[:, _j]
+            _hub_P_out_rows = _hub_out_rows_acc
+            _hub_P_in_cols  = _hub_in_cols_acc
+
+        if verbose and (_hub_out_idx or _hub_in_idx):
+            print(
+                f"[hub_bisection] out-hubs={_hub_out_idx}, in-hubs={_hub_in_idx} "
+                f"(threshold s/k > {hub_sk_threshold})"
+            )
 
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
@@ -980,6 +1119,46 @@ def solve_fixed_point_qdecm(
                 theta_fp > 0, torch.maximum(theta_fp, _step_floor), theta_fp
             )
 
+            # --- Hub bisection (1D coordinate descent for high s/k nodes) ---
+            # For hub nodes, the global step cannot resolve β_i ≈ 1 accurately.
+            # Multiple Gauss-Seidel sweeps (out-hubs then in-hubs) until the hub
+            # sub-system is self-consistent.  A single sweep is inconsistent when
+            # a node appears in both out-hub and in-hub lists: the β_in update in
+            # the in-hub pass invalidates the β_out computed in the out-hub pass.
+            # 3 sweeps are enough for typical cases (convergence is geometric).
+            if _hub_active and (_hub_out_idx or _hub_in_idx):
+                import numpy as _hnp
+                _beta_out_fp = torch.exp(-theta_fp[:N]).numpy()
+                _beta_in_fp  = torch.exp(-theta_fp[N:]).numpy()
+
+                _HUB_SWEEPS = 3
+                for _sweep in range(_HUB_SWEEPS):
+                    for _hk, _hi in enumerate(_hub_out_idx):
+                        _p_row = _hub_P_out_rows[_hk].numpy()
+                        _new_beta = _bisect_hub_beta(
+                            _p_row, _beta_in_fp, s_out[_hi].item()
+                        )
+                        if _new_beta > 0.0:
+                            _new_theta = float(-_hnp.log(max(_new_beta, 1e-300)))
+                            theta_fp[_hi] = max(_new_theta, -_ETA_MAX)
+                            _beta_out_fp[_hi] = _new_beta
+
+                    for _hk, _hj in enumerate(_hub_in_idx):
+                        _p_col = _hub_P_in_cols[_hk].numpy()
+                        _new_beta = _bisect_hub_beta(
+                            _p_col, _beta_out_fp, s_in[_hj].item()
+                        )
+                        if _new_beta > 0.0:
+                            _new_theta = float(-_hnp.log(max(_new_beta, 1e-300)))
+                            theta_fp[N + _hj] = max(_new_theta, -_ETA_MAX)
+                            _beta_in_fp[_hj] = _new_beta
+
+                # All hub constraints satisfied → zero their F_current entries
+                for _hi in _hub_out_idx:
+                    F_current[_hi] = 0.0
+                for _hj in _hub_in_idx:
+                    F_current[N + _hj] = 0.0
+
             # --- Convergence check using the step-computed residual ---
             # Relative: MRE = max|F_i|/target_i
             res_norm = (
@@ -1099,6 +1278,16 @@ def solve_fixed_point_qdecm(
                     theta_next = theta_fp  # continue from current GS output
                 else:
                     r_k = theta_fp - theta
+                    # Exclude hub components from Anderson residuals: hub θ
+                    # values are always overridden by bisection, so their
+                    # differences would confuse the mixing weights and slow
+                    # convergence for the (many more) non-hub components.
+                    if _hub_active and (_hub_out_idx or _hub_in_idx):
+                        r_k = r_k.clone()
+                        for _hi in _hub_out_idx:
+                            r_k[_hi] = 0.0
+                        for _hj in _hub_in_idx:
+                            r_k[N + _hj] = 0.0
                     r_k_norm = r_k.abs().max().item()
                     if math.isfinite(r_k_norm) and (
                         variant != "theta-newton" or r_k_norm < _ANDERSON_MAX_NORM
@@ -1143,6 +1332,20 @@ def solve_fixed_point_qdecm(
                         theta_next = theta_fp
             else:
                 theta_next = theta_fp
+
+            # --- Freeze hub components after Anderson mixing ---
+            # Anderson mixes ALL components, including hubs, which were just
+            # solved exactly by bisection.  Override the hub θ values in
+            # theta_next with those from theta_fp (post-bisection) so that
+            # the next iteration starts with the exact bisection solution,
+            # not a contaminated linear combination.
+            if _hub_active and theta_next is not theta_fp and (
+                _hub_out_idx or _hub_in_idx
+            ):
+                for _hi in _hub_out_idx:
+                    theta_next[_hi] = theta_fp[_hi]
+                for _hj in _hub_in_idx:
+                    theta_next[N + _hj] = theta_fp[N + _hj]
 
             # --- FP-GS post-Anderson Newton-Anderson mini-loop ---
             if _fpgs_newton_fired:

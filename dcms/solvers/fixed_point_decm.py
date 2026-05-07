@@ -492,6 +492,84 @@ def _decm_step_chunked(
 
 
 # -------------------------------------------------------------------------
+# Hub bisection helper (DECM)
+# -------------------------------------------------------------------------
+
+def _bisect_hub_eta_decm(
+    theta_self: float,
+    theta_other: "np.ndarray",
+    eta_other: "np.ndarray",
+    s_target: float,
+    self_idx: int,
+    n_bisect: int = 60,
+) -> float:
+    """Find η such that Σ_{j≠i} p_ij(η) · G_ij(η) = s_target via bisection.
+
+    For a hub node i (out or in) with high s/k the global Newton step tends to
+    produce very small η, causing numerical instability.  This function solves
+    the 1D strength equation exactly while keeping all other parameters fixed.
+
+    The function
+
+        f(η_i) = Σ_{j≠i} p_ij · G_ij
+
+    where z_j = η_i + η_j^{other},  G_j = -1/expm1(-z_j),
+    logit(p_ij) = -θ_i - θ_j^{other} - log(expm1(z_j))
+
+    is strictly *decreasing* in η_i: as η_i ↑, z_j ↑, G_j → 1, p_ij → 0.
+    The bracket is [_ETA_MIN, _ETA_MAX]; f → +∞ as η_i → 0⁺, f → 0 as η_i → ∞.
+
+    Args:
+        theta_self:  Current θ parameter of hub node (θ_out_i for out-hub).
+        theta_other: θ parameters of the opposing side (θ_in for out-hub),
+                     length N.
+        eta_other:   η parameters of the opposing side (η_in for out-hub),
+                     length N.
+        s_target:    Observed strength to match (must be positive).
+        self_idx:    Index of the hub node (to zero out the diagonal term).
+        n_bisect:    Number of bisection steps.
+
+    Returns:
+        Scalar η* such that f(η*) ≈ s_target.
+    """
+    import math as _math
+    import numpy as _np
+
+    N = len(theta_other)
+
+    def _f(eta_val: float) -> float:
+        z = eta_val + eta_other                     # (N,)
+        z = _np.maximum(z, _Z_G_CLAMP)
+        G = -1.0 / _np.expm1(-z)                   # G = 1/(1-e^{-z})
+        log_q = -_np.log(_np.expm1(z))             # log_q = -log(e^z - 1)
+        logit_p = -theta_self - theta_other + log_q
+        p = 1.0 / (1.0 + _np.exp(-logit_p))        # sigmoid
+        W = p * G
+        W[self_idx] = 0.0                           # exclude diagonal
+        return float(W.sum()) - s_target
+
+    # Bracket: [_ETA_MIN, _ETA_MAX]; f is decreasing so f(lo) > 0 > f(hi)
+    eta_lo = _ETA_MIN
+    eta_hi = _ETA_MAX
+
+    # If even the minimum gives f < 0, the target is unreachable → return lo
+    f_lo = _f(eta_lo)
+    if f_lo <= 0.0:
+        return eta_lo
+
+    for _ in range(n_bisect):
+        eta_mid = 0.5 * (eta_lo + eta_hi)
+        if _math.isinf(eta_mid) or _math.isnan(eta_mid):
+            break
+        if _f(eta_mid) > 0.0:
+            eta_lo = eta_mid
+        else:
+            eta_hi = eta_mid
+
+    return 0.5 * (eta_lo + eta_hi)
+
+
+# -------------------------------------------------------------------------
 # Main solver
 # -------------------------------------------------------------------------
 
@@ -513,6 +591,7 @@ def solve_fixed_point_decm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    hub_sk_threshold: float = 0.0,
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -553,6 +632,13 @@ def solve_fixed_point_decm(
         monitor:        If ``True`` (and ``verbose=True``), overwrite the same
                         terminal line at each iteration (``end='\\r'``) so only
                         the latest status is visible.  Default=False.
+        hub_sk_threshold: When > 0, nodes whose observed strength-to-degree
+                        ratio ``s_i / k_hat_i`` exceeds this value are treated
+                        as *hub nodes* and solved exactly each iteration via 1D
+                        bisection over η rather than the global Newton step.
+                        Use this for networks with a few nodes that have very
+                        high ``s/k`` ratios (e.g. ``s/k > 5``) which cause the
+                        global solver to stagnate.  Default=0.0 (disabled).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -681,6 +767,46 @@ def solve_fixed_point_decm(
     _v_targets = torch.cat([k_out, k_in, s_out, s_in])
     _v_nonzero = _v_targets > 0
 
+    # ------------------------------------------------------------------
+    # Hub precomputation (only when hub_sk_threshold > 0)
+    # ------------------------------------------------------------------
+    import numpy as _np_hub
+
+    _hub_active = hub_sk_threshold > 0.0 and not _use_numba
+    _hub_out_mask: torch.Tensor | None = None   # shape (N,) bool
+    _hub_in_mask: torch.Tensor | None = None
+
+    if _hub_active:
+        # k_hat ≈ k_out (use observed degrees as proxy; also, a node with
+        # zero strength is excluded from hub treatment regardless)
+        k_hat_out = k_out.clamp(min=1.0)
+        k_hat_in = k_in.clamp(min=1.0)
+        sk_out = s_out / k_hat_out
+        sk_in = s_in / k_hat_in
+        _hub_out_mask = (sk_out > hub_sk_threshold) & (s_out > 0) & (~zero_k_out)
+        _hub_in_mask = (sk_in > hub_sk_threshold) & (s_in > 0) & (~zero_k_in)
+
+        _hub_out_indices = _hub_out_mask.nonzero(as_tuple=True)[0].tolist()
+        _hub_in_indices = _hub_in_mask.nonzero(as_tuple=True)[0].tolist()
+
+        # Build hub masks for the 4N Anderson exclusion vector
+        _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
+        for _idx in _hub_out_indices:
+            _hub_4N_mask[2 * N + _idx] = True          # η_out part
+        for _idx in _hub_in_indices:
+            _hub_4N_mask[3 * N + _idx] = True          # η_in part
+
+        if verbose:
+            print(
+                f"[hub-bisect] threshold={hub_sk_threshold}: "
+                f"{len(_hub_out_indices)} out-hubs, "
+                f"{len(_hub_in_indices)} in-hubs identified."
+            )
+    else:
+        _hub_out_indices = []
+        _hub_in_indices = []
+        _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
+
     try:
         for _ in range(max_iter):
             if max_time > 0 and (time.perf_counter() - t0) > max_time:
@@ -701,7 +827,47 @@ def solve_fixed_point_decm(
             )
             theta_fp = torch.cat([theta_fp[:2 * N], eta_part_new])
 
-            # Relative: MRE = max|F_i|/target_i
+            # ------------------------------------------------------------------
+            # Hub bisection: for nodes with s/k > threshold, find η exactly
+            # via 1D bisection (3 GS sweeps for consistency between out/in).
+            # ------------------------------------------------------------------
+            if _hub_active and (_hub_out_indices or _hub_in_indices):
+                _th_fp_np = theta_fp.numpy()
+                for _sweep in range(3):
+                    # --- Out-hub pass ---
+                    for _i in _hub_out_indices:
+                        _eta_in_cur = _th_fp_np[3 * N:]       # current η_in
+                        _tho_cur = _th_fp_np[N:2 * N]         # current θ_in
+                        _eta_out_new = _bisect_hub_eta_decm(
+                            theta_self=float(_th_fp_np[_i]),   # θ_out_i
+                            theta_other=_tho_cur,
+                            eta_other=_eta_in_cur,
+                            s_target=float(s_out[_i].item()),
+                            self_idx=_i,
+                        )
+                        _th_fp_np[2 * N + _i] = _eta_out_new
+                    # --- In-hub pass ---
+                    for _j in _hub_in_indices:
+                        _eta_out_cur = _th_fp_np[2 * N:3 * N] # current η_out
+                        _tho_cur = _th_fp_np[:N]               # current θ_out
+                        _eta_in_new = _bisect_hub_eta_decm(
+                            theta_self=float(_th_fp_np[N + _j]),   # θ_in_j
+                            theta_other=_tho_cur,
+                            eta_other=_eta_out_cur,
+                            s_target=float(s_in[_j].item()),
+                            self_idx=_j,
+                        )
+                        _th_fp_np[3 * N + _j] = _eta_in_new
+                theta_fp = torch.from_numpy(_th_fp_np)
+
+                # Zero out F_current for hub nodes (their strength equation is
+                # exactly satisfied after bisection; keep residual for bookkeeping)
+                for _i in _hub_out_indices:
+                    F_current[2 * N + _i] = 0.0
+                for _j in _hub_in_indices:
+                    F_current[3 * N + _j] = 0.0
+
+
             res_norm = (
                 (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
                 if _v_nonzero.any() else 0.0
@@ -782,6 +948,10 @@ def solve_fixed_point_decm(
                     theta_next = theta_fp
                 else:
                     r_k = theta_fp - theta
+                    # Hub exclusion: zero hub components in r_k so Anderson
+                    # mixing weights focus on non-hub convergence
+                    if _hub_active:
+                        r_k[_hub_4N_mask] = 0.0
                     r_k_norm = r_k.abs().max().item()
                     if math.isfinite(r_k_norm) and r_k_norm < _ANDERSON_MAX_NORM:
                         _and_g.append(theta_fp.clone())
@@ -813,6 +983,10 @@ def solve_fixed_point_decm(
                             theta_next = theta_fp
                             _and_g.clear()
                             _and_r.clear()
+
+                        # Anderson freeze: restore hub η to bisection values
+                        if _hub_active:
+                            theta_next[_hub_4N_mask] = theta_fp[_hub_4N_mask]
                     else:
                         theta_next = theta_fp
             else:

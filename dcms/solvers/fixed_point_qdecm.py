@@ -785,6 +785,7 @@ def solve_fixed_point_qdecm(
     verbose: bool = False,
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
+    backtracking_gamma: float = 0.0,
 ) -> SolverResult:
     """Fixed-point iteration for the qDECM weight step.
 
@@ -833,6 +834,15 @@ def solve_fixed_point_qdecm(
                      Newton/FP step.  k_hat_i = Σ_j p_ij is the expected degree
                      from the DCM topology.  Typical value: 20–50.  Default 0
                      (disabled).
+        backtracking_gamma (float): When > 0, after each ``"theta-newton"``
+                     step a backtracking line search is applied: the residual
+                     at the proposed ``theta_fp`` is evaluated, and if it
+                     exceeds ``backtracking_gamma × res_norm`` (residual at
+                     the current iterate), the step is halved up to 5 times
+                     until the condition is met.  Typical value: ``2.0``
+                     (allow at most a 2× residual increase).  Default 0
+                     (disabled).  Anderson history is cleared whenever a
+                     dampened step is accepted.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -1169,6 +1179,50 @@ def solve_fixed_point_qdecm(
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
                 break
+
+            # --- Backtracking line search (theta-newton only, PyTorch path) ---
+            # Evaluate the residual at the proposed theta_fp.  If it exceeds
+            # backtracking_gamma × res_norm (residual at the current theta),
+            # halve the step up to 5 times and accept the best dampened iterate.
+            # Anderson history is cleared on each successful backtrack because the
+            # shorter step invalidates the mixing history accumulated so far.
+            if (
+                backtracking_gamma > 0.0
+                and variant == "theta-newton"
+                and res_norm > 0.0
+                and not _use_numba
+            ):
+                _F_fp = residual_fn(theta_fp)
+                _res_fp = (
+                    (_F_fp.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                    if _v_nonzero.any() else 0.0
+                )
+                if math.isfinite(_res_fp) and _res_fp > backtracking_gamma * res_norm:
+                    _bt_best_res = _res_fp
+                    _bt_best_theta = theta_fp.clone()
+                    _bt_alpha = 0.5
+                    for _ in range(5):  # min alpha = 1/32
+                        _theta_bt = (
+                            theta + _bt_alpha * (theta_fp - theta)
+                        ).clamp(-_ETA_MAX, _ETA_MAX)
+                        _F_bt = residual_fn(_theta_bt)
+                        _res_bt = (
+                            (_F_bt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                            if _v_nonzero.any() else 0.0
+                        )
+                        if math.isfinite(_res_bt) and _res_bt < _bt_best_res:
+                            _bt_best_res = _res_bt
+                            _bt_best_theta = _theta_bt.clone()
+                        if math.isfinite(_res_bt) and _res_bt <= backtracking_gamma * res_norm:
+                            break
+                        _bt_alpha *= 0.5
+                    if _bt_best_res < _res_fp:
+                        theta_fp = _bt_best_theta
+                        _and_g.clear()
+                        _and_r.clear()
+                        _best_res_for_anderson = float("inf")
+                        _tn_stagnation_count = 0
+                        _tn_best_local = float("inf")
 
             n_iter += 1
             residuals.append(res_norm)

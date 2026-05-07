@@ -41,7 +41,6 @@ from __future__ import annotations
 from typing import Union
 
 import torch
-import functools
 
 from dcms.solvers.base import SolverResult
 
@@ -612,7 +611,7 @@ class qDECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', theta_topo_0=None, theta_weights_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0)-> SolverResult:
+    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', theta_topo_0=None, theta_weights_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -653,6 +652,14 @@ class qDECMModel:
                 this for networks with a few nodes that have very high
                 ``s/k`` ratios (e.g. ``s/k > 5``) which cause the global
                 solver to stagnate.  Default=0.0 (disabled).
+            backtracking_gamma (float): When > 0, enables a per-step
+                backtracking line search in the ``"theta-newton"`` variant.
+                After each Newton step the residual at the proposed iterate is
+                evaluated; if it exceeds ``backtracking_gamma`` times the
+                current residual, the step is halved (up to 5 times) until the
+                condition is met.  Typical value: ``2.0``.  Default=0.0
+                (disabled).  Combine with ``hub_sk_threshold`` for networks
+                with extreme hubs.
 
         Returns:
             :class:`~dcms.solvers.base.SolverResult` instance.  The combined
@@ -683,10 +690,10 @@ class qDECMModel:
             self.ic_weig = self.initial_theta_weight(theta_topo = _sol_topo.best_theta, method=ic_weights)
 
         # Build the residual function that fixes theta_topo
-        res_weight = functools.partial(self.residual_strength, theta_topo=_sol_topo.best_theta)
+        res_weight = lambda tb: self.residual_strength(_sol_topo.best_theta, tb)
 
         from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm  # lazy import to avoid circular dependency
-        _sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=_sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold)
+        _sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=_sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, backtracking_gamma=backtracking_gamma)
         if len(_sol_weights.message)>0:
             print(f'Weights: {_sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 

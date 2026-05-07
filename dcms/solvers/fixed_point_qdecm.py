@@ -1189,10 +1189,12 @@ def solve_fixed_point_qdecm(
                 sys.stdout.flush()
 
             # Keep a reference to the iterate with the minimum equation-residual.
-            # Save theta_fp (the Newton/FP output) since res_norm was measured on it.
+            # res_norm = MRE(F(theta)) is measured at the *current* theta (before
+            # the step), so we save theta (not theta_fp) to keep best_theta and
+            # best_theta_res consistent.
             if res_norm < best_theta_res:
                 best_theta_res = res_norm
-                best_theta = theta_fp.clone()
+                best_theta = theta.clone()
 
             if res_norm < tol:
                 converged = True

@@ -22,7 +22,8 @@ class SolverResult:
         residuals: History of the ℓ∞ relative residual (MRE = max|F_i|/target_i),
             one entry per accepted step.  ``residuals[-1]`` is the MRE at the
             last iterate (``theta``); ``min(residuals)`` is the MRE at the
-            best iterate (``best_theta``).
+            best iterate (``best_theta``).  Use the ``mre`` and ``last_mre``
+            convenience properties instead of indexing ``residuals`` directly.
         elapsed_time: Wall-clock time in seconds.
         peak_ram_bytes: Peak RSS increase in bytes during the solver run
                         (measured via psutil, OS-level resident set size).
@@ -43,6 +44,16 @@ class SolverResult:
     # ------------------------------------------------------------------
 
     @property
+    def mre(self) -> float:
+        """MRE at the best iterate (``best_theta``).  Equals ``min(residuals)``."""
+        return min(self.residuals) if self.residuals else float("nan")
+
+    @property
+    def last_mre(self) -> float:
+        """MRE at the last iterate (``theta``).  Equals ``residuals[-1]``."""
+        return self.residuals[-1] if self.residuals else float("nan")
+
+    @property
     def x(self) -> np.ndarray:
         """Physical out-degree multipliers x_i = exp(-θ_i) at best_theta."""
         n = len(self.best_theta) // 2
@@ -56,11 +67,9 @@ class SolverResult:
 
     def __repr__(self) -> str:
         status = "CONVERGED" if self.converged else "NOT CONVERGED"
-        last_res = self.residuals[-1] if self.residuals else float("nan")
-        best_res = min(self.residuals) if self.residuals else float("nan")
         return (
             f"SolverResult({status}, iters={self.iterations}, "
-            f"best_residual={best_res:.3e}, last_residual={last_res:.3e}, "
+            f"best_mre={self.mre:.3e}, last_mre={self.last_mre:.3e}, "
             f"time={self.elapsed_time:.3f}s, "
             f"peak_ram={self.peak_ram_bytes / 1024:.1f} KB)"
         )

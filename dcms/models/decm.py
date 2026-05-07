@@ -584,6 +584,7 @@ class DECMModel:
         verbose: bool = False,
         monitor: bool = False,
         hub_sk_threshold: float = 0.0,
+        backtracking_gamma: float = 0.0,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -638,6 +639,12 @@ class DECMModel:
                            networks with nodes having very high s/k ratios
                            (e.g. ``s/k > 5``) that cause stagnation.
                            Default=0.0 (disabled).
+            backtracking_gamma: When > 0, enables a per-step backtracking
+                           line search.  After each Newton step the residual
+                           at the proposed iterate is evaluated; if it exceeds
+                           ``backtracking_gamma`` times the current residual,
+                           the step is halved (up to 5 times).  Typical value:
+                           ``2.0``.  Default=0.0 (disabled).
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -671,6 +678,7 @@ class DECMModel:
                 verbose=verbose,
                 monitor=monitor,
                 hub_sk_threshold=hub_sk_threshold,
+                backtracking_gamma=backtracking_gamma,
             )
 
         if theta_0 is not None:

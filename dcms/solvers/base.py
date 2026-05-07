@@ -12,18 +12,25 @@ class SolverResult:
     """Result returned by every solver in this package.
 
     Attributes:
-        theta: Parameter vector θ at the *last* iteration step, shape (2N,).
+        theta: Parameter vector θ at the *last* iteration step.
+            Shape (2N,) for DCM/DWCM, (4N,) for DECM and qDECM.
+            For qDECM the layout is [θ_out_topo, θ_in_topo, θ_β_out, θ_β_in].
         best_theta: Parameter vector θ that achieved the lowest ℓ∞ relative
-            residual (MRE) during iteration, shape (2N,).  Equals ``theta``
-            when the solver converged normally; may differ when the solver
-            stopped early (stagnation, timeout, max_iter).
+            residual (MRE) during iteration (same shape as ``theta``).
+            Equals ``theta`` when the solver converged normally; may differ
+            when the solver stopped early (stagnation, timeout, max_iter).
         converged: True if the solver reached the requested tolerance.
-        iterations: Number of update steps performed.
-        residuals: History of the ℓ∞ relative residual (MRE = max|F_i|/target_i),
-            one entry per accepted step.  ``residuals[-1]`` is the MRE at the
-            last iterate (``theta``); ``min(residuals)`` is the MRE at the
-            best iterate (``best_theta``).  Use the ``mre`` and ``last_mre``
-            convenience properties instead of indexing ``residuals`` directly.
+        iterations: Total number of update steps performed (for qDECM: sum of
+            topology and weight iterations).
+        residuals: History of the joint ℓ∞ relative residual
+            (MRE = max|F_i|/target_i), one entry per accepted step.
+            Empty for qDECM (use ``residuals_topo`` and ``residuals_weights``
+            instead); use the ``mre`` and ``last_mre`` properties for
+            convenient access.
+        residuals_topo: Residual history for the topology sub-solver (qDECM
+            only).  Empty for all other models.
+        residuals_weights: Residual history for the weight sub-solver (qDECM
+            only).  Empty for all other models.
         elapsed_time: Wall-clock time in seconds.
         peak_ram_bytes: Peak RSS increase in bytes during the solver run
                         (measured via psutil, OS-level resident set size).
@@ -35,6 +42,8 @@ class SolverResult:
     converged: bool
     iterations: int
     residuals: List[float] = field(default_factory=list)
+    residuals_topo: List[float] = field(default_factory=list)
+    residuals_weights: List[float] = field(default_factory=list)
     elapsed_time: float = 0.0
     peak_ram_bytes: int = 0
     message: str = ""
@@ -45,13 +54,29 @@ class SolverResult:
 
     @property
     def mre(self) -> float:
-        """MRE at the best iterate (``best_theta``).  Equals ``min(residuals)``."""
-        return min(self.residuals) if self.residuals else float("nan")
+        """MRE at the best iterate (``best_theta``).
+
+        For single-phase solvers (DCM, DECM, DWCM): ``min(residuals)``.
+        For qDECM (two-phase): ``max(min(residuals_topo), min(residuals_weights))``.
+        """
+        if self.residuals:
+            return min(self.residuals)
+        if self.residuals_topo and self.residuals_weights:
+            return max(min(self.residuals_topo), min(self.residuals_weights))
+        return float("nan")
 
     @property
     def last_mre(self) -> float:
-        """MRE at the last iterate (``theta``).  Equals ``residuals[-1]``."""
-        return self.residuals[-1] if self.residuals else float("nan")
+        """MRE at the last iterate (``theta``).
+
+        For single-phase solvers: ``residuals[-1]``.
+        For qDECM: ``max(residuals_topo[-1], residuals_weights[-1])``.
+        """
+        if self.residuals:
+            return self.residuals[-1]
+        if self.residuals_topo and self.residuals_weights:
+            return max(self.residuals_topo[-1], self.residuals_weights[-1])
+        return float("nan")
 
     @property
     def x(self) -> np.ndarray:

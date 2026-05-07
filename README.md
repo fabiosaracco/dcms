@@ -295,7 +295,7 @@ converged = model.solve_tool(
     max_time=600,         # hard time limit
     verbose=True,
 )
-print(model.sol_weights.best_MRE)
+print(model.sol.mre)
 ```
 
 ---
@@ -399,8 +399,9 @@ converged = model.solve_tool(
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
 )
 # solve_tool returns True if *both* topology and weight steps converged
-theta_topo   = model.sol_topo.theta    # topology parameters, shape (2N,)
-theta_weight = model.sol_weights.theta # weight parameters, shape (2N,)
+# sol.theta has shape (4N,): [θ_out_topo, θ_in_topo, θ_β_out, θ_β_in]
+theta_topo   = model.sol.theta[:2*N]   # topology parameters
+theta_weight = model.sol.theta[2*N:]   # weight parameters
 ```
 
 Additional model methods:
@@ -501,16 +502,21 @@ Calls `sample()` before `solve_tool()` raise `RuntimeError`.
 
 ### 3.6 SolverResult
 
-`solve_tool()` stores results on the model: `model.sol` for DCM/DWCM/DECM, `model.sol_topo` / `model.sol_weights` for qDECM.  The `SolverResult` dataclass fields are:
+`solve_tool()` stores results on the model as `model.sol` for all models.  The `SolverResult` dataclass fields are:
 
 ```python
-result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM, (4N,) for DECM
+result.theta           # np.ndarray — parameters in log-space; shape (2N,) for DCM/DWCM, (4N,) for qDECM/DECM
+result.best_theta      # np.ndarray — iterate with lowest MRE (same shape as theta)
 result.converged       # bool
-result.iterations      # int
-result.residuals       # list[float] — ℓ∞ relative residual (MRE) per accepted step
+result.iterations      # int — total iterations (qDECM: topo + weight steps summed)
+result.residuals       # list[float] — ℓ∞ MRE per step (empty for qDECM; use residuals_topo / residuals_weights)
+result.residuals_topo    # list[float] — topology MRE history (qDECM only)
+result.residuals_weights # list[float] — weight MRE history (qDECM only)
 result.elapsed_time    # float — wall-clock seconds
 result.peak_ram_bytes  # int
 result.message         # str — warnings or error description
+result.mre             # float — MRE at best_theta (min of residuals, or max(min_topo, min_weights) for qDECM)
+result.last_mre        # float — MRE at last iterate theta
 ```
 
 ### 3.7 Standalone solvers (advanced)
@@ -603,7 +609,7 @@ pip install dcms numba           # equivalent
 
 ### 3.9 Custom initial conditions and warm restart
 
-Each model internally works with a *parameter vector* in log-space.  For DCM the entries are the Lagrange multipliers θ_i = −log(x_i) associated to degree constraints; for DWCM / qDECM (weight step) / DECM (weight part) they are η_i = −log(β_i), the log-fitnesses associated to strength constraints.  After `solve_tool()` finishes, the result is stored in `model.sol.theta` (or `model.sol_topo.theta` / `model.sol_weights.theta` for qDECM).
+Each model internally works with a *parameter vector* in log-space.  After `solve_tool()` finishes, the result is stored in `model.sol.theta` for all models.
 
 **Shape of the parameter vectors**
 
@@ -611,8 +617,7 @@ Each model internally works with a *parameter vector* in log-space.  For DCM the
 |-------|-----------|-------|---------|
 | DCM | `model.sol.theta` | (2N,) | `[θ_out₀ … θ_out_{N-1} | θ_in₀ … θ_in_{N-1}]` |
 | DWCM | `model.sol.theta` | (2N,) | `[η_out₀ … | η_in₀ …]` where `β_out_i = exp(−η_out_i)` |
-| qDECM | `model.sol_topo.theta` | (2N,) | DCM multipliers (same as DCM) |
-| qDECM | `model.sol_weights.theta` | (2N,) | DWCM-like multipliers `[η_out | η_in]` |
+| qDECM | `model.sol.theta` | (4N,) | `[θ_out_topo | θ_in_topo | η_out | η_in]` |
 | DECM | `model.sol.theta` | (4N,) | `[θ_out | θ_in | η_out | η_in]` |
 
 The entries are related to the model probabilities by `x_i = exp(−θ_i)` (topology) and `β_i = exp(−η_i)` (weights).  The feasibility constraint is `η_out_i + η_in_j > 0` for every pair (i, j) with a potential link (individual η can be negative as long as the pairwise sum stays positive).
@@ -621,18 +626,19 @@ The entries are related to the model probabilities by `x_i = exp(−θ_i)` (topo
 
 By default `solve_tool()` computes the starting point from the observed degree/strength sequences (the `ic` / `ic_topo` / `ic_weights` string choices).  On hard instances — networks with very high-weight hubs or extreme s/k ratios — the automatic starting point may be far from the solution and the solver may not converge within the iteration budget.  The new `theta_0` / `theta_topo_0` / `theta_weights_0` parameters let you supply any array as the starting point, enabling two practical strategies:
 
-1. **Warm restart** — if a first call did not converge, the best iterate found so far is always stored in `model.sol.theta` / `model.sol_weights.theta` (the solver internally tracks the iterate with the smallest residual, not just the last one).  Pass that array back as the starting point for a second call, possibly with a smaller `anderson_depth` to reduce Anderson contamination:
+1. **Warm restart** — if a first call did not converge, the best iterate found so far is always stored in `model.sol.theta` (the solver internally tracks the iterate with the smallest residual, not just the last one).  Pass that array back as the starting point for a second call, possibly with a smaller `anderson_depth` to reduce Anderson contamination:
 
 ```python
 model = qDECMModel(k_out, k_in, s_out, s_in)
 model.solve_tool(max_iter=5000, verbose=True, monitor=True)
 
-if not model.sol_weights.converged:
+if not model.sol.converged:
+    N = len(k_out)
     # Second attempt from best iterate, less aggressive Anderson mixing
     model.solve_tool(
-        theta_topo_0=model.sol_topo.theta,       # topology already solved, reuse it
-        theta_weights_0=model.sol_weights.theta,  # start from best weight iterate
-        anderson_depth=3,                         # reduce Anderson depth
+        theta_topo_0=model.sol.theta[:2*N],    # topology already solved, reuse it
+        theta_weights_0=model.sol.theta[2*N:], # start from best weight iterate
+        anderson_depth=3,                       # reduce Anderson depth
         max_iter=10000,
     )
 ```

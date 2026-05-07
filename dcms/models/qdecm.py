@@ -105,8 +105,7 @@ class qDECMModel:
         # Nodes with zero strength (β = 0 exactly, θ_β → +∞).
         self.zero_s_out: torch.Tensor = (self.s_out == 0)
         self.zero_s_in: torch.Tensor = (self.s_in == 0)
-        self.sol_topo: SolverResult | None = None
-        self.sol_weights: SolverResult | None = None
+        self.sol: SolverResult | None = None
 
     # ------------------------------------------------------------------
     # Core matrices
@@ -622,11 +621,11 @@ class qDECMModel:
             theta_topo_0: Custom initial parameter vector for the topology step,
                 shape ``(2N,)``.  If provided, overrides ``ic_topo`` entirely.
                 Can be a numpy array, list, or :class:`torch.Tensor`.  Useful
-                for warm-starting from a previous :attr:`sol_topo`.theta.
+                for warm-starting from a previous ``sol.theta[:2N]``.
             theta_weights_0: Custom initial parameter vector for the weight step,
                 shape ``(2N,)``.  If provided, overrides ``ic_weights`` entirely.
                 Can be a numpy array, list, or :class:`torch.Tensor`.  Useful
-                for warm-starting from a previous :attr:`sol_weights`.theta
+                for warm-starting from a previous ``sol.theta[2N:]``
                 (e.g. best iterate from a prior run that did not converge).
             tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
             max_iter (int): the maximum number of iterations. Default=2000.
@@ -656,7 +655,12 @@ class qDECMModel:
                 solver to stagnate.  Default=0.0 (disabled).
 
         Returns:
-            :class:`~src.solvers.base.SolverResult` instance.
+            :class:`~dcms.solvers.base.SolverResult` instance.  The combined
+            result is also stored on the model as :attr:`sol`.  ``sol.theta``
+            and ``sol.best_theta`` have shape ``(4N,)`` with layout
+            ``[θ_out_topo, θ_in_topo, θ_β_out, θ_β_in]``.
+            ``sol.residuals_topo`` and ``sol.residuals_weights`` hold the
+            per-phase residual histories.
         """
         import torch as _torch
         # Step 1: solve the DCM topology
@@ -665,10 +669,10 @@ class qDECMModel:
         else:
             self.ic_topo=self.initial_theta_topo(ic_topo)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-        self.sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+        _sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         
-        if len(self.sol_topo.message)>0:
-            print(f'Topology: {self.sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
+        if len(_sol_topo.message)>0:
+            print(f'Topology: {_sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
        
 
@@ -676,17 +680,36 @@ class qDECMModel:
         if theta_weights_0 is not None:
             self.ic_weig = _torch.as_tensor(theta_weights_0, dtype=_torch.float64)
         else:
-            self.ic_weig = self.initial_theta_weight(theta_topo = self.sol_topo.best_theta, method=ic_weights)
+            self.ic_weig = self.initial_theta_weight(theta_topo = _sol_topo.best_theta, method=ic_weights)
 
         # Build the residual function that fixes theta_topo
-        res_weight = functools.partial(self.residual_strength, theta_topo=self.sol_topo.best_theta)
+        res_weight = functools.partial(self.residual_strength, theta_topo=_sol_topo.best_theta)
 
         from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm  # lazy import to avoid circular dependency
-        self.sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=self.sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold)
-        if len(self.sol_weights.message)>0:
-            print(f'Weights: {self.sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
+        _sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=_sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold)
+        if len(_sol_weights.message)>0:
+            print(f'Weights: {_sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
-        return self.sol_topo.converged and self.sol_weights.converged
+        # Combine into a single SolverResult (4N theta: [topo_out, topo_in, w_out, w_in])
+        import numpy as _np
+        _msg_parts = []
+        if _sol_topo.message:
+            _msg_parts.append(f"Topology: {_sol_topo.message}")
+        if _sol_weights.message:
+            _msg_parts.append(f"Weights: {_sol_weights.message}")
+        self.sol = SolverResult(
+            theta=_np.concatenate([_sol_topo.theta, _sol_weights.theta]),
+            best_theta=_np.concatenate([_sol_topo.best_theta, _sol_weights.best_theta]),
+            converged=_sol_topo.converged and _sol_weights.converged,
+            iterations=_sol_topo.iterations + _sol_weights.iterations,
+            residuals=[],
+            residuals_topo=_sol_topo.residuals,
+            residuals_weights=_sol_weights.residuals,
+            elapsed_time=_sol_topo.elapsed_time + _sol_weights.elapsed_time,
+            peak_ram_bytes=_sol_topo.peak_ram_bytes + _sol_weights.peak_ram_bytes,
+            message=" | ".join(_msg_parts),
+        )
+        return self.sol.converged
 
     def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
         """Sample a weighted directed network from the fitted qDECM.
@@ -712,15 +735,15 @@ class qDECMModel:
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
         """
-        if self.sol_topo is None or self.sol_weights is None:
+        if self.sol is None:
             raise RuntimeError("Call solve_tool() first.")
         import numpy as np
         rng = np.random.default_rng(seed)
         N = self.N
-        theta_topo = np.asarray(self.sol_topo.best_theta, dtype=np.float64)
+        theta_topo = np.asarray(self.sol.best_theta[:2 * N], dtype=np.float64)
         theta_out  = theta_topo[:N]
         theta_in   = theta_topo[N:]
-        theta_w   = np.asarray(self.sol_weights.best_theta, dtype=np.float64)
+        theta_w   = np.asarray(self.sol.best_theta[2 * N:], dtype=np.float64)
         beta_out  = np.exp(-theta_w[:N])
         beta_in   = np.exp(-theta_w[N:])
         edges: list = []

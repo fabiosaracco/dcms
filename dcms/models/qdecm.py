@@ -775,7 +775,8 @@ class qDECMModel:
         weights = rng.geometric(1.0 - b_vals)
         return np.column_stack([rows, cols, weights])
 
-    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+    def sample(self, seed: int | None = None,
+               chunk_size: int = 512) -> "np.ndarray":
         """Sample a weighted directed network from the fitted qDECM.
 
         Two-step procedure mirroring the qDECM factorisation:
@@ -797,12 +798,14 @@ class qDECMModel:
             chunk_size: Number of source rows processed at a time.
 
         Returns:
-            Weighted edge list: list of ``[source, target, weight]`` integer triples.
+            ``np.ndarray`` of shape ``(L, 3)`` with integer columns
+            ``[source, target, weight]``.  Iterating ``for i, j, w in edges``
+            works identically to the old list-of-lists format.
 
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
         """
-        return self._sample_raw(seed=seed, chunk_size=chunk_size).tolist()
+        return self._sample_raw(seed=seed, chunk_size=chunk_size)
 
     def sample_many(self, n: int, seed: int | None = None,
                     n_jobs: int = -1) -> list:

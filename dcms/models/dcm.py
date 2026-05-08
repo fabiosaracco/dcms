@@ -437,7 +437,8 @@ class DCMModel:
             return np.empty((0, 2), dtype=int)
         return np.vstack(parts)
 
-    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+    def sample(self, seed: int | None = None,
+               chunk_size: int = 512) -> "np.ndarray":
         """Sample a binary directed network from the fitted DCM.
 
         For each ordered pair ``(i, j)`` with ``i ≠ j``, a directed edge is
@@ -456,12 +457,14 @@ class DCMModel:
                 fallback path (controls peak RAM).
 
         Returns:
-            Edge list: list of ``[source, target]`` integer pairs.
+            ``np.ndarray`` of shape ``(L, 2)`` with integer columns
+            ``[source, target]``.  Iterating ``for i, j in edges`` works
+            identically to the old list-of-lists format.
 
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
         """
-        return self._sample_raw(seed=seed, chunk_size=chunk_size).tolist()
+        return self._sample_raw(seed=seed, chunk_size=chunk_size)
 
     def sample_many(self, n: int, seed: int | None = None,
                     n_jobs: int = -1) -> list:

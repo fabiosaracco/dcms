@@ -32,16 +32,15 @@ class TestDCMSample:
         with pytest.raises(RuntimeError):
             DCMModel(k_out, k_in).sample()
 
-    def test_returns_list(self):
+    def test_returns_ndarray(self):
         edges = self._fitted().sample(seed=0)
-        assert isinstance(edges, list)
+        assert isinstance(edges, np.ndarray)
+        assert edges.ndim == 2 and edges.shape[1] == 2
 
     def test_edge_format(self):
         edges = self._fitted().sample(seed=0)
-        for e in edges:
-            assert len(e) == 2
-            assert isinstance(e[0], int)
-            assert isinstance(e[1], int)
+        assert np.issubdtype(edges.dtype, np.integer)
+        assert edges.shape[1] == 2
 
     def test_no_self_loops(self):
         edges = self._fitted().sample(seed=0)
@@ -57,11 +56,11 @@ class TestDCMSample:
 
     def test_reproducible(self):
         m = self._fitted()
-        assert m.sample(seed=7) == m.sample(seed=7)
+        assert np.array_equal(m.sample(seed=7), m.sample(seed=7))
 
     def test_different_seeds_differ(self):
         m = self._fitted()
-        assert m.sample(seed=1) != m.sample(seed=2)
+        assert not np.array_equal(m.sample(seed=1), m.sample(seed=2))
 
     def test_degree_distribution_approx(self):
         """Sampled mean degree should be close to the observed degree."""
@@ -100,13 +99,15 @@ class TestDWCMSample:
         with pytest.raises(RuntimeError):
             DWCMModel(s_out, s_in).sample()
 
-    def test_returns_list(self):
-        assert isinstance(self._fitted().sample(seed=0), list)
+    def test_returns_ndarray(self):
+        edges = self._fitted().sample(seed=0)
+        assert isinstance(edges, np.ndarray)
+        assert edges.ndim == 2 and edges.shape[1] == 3
 
     def test_edge_format(self):
-        for e in self._fitted().sample(seed=0):
-            assert len(e) == 3
-            assert isinstance(e[0], int) and isinstance(e[1], int) and isinstance(e[2], int)
+        edges = self._fitted().sample(seed=0)
+        assert np.issubdtype(edges.dtype, np.integer)
+        assert edges.shape[1] == 3
 
     def test_positive_weights(self):
         for _, _, w in self._fitted().sample(seed=0):
@@ -118,7 +119,7 @@ class TestDWCMSample:
 
     def test_reproducible(self):
         m = self._fitted()
-        assert m.sample(seed=3) == m.sample(seed=3)
+        assert np.array_equal(m.sample(seed=3), m.sample(seed=3))
 
     def test_strength_distribution_approx(self):
         """Sampled mean strength should be close to observed strength."""
@@ -159,25 +160,26 @@ class TestQDECMSample:
         with pytest.raises(RuntimeError):
             qDECMModel(k_out, k_in, s_out, s_in).sample()
 
-    def test_returns_list(self):
-        assert isinstance(self._fitted().sample(seed=0), list)
+    def test_returns_ndarray(self):
+        edges = self._fitted().sample(seed=0)
+        assert isinstance(edges, np.ndarray)
+        assert edges.ndim == 2 and edges.shape[1] == 3
 
     def test_edge_format(self):
-        for e in self._fitted().sample(seed=0):
-            assert len(e) == 3
-            assert all(isinstance(x, int) for x in e)
+        edges = self._fitted().sample(seed=0)
+        assert np.issubdtype(edges.dtype, np.integer)
+        assert edges.shape[1] == 3
 
     def test_positive_weights(self):
-        for _, _, w in self._fitted().sample(seed=0):
-            assert w > 0
+        assert (self._fitted().sample(seed=0)[:, 2] > 0).all()
 
     def test_no_self_loops(self):
-        for i, j, _ in self._fitted().sample(seed=0):
-            assert i != j
+        edges = self._fitted().sample(seed=0)
+        assert np.all(edges[:, 0] != edges[:, 1])
 
     def test_reproducible(self):
         m = self._fitted()
-        assert m.sample(seed=5) == m.sample(seed=5)
+        assert np.array_equal(m.sample(seed=5), m.sample(seed=5))
 
 
 # ── DECM ─────────────────────────────────────────────────────────────────────
@@ -196,25 +198,26 @@ class TestDECMSample:
         with pytest.raises(RuntimeError):
             DECMModel(k_out, k_in, s_out, s_in).sample()
 
-    def test_returns_list(self):
-        assert isinstance(self._fitted().sample(seed=0), list)
+    def test_returns_ndarray(self):
+        edges = self._fitted().sample(seed=0)
+        assert isinstance(edges, np.ndarray)
+        assert edges.ndim == 2 and edges.shape[1] == 3
 
     def test_edge_format(self):
-        for e in self._fitted().sample(seed=0):
-            assert len(e) == 3
-            assert all(isinstance(x, int) for x in e)
+        edges = self._fitted().sample(seed=0)
+        assert np.issubdtype(edges.dtype, np.integer)
+        assert edges.shape[1] == 3
 
     def test_positive_weights(self):
-        for _, _, w in self._fitted().sample(seed=0):
-            assert w > 0
+        assert (self._fitted().sample(seed=0)[:, 2] > 0).all()
 
     def test_no_self_loops(self):
-        for i, j, _ in self._fitted().sample(seed=0):
-            assert i != j
+        edges = self._fitted().sample(seed=0)
+        assert np.all(edges[:, 0] != edges[:, 1])
 
     def test_reproducible(self):
         m = self._fitted()
-        assert m.sample(seed=9) == m.sample(seed=9)
+        assert np.array_equal(m.sample(seed=9), m.sample(seed=9))
 
 
 # ---------------------------------------------------------------------------

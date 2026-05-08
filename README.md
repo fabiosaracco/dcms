@@ -507,11 +507,14 @@ Additional model methods:
 After calling `solve_tool()`, every model exposes two sampling methods:
 
 ```python
-# Single sample — returns a Python list (backward-compatible)
+# Single sample — returns a NumPy array (no Python list overhead)
 edges = model.sample(
     seed=42,          # integer or None — random seed for reproducibility
     chunk_size=512,   # rows processed per iteration (exact fallback only)
 )
+# DCM:   np.ndarray shape (L, 2), columns [source, target]
+# other: np.ndarray shape (L, 3), columns [source, target, weight]
+# Iteration works identically to lists: for i, j, w in edges: ...
 
 # Parallel batch sampling — returns a list of NumPy arrays
 samples = model.sample_many(
@@ -522,17 +525,16 @@ samples = model.sample_many(
 # each element: np.ndarray of shape (L_k, 2) for DCM, (L_k, 3) for weighted
 ```
 
-`sample()` returns a Python list of `[i, j]` or `[i, j, w]` integer lists.
-`sample_many()` returns a list of NumPy arrays — iterating `for i, j in arr` works identically.
+Both methods return `np.ndarray` — iterating `for i, j in arr` or `for i, j, w in arr` works the same as with lists.
 
 The output format and the underlying sampling distribution differ by model:
 
-| Model | Output | Sampling distribution |
-|-------|--------|-----------------------|
-| `DCMModel` | `[[i, j], ...]` | `A_ij ~ Bernoulli(p_ij)` independently for each `i ≠ j` |
-| `DWCMModel` | `[[i, j, w], ...]` | `w_ij ~ Geom(1 − β_ij) − 1` (starts at 0); pairs with `w=0` omitted |
-| `qDECMModel` | `[[i, j, w], ...]` | Step 1: `A_ij ~ Bernoulli(p_ij)`; step 2 if link: `w_ij ~ Geom(1 − β_ij)` (starts at 1) |
-| `DECMModel` | `[[i, j, w], ...]` | Same two steps, but `p_ij` uses the full coupled DECM formula |
+| Model | Output shape | Sampling distribution |
+|-------|--------------|-----------------------|
+| `DCMModel` | `(L, 2)` | `A_ij ~ Bernoulli(p_ij)` independently for each `i ≠ j` |
+| `DWCMModel` | `(L, 3)` | `w_ij ~ Geom(1 − β_ij) − 1` (starts at 0); pairs with `w=0` omitted |
+| `qDECMModel` | `(L, 3)` | Step 1: `A_ij ~ Bernoulli(p_ij)`; step 2 if link: `w_ij ~ Geom(1 − β_ij)` (starts at 1) |
+| `DECMModel` | `(L, 3)` | Same two steps, but `p_ij` uses the full coupled DECM formula |
 
 where `β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)` and `p_ij` is the relevant model's link probability.
 
@@ -558,7 +560,7 @@ Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chu
 
 #### Parallel batch sampling with `sample_many()`
 
-`sample_many()` uses `ThreadPoolExecutor` to generate samples in parallel.  NumPy releases the GIL during random-number generation and array operations, so threading provides near-linear speedup up to the number of physical cores.  The internal `_sample_raw()` method returns a NumPy array directly (no `list` conversion), eliminating the main GIL-holding bottleneck per sample.
+`sample_many()` uses `ThreadPoolExecutor` to generate samples in parallel.  NumPy releases the GIL during random-number generation and array operations, so threading provides near-linear speedup up to the number of physical cores.  Both `sample()` and `sample_many()` return NumPy arrays directly (no `list` conversion), eliminating the main GIL-holding bottleneck.
 
 **Benchmark** (N = 5 000, power-law degree sequence, ρ = 10⁻³):
 
@@ -567,6 +569,27 @@ Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chu
 | DCM | ~32 ms | ~4 ms | ~8× |
 | qDECM | ~37 ms | ~5 ms | ~7× |
 | DWCM | ~83 ms | ~11 ms | ~7× |
+
+#### Memory estimates for large networks
+
+Each sample is a contiguous `int64` array — RAM per sample scales as `L × cols × 8 bytes`:
+
+| N | ρ | mean degree | L (directed) | Per sample (weighted) | 2 000 samples |
+|---|---|-------------|--------------|----------------------|---------------|
+| 5 000 | 10⁻³ | 5 | ~25 000 | ~0.6 MB | ~1.2 GB |
+| 50 000 | 10⁻³ | 50 | ~2 500 000 | ~60 MB | ~120 GB ❌ |
+| 50 000 | 10⁻⁴ | 5 | ~250 000 | ~6 MB | ~12 GB |
+
+> **For N ≳ 10k**, storing all 2 000 samples at once is impractical.  Use a streaming pattern instead:
+> ```python
+> rng = np.random.default_rng(42)
+> measures = []
+> for _ in range(2000):
+>     arr = model.sample(seed=int(rng.integers(2**31)))
+>     measures.append(some_measurement(arr))
+>     # arr is released after each iteration — only ~1 sample in memory at a time
+> ```
+> Or batch `sample_many()` in chunks of `n_jobs` to parallelise without accumulating all results.
 
 Calls to `sample()` or `sample_many()` before `solve_tool()` raise `RuntimeError`.
 

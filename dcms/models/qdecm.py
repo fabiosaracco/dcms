@@ -611,21 +611,19 @@ class qDECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo:str='degrees', ic_weights:str='topology', theta_topo_0=None, theta_weights_0=None, tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0)-> SolverResult:
+    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
-            ic_topo (str): the initial condition on theta for the topology. Default="degrees", another possible choice is "random".
-            ic_wei (str): the initial condition on theta for the weights. Default="topology", another possible choice is "random".
-            theta_topo_0: Custom initial parameter vector for the topology step,
-                shape ``(2N,)``.  If provided, overrides ``ic_topo`` entirely.
-                Can be a numpy array, list, or :class:`torch.Tensor`.  Useful
-                for warm-starting from a previous ``sol.theta[:2N]``.
-            theta_weights_0: Custom initial parameter vector for the weight step,
-                shape ``(2N,)``.  If provided, overrides ``ic_weights`` entirely.
-                Can be a numpy array, list, or :class:`torch.Tensor`.  Useful
-                for warm-starting from a previous ``sol.theta[2N:]``
-                (e.g. best iterate from a prior run that did not converge).
+            ic_topo (str or array-like): Initial condition for the topology step,
+                shape ``(2N,)``.  Pass a string (``"degrees"``, ``"random"``) to
+                use a built-in initializer, or pass a numpy array / list /
+                :class:`torch.Tensor` to warm-start (e.g. a previous
+                ``sol.best_theta[:2*N]``).
+            ic_wei (str or array-like): Initial condition for the weight step,
+                shape ``(2N,)``.  Pass a string (``"topology"``, ``"random"``)
+                or an array to warm-start (e.g. a previous
+                ``sol.best_theta[2*N:]``).
             tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
             max_iter (int): the maximum number of iterations. Default=2000.
             variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
@@ -671,10 +669,10 @@ class qDECMModel:
         """
         import torch as _torch
         # Step 1: solve the DCM topology
-        if theta_topo_0 is not None:
-            self.ic_topo = _torch.as_tensor(theta_topo_0, dtype=_torch.float64)
+        if isinstance(ic_topo, str):
+            self.ic_topo = self.initial_theta_topo(ic_topo)
         else:
-            self.ic_topo=self.initial_theta_topo(ic_topo)
+            self.ic_topo = _torch.as_tensor(ic_topo, dtype=_torch.float64)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
         _sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         
@@ -684,10 +682,10 @@ class qDECMModel:
        
 
         # Step 2: solve the conditioned weight equations
-        if theta_weights_0 is not None:
-            self.ic_weig = _torch.as_tensor(theta_weights_0, dtype=_torch.float64)
+        if isinstance(ic_wei, str):
+            self.ic_weig = self.initial_theta_weight(theta_topo=_sol_topo.best_theta, method=ic_wei)
         else:
-            self.ic_weig = self.initial_theta_weight(theta_topo = _sol_topo.best_theta, method=ic_weights)
+            self.ic_weig = _torch.as_tensor(ic_wei, dtype=_torch.float64)
 
         # Build the residual function that fixes theta_topo
         res_weight = lambda tb: self.residual_strength(_sol_topo.best_theta, tb)

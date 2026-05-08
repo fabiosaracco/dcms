@@ -482,7 +482,7 @@ class DECMModel:
             # Suppress solver progress messages — this is an IC computation,
             # not a user-facing solve.
             with contextlib.redirect_stdout(io.StringIO()):
-                qdecm.solve_tool(ic_topo="degrees", ic_weights="topology")
+                qdecm.solve_tool(ic_topo="degrees", ic_wei="topology")
             theta_topo = torch.as_tensor(qdecm.sol.best_theta[:2 * N], dtype=torch.float64)
             theta_weight = torch.as_tensor(qdecm.sol.best_theta[2 * N:], dtype=torch.float64)
             return torch.cat([theta_topo, theta_weight])
@@ -572,7 +572,6 @@ class DECMModel:
     def solve_tool(
         self,
         ic: str = "degrees",
-        theta_0=None,
         tol: float = 1e-6,
         max_iter: int = 2000,
         max_time: float = 0,
@@ -599,13 +598,15 @@ class DECMModel:
         ``theta = [θ_out | θ_in | η_out | η_in]``).
 
         Args:
-            ic:            Primary initial condition (``"degrees"``, ``"random"``,
-                           ``"uniform"``, ``"qdecm"``).
-            theta_0:       Custom initial parameter vector, shape ``(4N,)``
-                           ``[θ_out | θ_in | η_out | η_in]``.  If provided,
-                           overrides ``ic`` and disables ``multi_start``
-                           (a single run is performed from the given vector).
-                           Can be a numpy array, list, or :class:`torch.Tensor`.
+            ic:            Primary initial condition for the solver.  Pass a
+                           string (``"degrees"``, ``"random"``, ``"uniform"``,
+                           ``"qdecm"``) to use a built-in initializer, or pass
+                           a numpy array / list / :class:`torch.Tensor` of
+                           shape ``(4N,)`` to warm-start from a custom vector
+                           ``[θ_out | θ_in | η_out | η_in]`` (e.g. a previous
+                           ``sol.best_theta``).  When an array is supplied,
+                           ``multi_start`` is ignored and a single run is
+                           performed.
             tol:           Convergence tolerance on the ℓ∞ residual.
             max_iter:      Maximum iterations per attempt.
             max_time:      Wall-clock time limit in seconds per attempt
@@ -615,7 +616,7 @@ class DECMModel:
             multi_start:   If ``True`` (default), retry with fallback ICs when
                            the primary IC does not converge.  Set to ``False``
                            for clean per-IC benchmarking.  Ignored when
-                           ``theta_0`` is provided.
+                           ``ic`` is an array.
             backend:       Compute backend: ``"auto"`` (default), ``"pytorch"``,
                            or ``"numba"``.  ``"auto"`` uses PyTorch for
                            N ≤ 5 000 and Numba for larger networks.
@@ -681,9 +682,9 @@ class DECMModel:
                 backtracking_gamma=backtracking_gamma,
             )
 
-        if theta_0 is not None:
-            self.ic = _torch.as_tensor(theta_0, dtype=_torch.float64)
-            self.sol = _run_once(ic, theta0_override=theta_0)
+        if not isinstance(ic, str):
+            self.ic = _torch.as_tensor(ic, dtype=_torch.float64)
+            self.sol = _run_once("degrees", theta0_override=ic)
             if self.sol.message:
                 print(self.sol.message+" "*50)
             return self.sol.converged

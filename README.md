@@ -343,14 +343,13 @@ from dcms.models.dcm import DCMModel
 
 model = DCMModel(k_out, k_in)
 converged = model.solve_tool(
-    ic="degrees",           # initial condition: "degrees" (default) or "random"
+    ic="degrees",           # "degrees" (default), "random" — or pass an array (warm start)
     tol=1e-6,               # convergence tolerance (ℓ∞ relative residual MRE)
     max_iter=2000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     variant="theta-newton", # "theta-newton" (default) or "gauss-seidel"
     anderson_depth=10,
     backend="auto",         # "auto" (default), "pytorch", or "numba"
-    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
 )
@@ -373,7 +372,7 @@ from dcms.models.dwcm import DWCMModel
 
 model = DWCMModel(s_out, s_in)
 converged = model.solve_tool(
-    ic="strengths",         # initial condition (see below)
+    ic="strengths",         # "strengths" (default), "random" — or pass an array (warm start)
     tol=1e-6,
     max_iter=2000,
     max_time=0,
@@ -415,10 +414,8 @@ from dcms.models.qdecm import qDECMModel
 
 model = qDECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
-    ic_topo="degrees",      # topology init: "degrees" (default) or "random"
-    ic_weights="topology",  # weight init: "topology" (default) or "topology_node"
-    theta_topo_0=None,      # custom topology IC (overrides ic_topo if given)
-    theta_weights_0=None,   # custom weight IC (overrides ic_weights if given)
+    ic_topo="degrees",      # topology init: "degrees" (default) or "random" — or pass an array
+    ic_wei="topology",      # weight init: "topology" (default) or "random" — or pass an array
     tol=1e-6,
     max_iter=2000,
     max_time=0,
@@ -466,7 +463,7 @@ from dcms.models.decm import DECMModel
 
 model = DECMModel(k_out, k_in, s_out, s_in)
 converged = model.solve_tool(
-    ic="degrees",           # initial condition: "degrees" (default) or "random"
+    ic="degrees",           # "degrees" (default), "random", "qdecm" — or pass an array (warm start)
     tol=1e-6,               # convergence tolerance (ℓ∞ relative residual MRE)
     max_iter=5000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
@@ -658,9 +655,9 @@ The entries are related to the model probabilities by `x_i = exp(−θ_i)` (topo
 
 **Why custom ICs?**
 
-By default `solve_tool()` computes the starting point from the observed degree/strength sequences (the `ic` / `ic_topo` / `ic_weights` string choices).  On hard instances — networks with very high-weight hubs or extreme s/k ratios — the automatic starting point may be far from the solution and the solver may not converge within the iteration budget.  The new `theta_0` / `theta_topo_0` / `theta_weights_0` parameters let you supply any array as the starting point, enabling two practical strategies:
+By default `solve_tool()` computes the starting point from the observed degree/strength sequences (the `ic` / `ic_topo` / `ic_wei` string choices).  On hard instances — networks with very high-weight hubs or extreme s/k ratios — the automatic starting point may be far from the solution and the solver may not converge within the iteration budget.  All models accept an **array** directly as the `ic` parameter (or `ic_topo` / `ic_wei` for qDECM) to warm-start from any custom vector, enabling two practical strategies:
 
-1. **Warm restart** — if a first call did not converge, the best iterate found so far is always stored in `model.sol.theta` (the solver internally tracks the iterate with the smallest residual, not just the last one).  Pass that array back as the starting point for a second call, possibly with a smaller `anderson_depth` to reduce Anderson contamination:
+1. **Warm restart** — if a first call did not converge, the best iterate found so far is always stored in `model.sol.best_theta` (the solver internally tracks the iterate with the smallest residual).  Pass that array back as the starting point for a second call, possibly with a smaller `anderson_depth` to reduce Anderson contamination:
 
 ```python
 model = qDECMModel(k_out, k_in, s_out, s_in)
@@ -670,9 +667,9 @@ if not model.sol.converged:
     N = len(k_out)
     # Second attempt from best iterate, less aggressive Anderson mixing
     model.solve_tool(
-        theta_topo_0=model.sol.theta[:2*N],    # topology already solved, reuse it
-        theta_weights_0=model.sol.theta[2*N:], # start from best weight iterate
-        anderson_depth=3,                       # reduce Anderson depth
+        ic_topo=model.sol.best_theta[:2*N],   # topology already solved, reuse it
+        ic_wei=model.sol.best_theta[2*N:],    # start from best weight iterate
+        anderson_depth=3,                      # reduce Anderson depth
         max_iter=10000,
     )
 ```
@@ -685,11 +682,11 @@ dwcm.solve_tool()
 
 qdecm = qDECMModel(k_out, k_in, s_out, s_in)
 qdecm.solve_tool(
-    theta_weights_0=dwcm.sol.theta,   # DWCM solution as weight IC
+    ic_wei=dwcm.sol.best_theta,   # DWCM solution as weight IC
 )
 ```
 
-For DCM and DWCM pass `theta_0` (shape 2N).  For DECM pass `theta_0` (shape 4N = `[θ_out|θ_in|η_out|η_in]`); `multi_start` is automatically disabled when `theta_0` is provided.
+For DCM, DWCM and DECM pass an array of shape (2N,), (2N,) and (4N,) respectively to `ic`.  For DECM, `multi_start` is automatically disabled when `ic` is an array.
 
 ### 3.10 Network generator (`dcms/utils/wng.py`)
 

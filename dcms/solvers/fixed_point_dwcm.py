@@ -524,10 +524,10 @@ def solve_fixed_point_dwcm(
                     if _v_nonzero.any() else float("nan")
                 )
                 print(
-                    f"[{datetime.datetime.now():%H:%M:%S}] "
+                    f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
                     f"iteration={n_iter:5d}, "
                     f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
-                    f"MRE_weights={_mre:.2e}",
+                    f"MRE_weights={_mre:.5e}",
                     end="\r" if monitor else "\n",
                 )
                 sys.stdout.flush()

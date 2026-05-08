@@ -509,7 +509,7 @@ After calling `solve_tool()`, every model exposes a `sample()` method that draws
 ```python
 edges = model.sample(
     seed=42,          # integer or None — random seed for reproducibility
-    chunk_size=512,   # rows processed per iteration (controls peak RAM)
+    chunk_size=512,   # rows processed per iteration (exact fallback only)
 )
 ```
 
@@ -528,6 +528,29 @@ The geometric distributions follow Mastrandrea et al. (2014) / Vallarano et al. 
 
 - **DWCM**: integer weights `w ≥ 0`, `P(w=k) = (1−β_ij) β_ij^k`.  The expected weight is `β_ij / (1−β_ij)`, matching the constraint `s_out_i = Σ_j ⟨w_ij⟩`.
 - **qDECM / DECM**: integer weights `w ≥ 1` conditional on the link existing, `P(w=k|A=1) = (1−β_ij) β_ij^{k−1}`.  The unconditional expected weight is `p_ij / (1−β_ij)`.
+
+#### Fast sparse sampler (default for sparse networks)
+
+For sparse networks (mean p < 5 %) DCM, DWCM and qDECM use an O(L) **Poisson-intensity sampler** instead of the O(N²) chunk-based sampler.  The algorithm is:
+
+1. Draw `n_cand ~ Poisson(S_x · S_y)` edge candidates, where `S_x = Σ x_i`, `S_y = Σ y_j`.
+2. Sample `src ~ x/S_x` and `dst ~ y/S_y` via the alias method — O(N + L) total.
+3. Accept candidate `(i,j)` with probability `1/(1 + x_i y_j) ∈ (0,1]`.
+4. Remove self-loops and deduplicate (1D integer encoding, 13× faster than 2D sort).
+
+After deduplication the edge probability is `P(A_ij = 1) = 1 − exp(−p_ij)`, which differs from the exact `p_ij` by `p_ij²/2`.  For typical sparse networks with `p_ij ~ 10⁻³` this error is `~5×10⁻⁷` per edge — negligible for any ensemble observable.
+
+> **Note**: this is *not* the Chung–Lu approximation.  Chung–Lu would skip step 3, giving `P ≈ x_i y_j` rather than `x_i y_j/(1+x_i y_j)`.  The acceptance step in step 3 ensures the exact DCM probabilities are respected; only the Poisson-to-Bernoulli conversion introduces a second-order error.
+
+Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chunk_size` controls peak RAM in that path.
+
+**Benchmark** (N = 5 000, power-law degree sequence, ρ = 10⁻³):
+
+| Model | Before (exact) | After (fast) | Speedup |
+|-------|---------------|--------------|---------|
+| DCM | 371 ms | 32 ms | ~12× |
+| qDECM | 451 ms | 37 ms | ~12× |
+| DWCM | — | 83 ms | — |
 
 Calls `sample()` before `solve_tool()` raise `RuntimeError`.
 

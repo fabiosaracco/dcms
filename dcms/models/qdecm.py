@@ -718,44 +718,21 @@ class qDECMModel:
         )
         return self.sol.converged
 
-    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
-        """Sample a weighted directed network from the fitted qDECM.
-
-        Two-step procedure mirroring the qDECM factorisation:
-
-        1. **Topology** — draw ``A_ij ~ Bernoulli(p_ij)`` where
-           ``p_ij = x_i y_j / (1 + x_i y_j)`` comes from the DCM solution.
-        2. **Weights** — for each present link draw ``w_ij`` from a geometric
-           distribution starting at 1 (the conditional distribution given the
-           link exists)::
-
-               P(w_ij = k | A_ij = 1) = (1 − β_ij) β_ij^{k−1},   k = 1, 2, …
-               β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
-
-        Args:
-            seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time.
-
-        Returns:
-            Weighted edge list: list of ``[source, target, weight]`` integer triples.
-
-        Raises:
-            RuntimeError: if :meth:`solve_tool` has not been called yet.
-        """
+    def _sample_raw(self, seed: int | None = None,
+                    chunk_size: int = 512) -> "np.ndarray":
+        """Internal sampler — returns shape ``(L, 3)`` NumPy array (no tolist)."""
+        import numpy as np
         if self.sol is None:
             raise RuntimeError("Call solve_tool() first.")
-        import numpy as np
         rng = np.random.default_rng(seed)
         N = self.N
-        # Precompute fitnesses once — avoids N² exp() calls
         theta_topo = np.asarray(self.sol.best_theta[:2 * N], dtype=np.float64)
-        x = np.exp(-theta_topo[:N])   # topology out-fitnesses
-        y = np.exp(-theta_topo[N:])   # topology in-fitnesses
+        x = np.exp(-theta_topo[:N])
+        y = np.exp(-theta_topo[N:])
         theta_w  = np.asarray(self.sol.best_theta[2 * N:], dtype=np.float64)
         beta_out = np.exp(-theta_w[:N])
         beta_in  = np.exp(-theta_w[N:])
 
-        # Step 1: topology — use fast sparse sampler when network is sparse
         mean_p = x.sum() * y.sum() / (N * (N - 1))
         if mean_p < 0.05:
             S_x = x.sum();  S_y = y.sum()
@@ -775,7 +752,6 @@ class qDECMModel:
             else:
                 rows = cols = np.empty(0, dtype=int)
         else:
-            # Dense fallback: exact chunk-based sampler
             rows_list, cols_list = [], []
             for i_start in range(0, N, chunk_size):
                 i_end = min(i_start + chunk_size, N)
@@ -793,11 +769,70 @@ class qDECMModel:
             else:
                 rows = cols = np.empty(0, dtype=int)
 
-        edges: list = []
-        if len(rows):
-            # Step 2: weights only on present edges
-            b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
-            weights = rng.geometric(1.0 - b_vals)
-            edges = np.column_stack([rows, cols, weights]).tolist()
-        return edges
+        if not len(rows):
+            return np.empty((0, 3), dtype=int)
+        b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
+        weights = rng.geometric(1.0 - b_vals)
+        return np.column_stack([rows, cols, weights])
+
+    def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
+        """Sample a weighted directed network from the fitted qDECM.
+
+        Two-step procedure mirroring the qDECM factorisation:
+
+        1. **Topology** — draw ``A_ij ~ Bernoulli(p_ij)`` where
+           ``p_ij = x_i y_j / (1 + x_i y_j)`` comes from the DCM solution.
+        2. **Weights** — for each present link draw ``w_ij`` from a geometric
+           distribution starting at 1 (the conditional distribution given the
+           link exists)::
+
+               P(w_ij = k | A_ij = 1) = (1 − β_ij) β_ij^{k−1},   k = 1, 2, …
+               β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
+
+        Uses a Poisson-intensity sparse sampler (O(L)) for sparse networks;
+        falls back to the exact O(N²) chunk sampler when mean p > 5 %.
+
+        Args:
+            seed: Random seed for reproducibility.
+            chunk_size: Number of source rows processed at a time.
+
+        Returns:
+            Weighted edge list: list of ``[source, target, weight]`` integer triples.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        return self._sample_raw(seed=seed, chunk_size=chunk_size).tolist()
+
+    def sample_many(self, n: int, seed: int | None = None,
+                    n_jobs: int = -1) -> list:
+        """Generate ``n`` independent samples in parallel.
+
+        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
+        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
+        works the same as with the list returned by :meth:`sample`.
+
+        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
+        the GIL during random-number generation and array operations, giving
+        near-linear speedup up to the number of physical cores.
+
+        Args:
+            n: Number of independent samples to draw.
+            seed: Master seed from which per-sample seeds are derived.
+            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
+
+        Returns:
+            List of ``n`` NumPy arrays, one per sample.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        import numpy as np
+        from concurrent.futures import ThreadPoolExecutor
+        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
+        if n_jobs == 1:
+            return [self._sample_raw(seed=s) for s in seeds]
+        max_workers = None if n_jobs < 0 else n_jobs
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(self._sample_raw, seeds))
 

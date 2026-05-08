@@ -435,6 +435,53 @@ class DWCMModel:
             
         return self.sol.converged
 
+    def _sample_raw(self, seed: int | None = None,
+                    chunk_size: int = 512) -> "np.ndarray":
+        """Internal sampler — returns shape ``(L, 3)`` NumPy array (no tolist)."""
+        import numpy as np
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        rng = np.random.default_rng(seed)
+        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        N = self.N
+        beta_out = np.exp(-theta[:N])
+        beta_in  = np.exp(-theta[N:])
+
+        mean_b = beta_out.sum() * beta_in.sum() / (N * (N - 1))
+        if mean_b < 0.05:
+            S_bo = beta_out.sum();  S_bi = beta_in.sum()
+            n_cand = rng.poisson(S_bo * S_bi)
+            if n_cand == 0:
+                return np.empty((0, 3), dtype=int)
+            src_c = rng.choice(N, size=n_cand, p=beta_out / S_bo)
+            dst_c = rng.choice(N, size=n_cand, p=beta_in  / S_bi)
+            mask = src_c != dst_c
+            src_c, dst_c = src_c[mask], dst_c[mask]
+            if len(src_c) == 0:
+                return np.empty((0, 3), dtype=int)
+            uid = np.unique(src_c.astype(np.int64) * N + dst_c)
+            rows = (uid // N).astype(int)
+            cols = (uid  % N).astype(int)
+            b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
+            weights = rng.geometric(1.0 - b_vals)
+            return np.column_stack([rows, cols, weights])
+
+        # Dense fallback
+        parts: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)
+            chunk_range = np.arange(i_end - i_start)
+            b[chunk_range, i_start + chunk_range] = 0.0
+            rows, cols = np.where(rng.random(b.shape) < b)
+            if len(rows):
+                b_vals = b[rows, cols]
+                weights = rng.geometric(1.0 - b_vals)
+                parts.append(np.column_stack([i_start + rows, cols, weights]))
+        if not parts:
+            return np.empty((0, 3), dtype=int)
+        return np.vstack(parts)
+
     def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
         """Sample a weighted directed network from the fitted DWCM.
 
@@ -462,48 +509,36 @@ class DWCMModel:
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
         """
-        if self.sol is None:
-            raise RuntimeError("Call solve_tool() first.")
+        return self._sample_raw(seed=seed, chunk_size=chunk_size).tolist()
+
+    def sample_many(self, n: int, seed: int | None = None,
+                    n_jobs: int = -1) -> list:
+        """Generate ``n`` independent samples in parallel.
+
+        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
+        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
+        works the same as with the list returned by :meth:`sample`.
+
+        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
+        the GIL during random-number generation and array operations, giving
+        near-linear speedup up to the number of physical cores.
+
+        Args:
+            n: Number of independent samples to draw.
+            seed: Master seed from which per-sample seeds are derived.
+            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
+
+        Returns:
+            List of ``n`` NumPy arrays, one per sample.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
         import numpy as np
-        rng = np.random.default_rng(seed)
-        theta = np.asarray(self.sol.theta, dtype=np.float64)
-        N = self.N
-        beta_out = np.exp(-theta[:N])
-        beta_in  = np.exp(-theta[N:])
-
-        mean_b = beta_out.sum() * beta_in.sum() / (N * (N - 1))
-        if mean_b < 0.05:
-            # Fast O(L) Poisson-intensity sampler
-            S_bo = beta_out.sum();  S_bi = beta_in.sum()
-            n_cand = rng.poisson(S_bo * S_bi)
-            if n_cand == 0:
-                return []
-            src_c = rng.choice(N, size=n_cand, p=beta_out / S_bo)
-            dst_c = rng.choice(N, size=n_cand, p=beta_in  / S_bi)
-            # For P(w>0) = β_ij, no acceptance correction needed in the sparse limit;
-            # deduplication converts Poisson(β) to Bernoulli(1-exp(-β)) ≈ Bernoulli(β).
-            mask = src_c != dst_c
-            src_c, dst_c = src_c[mask], dst_c[mask]
-            if len(src_c) == 0:
-                return []
-            uid = np.unique(src_c.astype(np.int64) * N + dst_c)
-            rows = (uid // N).astype(int)
-            cols = (uid  % N).astype(int)
-            b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
-            weights = rng.geometric(1.0 - b_vals)
-            return np.column_stack([rows, cols, weights]).tolist()
-
-        # Dense fallback: exact chunk-based sampler
-        edges: list = []
-        for i_start in range(0, N, chunk_size):
-            i_end = min(i_start + chunk_size, N)
-            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)
-            chunk_range = np.arange(i_end - i_start)
-            b[chunk_range, i_start + chunk_range] = 0.0
-            rows, cols = np.where(rng.random(b.shape) < b)
-            if len(rows):
-                b_vals = b[rows, cols]
-                weights = rng.geometric(1.0 - b_vals)
-                src = i_start + rows
-                edges.extend(np.column_stack([src, cols, weights]).tolist())
-        return edges
+        from concurrent.futures import ThreadPoolExecutor
+        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
+        if n_jobs == 1:
+            return [self._sample_raw(seed=s) for s in seeds]
+        max_workers = None if n_jobs < 0 else n_jobs
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(self._sample_raw, seeds))

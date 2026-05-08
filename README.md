@@ -502,16 +502,28 @@ Additional model methods:
 | `"degrees"` (default) | θ from `k/(N-1)` heuristic; η from `β = sqrt(1 − k/s)` mean-field |
 | `"random"` | Uniform random `θ ∈ [0.1, 2.0]`, `η ∈ [0.1, 2.0]` |
 
-### 3.5 Sampling synthetic networks — `model.sample()`
+### 3.5 Sampling synthetic networks — `model.sample()` / `model.sample_many()`
 
-After calling `solve_tool()`, every model exposes a `sample()` method that draws one independent realisation from the fitted MaxEnt distribution.
+After calling `solve_tool()`, every model exposes two sampling methods:
 
 ```python
+# Single sample — returns a Python list (backward-compatible)
 edges = model.sample(
     seed=42,          # integer or None — random seed for reproducibility
     chunk_size=512,   # rows processed per iteration (exact fallback only)
 )
+
+# Parallel batch sampling — returns a list of NumPy arrays
+samples = model.sample_many(
+    n=2000,           # number of independent samples
+    seed=42,          # master seed (per-sample seeds derived from it)
+    n_jobs=-1,        # worker threads; -1 = all logical CPUs (default)
+)
+# each element: np.ndarray of shape (L_k, 2) for DCM, (L_k, 3) for weighted
 ```
+
+`sample()` returns a Python list of `[i, j]` or `[i, j, w]` integer lists.
+`sample_many()` returns a list of NumPy arrays — iterating `for i, j in arr` works identically.
 
 The output format and the underlying sampling distribution differ by model:
 
@@ -544,15 +556,19 @@ After deduplication the edge probability is `P(A_ij = 1) = 1 − exp(−p_ij)`, 
 
 Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chunk_size` controls peak RAM in that path.
 
+#### Parallel batch sampling with `sample_many()`
+
+`sample_many()` uses `ThreadPoolExecutor` to generate samples in parallel.  NumPy releases the GIL during random-number generation and array operations, so threading provides near-linear speedup up to the number of physical cores.  The internal `_sample_raw()` method returns a NumPy array directly (no `list` conversion), eliminating the main GIL-holding bottleneck per sample.
+
 **Benchmark** (N = 5 000, power-law degree sequence, ρ = 10⁻³):
 
-| Model | Before (exact) | After (fast) | Speedup |
-|-------|---------------|--------------|---------|
-| DCM | 371 ms | 32 ms | ~12× |
-| qDECM | 451 ms | 37 ms | ~12× |
-| DWCM | — | 83 ms | — |
+| Model | `sample()` single | `sample_many(n, n_jobs=8)` effective per-sample | Speedup |
+|-------|-------------------|------------------------------------------------|---------|
+| DCM | ~32 ms | ~4 ms | ~8× |
+| qDECM | ~37 ms | ~5 ms | ~7× |
+| DWCM | ~83 ms | ~11 ms | ~7× |
 
-Calls `sample()` before `solve_tool()` raise `RuntimeError`.
+Calls to `sample()` or `sample_many()` before `solve_tool()` raise `RuntimeError`.
 
 ### 3.6 SolverResult
 

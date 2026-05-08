@@ -215,3 +215,102 @@ class TestDECMSample:
     def test_reproducible(self):
         m = self._fitted()
         assert m.sample(seed=9) == m.sample(seed=9)
+
+
+# ---------------------------------------------------------------------------
+# sample_many tests (all four models)
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+class TestSampleManyDCM:
+    @pytest.fixture(autouse=True)
+    def _model(self):
+        from dcms.models.dcm import DCMModel
+        k_out, k_in = _setup()[:2]
+        m = DCMModel(k_out, k_in)
+        m.solve_tool(tol=1e-6)
+        self.m = m
+
+    def test_returns_list_of_arrays(self):
+        samples = self.m.sample_many(4, seed=0)
+        assert len(samples) == 4
+        for s in samples:
+            assert isinstance(s, np.ndarray)
+            assert s.ndim == 2 and s.shape[1] == 2
+
+    def test_n_jobs_1(self):
+        samples = self.m.sample_many(3, seed=0, n_jobs=1)
+        assert len(samples) == 3
+
+    def test_no_self_loops(self):
+        for arr in self.m.sample_many(3, seed=1):
+            assert np.all(arr[:, 0] != arr[:, 1])
+
+
+class TestSampleManyDWCM:
+    @pytest.fixture(autouse=True)
+    def _model(self):
+        from dcms.models.dwcm import DWCMModel
+        _, _, s_out, s_in = _setup()
+        m = DWCMModel(s_out, s_in)
+        m.solve_tool(tol=1e-6)
+        self.m = m
+
+    def test_returns_list_of_arrays(self):
+        samples = self.m.sample_many(4, seed=0)
+        assert len(samples) == 4
+        for s in samples:
+            assert isinstance(s, np.ndarray)
+            assert s.ndim == 2 and s.shape[1] == 3
+
+    def test_no_self_loops(self):
+        for arr in self.m.sample_many(3, seed=1):
+            assert np.all(arr[:, 0] != arr[:, 1])
+
+
+class TestSampleManyQDECM:
+    @pytest.fixture(autouse=True)
+    def _model(self):
+        from dcms.models.qdecm import qDECMModel
+        k_out, k_in, s_out, s_in = _setup()
+        m = qDECMModel(k_out, k_in, s_out, s_in)
+        m.solve_tool(tol=1e-6)
+        self.m = m
+
+    def test_returns_list_of_arrays(self):
+        samples = self.m.sample_many(4, seed=0)
+        assert len(samples) == 4
+        for s in samples:
+            assert isinstance(s, np.ndarray)
+            assert s.ndim == 2 and s.shape[1] == 3
+
+    def test_n_jobs_1(self):
+        samples = self.m.sample_many(3, seed=0, n_jobs=1)
+        assert len(samples) == 3
+
+    def test_no_self_loops(self):
+        for arr in self.m.sample_many(3, seed=1):
+            assert np.all(arr[:, 0] != arr[:, 1])
+
+
+class TestSampleManyDECM:
+    @pytest.fixture(autouse=True)
+    def _model(self):
+        from dcms.models.decm import DECMModel
+        k_out, k_in, s_out, s_in = _setup()
+        m = DECMModel(k_out, k_in, s_out, s_in)
+        m.solve_tool(tol=1e-6)
+        self.m = m
+
+    def test_returns_list_of_arrays(self):
+        samples = self.m.sample_many(4, seed=0)
+        assert len(samples) == 4
+        for s in samples:
+            assert isinstance(s, np.ndarray)
+            assert s.ndim == 2 and s.shape[1] == 3
+
+    def test_no_self_loops(self):
+        for arr in self.m.sample_many(3, seed=1):
+            assert np.all(arr[:, 0] != arr[:, 1])

@@ -403,6 +403,40 @@ class DCMModel:
             
         return self.sol.converged
 
+    def _sample_raw(self, seed: int | None = None,
+                    chunk_size: int = 512) -> "np.ndarray":
+        """Internal sampler — returns a NumPy array, not a Python list.
+
+        Shape ``(L, 2)`` with dtype ``int``.  Called by both :meth:`sample`
+        and :meth:`sample_many` to avoid the GIL-holding ``.tolist()`` cost
+        in the parallel path.
+        """
+        import numpy as np
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        rng = np.random.default_rng(seed)
+        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        N = self.N
+        x = np.exp(-theta[:N])
+        y = np.exp(-theta[N:])
+        mean_p = x.sum() * y.sum() / (N * (N - 1))
+        if mean_p < 0.05:
+            return self._sample_sparse(x, y, rng, N)
+        # Dense fallback — build ndarray directly
+        parts: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            xy = x[i_start:i_end, None] * y[None, :]
+            p = xy / (1.0 + xy)
+            chunk_range = np.arange(i_end - i_start)
+            p[chunk_range, i_start + chunk_range] = 0.0
+            rows, cols = np.where(rng.random(p.shape) < p)
+            if len(rows):
+                parts.append(np.column_stack([i_start + rows, cols]))
+        if not parts:
+            return np.empty((0, 2), dtype=int)
+        return np.vstack(parts)
+
     def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
         """Sample a binary directed network from the fitted DCM.
 
@@ -427,61 +461,62 @@ class DCMModel:
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
         """
-        if self.sol is None:
-            raise RuntimeError("Call solve_tool() first.")
-        import numpy as np
-        rng = np.random.default_rng(seed)
-        theta = np.asarray(self.sol.theta, dtype=np.float64)
-        N = self.N
-        x = np.exp(-theta[:N])   # x_i = exp(-θ_out_i)
-        y = np.exp(-theta[N:])   # y_j = exp(-θ_in_j)
+        return self._sample_raw(seed=seed, chunk_size=chunk_size).tolist()
 
-        # Choose sampler based on sparsity
-        mean_p = x.sum() * y.sum() / (N * (N - 1))
-        if mean_p < 0.05:
-            return self._sample_sparse(x, y, rng, N)
-        # Dense fallback: exact chunk-based Bernoulli sampler
-        edges: list = []
-        for i_start in range(0, N, chunk_size):
-            i_end = min(i_start + chunk_size, N)
-            xy = x[i_start:i_end, None] * y[None, :]
-            p = xy / (1.0 + xy)
-            chunk_range = np.arange(i_end - i_start)
-            p[chunk_range, i_start + chunk_range] = 0.0
-            rows, cols = np.where(rng.random(p.shape) < p)
-            if len(rows):
-                src = i_start + rows
-                edges.extend(np.column_stack([src, cols]).tolist())
-        return edges
+    def sample_many(self, n: int, seed: int | None = None,
+                    n_jobs: int = -1) -> list:
+        """Generate ``n`` independent samples in parallel.
+
+        Each sample is a ``np.ndarray`` of shape ``(L_k, 2)`` with columns
+        ``[source, target]``.  Iterating ``for i, j in sample`` works the same
+        as with the list returned by :meth:`sample`.
+
+        Uses :class:`~concurrent.futures.ThreadPoolExecutor` — NumPy releases
+        the GIL during random-number generation and array operations, so
+        threading gives near-linear speedup up to the number of physical cores.
+
+        Args:
+            n: Number of independent samples to draw.
+            seed: Master seed from which per-sample seeds are derived.
+            n_jobs: Number of worker threads.  ``-1`` (default) uses all
+                available logical CPUs.
+
+        Returns:
+            List of ``n`` NumPy arrays, one per sample.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        import numpy as np
+        from concurrent.futures import ThreadPoolExecutor
+        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
+        if n_jobs == 1:
+            return [self._sample_raw(seed=s) for s in seeds]
+        max_workers = None if n_jobs < 0 else n_jobs
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(self._sample_raw, seeds))
 
     @staticmethod
     def _sample_sparse(x: "np.ndarray", y: "np.ndarray",
-                       rng: "np.random.Generator", N: int) -> list:
+                       rng: "np.random.Generator", N: int) -> "np.ndarray":
         """O(L) Poisson-intensity sampler for sparse DCM graphs.
 
-        Generates edges via a Poisson point process with intensity
-        λ_ij = x_i · y_j, then accepts each candidate (i,j) with
-        probability 1/(1 + x_i·y_j).  After deduplication this gives
-        P(A_ij = 1) = 1 − exp(−p_ij) where p_ij = x_i·y_j/(1+x_i·y_j).
-        The error vs exact Bernoulli(p_ij) is O(p²), negligible when sparse.
+        Returns ``np.ndarray`` of shape ``(L, 2)`` — no ``.tolist()`` call,
+        so the GIL is barely held (only during ``rng.choice`` alias setup).
         """
         import numpy as np
         S_x = x.sum();  S_y = y.sum()
-        Lambda = S_x * S_y
-        n_cand = rng.poisson(Lambda)
+        n_cand = rng.poisson(S_x * S_y)
         if n_cand == 0:
-            return []
+            return np.empty((0, 2), dtype=int)
         src = rng.choice(N, size=n_cand, p=x / S_x)
         dst = rng.choice(N, size=n_cand, p=y / S_y)
         xy_vals = x[src] * y[dst]
-        # Accept with prob 1/(1+xy), remove self-loops simultaneously
         keep = (rng.random(n_cand) * (1.0 + xy_vals) < 1.0) & (src != dst)
         src, dst = src[keep], dst[keep]
         if len(src) == 0:
-            return []
-        # Deduplicate via 1D integer encoding (13x faster than 2D unique)
-        # → converts Poisson multi-edges to single Bernoulli edges
+            return np.empty((0, 2), dtype=int)
         uid = np.unique(src.astype(np.int64) * N + dst)
         rows_u = (uid // N).astype(int)
         cols_u = (uid  % N).astype(int)
-        return np.column_stack([rows_u, cols_u]).tolist()
+        return np.column_stack([rows_u, cols_u])

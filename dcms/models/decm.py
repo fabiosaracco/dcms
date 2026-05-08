@@ -708,6 +708,48 @@ class DECMModel:
 
         return self.sol.converged
 
+    def _sample_raw(self, seed: int | None = None,
+                    chunk_size: int = 512) -> "np.ndarray":
+        """Internal sampler — returns shape ``(L, 3)`` NumPy array (no tolist).
+
+        DECM link probabilities are not rank-1 in the fitnesses (the
+        weight-multiplier term ``log_q_ij`` depends on both ``i`` and ``j``),
+        so the O(L) Poisson sparse trick cannot be applied.  The exact
+        O(N²) chunk sampler is used instead.
+        """
+        import numpy as np
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        rng = np.random.default_rng(seed)
+        N = self.N
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
+        theta_out = theta[:N]
+        theta_in  = theta[N : 2 * N]
+        eta_out   = theta[2 * N : 3 * N]
+        eta_in    = theta[3 * N :]
+        beta_out  = np.exp(-eta_out)
+        beta_in   = np.exp(-eta_in)
+        q_in  = 1.0 / np.expm1(eta_in).clip(min=1e-300)
+        q_out = 1.0 / np.expm1(eta_out).clip(min=1e-300)
+        parts: list = []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            q_out_chunk = q_out[i_start:i_end]
+            eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]
+            log_q = -np.log(np.expm1(eta_chunk).clip(min=1e-300))
+            logit_p = -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q
+            p = 1.0 / (1.0 + np.exp(-logit_p))
+            chunk_range = np.arange(i_end - i_start)
+            p[chunk_range, i_start + chunk_range] = 0.0
+            rows, cols = np.where(rng.random(p.shape) < p)
+            if len(rows):
+                b_vals = (beta_out[i_start + rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
+                weights = rng.geometric(1.0 - b_vals)
+                parts.append(np.column_stack([i_start + rows, cols, weights]))
+        if not parts:
+            return np.empty((0, 3), dtype=int)
+        return np.vstack(parts)
+
     def sample(self, seed: int | None = None, chunk_size: int = 512) -> list:
         """Sample a weighted directed network from the fitted DECM.
 
@@ -734,44 +776,38 @@ class DECMModel:
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
         """
-        if self.sol is None:
-            raise RuntimeError("Call solve_tool() first.")
+        return self._sample_raw(seed=seed, chunk_size=chunk_size).tolist()
+
+    def sample_many(self, n: int, seed: int | None = None,
+                    n_jobs: int = -1) -> list:
+        """Generate ``n`` independent samples in parallel.
+
+        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
+        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
+        works the same as with the list returned by :meth:`sample`.
+
+        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
+        the GIL during random-number generation and array operations, giving
+        near-linear speedup up to the number of physical cores.  Note that
+        DECM uses an O(N²) sampler (link probabilities are not rank-1), so the
+        per-sample cost is higher than for DCM/DWCM/qDECM.
+
+        Args:
+            n: Number of independent samples to draw.
+            seed: Master seed from which per-sample seeds are derived.
+            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
+
+        Returns:
+            List of ``n`` NumPy arrays, one per sample.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
         import numpy as np
-        rng = np.random.default_rng(seed)
-        N = self.N
-        # Precompute fitnesses once — avoids N² exp() calls inside the chunk loop
-        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
-        theta_out = theta[:N]
-        theta_in  = theta[N : 2 * N]
-        eta_out   = theta[2 * N : 3 * N]
-        eta_in    = theta[3 * N :]
-        beta_out  = np.exp(-eta_out)
-        beta_in   = np.exp(-eta_in)
-        # Precompute q_j = 1/(exp(η_in_j)-1) for the topology logit
-        q_in  = 1.0 / np.expm1(eta_in).clip(min=1e-300)    # (N,)
-        q_out = 1.0 / np.expm1(eta_out).clip(min=1e-300)   # (N,)  (used per chunk)
-        edges: list = []
-        for i_start in range(0, N, chunk_size):
-            i_end = min(i_start + chunk_size, N)
-            # p_ij = σ(−θ_out_i − θ_in_j + log(q_out_i*q_in_j/(q_out_i+q_in_j+q_out_i*q_in_j)))
-            # Equivalent formulation: logit = -θ_out - θ_in + log_q_sum
-            # log(1/expm1(η_i+η_j)) = log(q_out_i*q_in_j/(q_out_i+q_in_j+1))  — avoid full η_chunk
-            q_out_chunk = q_out[i_start:i_end]   # (chunk,)
-            # log_q_ij = log(1/expm1(η_out_i + η_in_j)) computed via q
-            #          = -log(1/(q_out_i*q_in_j) + 1/q_out_i + 1/q_in_j)
-            #   but simpler to compute eta_chunk directly — only 1 expm1 per chunk
-            eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, N)
-            log_q = -np.log(np.expm1(eta_chunk).clip(min=1e-300))
-            logit_p = -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q
-            p = 1.0 / (1.0 + np.exp(-logit_p))
-            chunk_range = np.arange(i_end - i_start)
-            p[chunk_range, i_start + chunk_range] = 0.0  # no self-loops (vectorized)
-            A = rng.random(p.shape) < p
-            rows, cols = np.where(A)
-            if len(rows):
-                # Weights only on present edges
-                b_vals = (beta_out[i_start + rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
-                weights = rng.geometric(1.0 - b_vals)
-                src = i_start + rows
-                edges.extend(np.column_stack([src, cols, weights]).tolist())
-        return edges
+        from concurrent.futures import ThreadPoolExecutor
+        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
+        if n_jobs == 1:
+            return [self._sample_raw(seed=s) for s in seeds]
+        max_workers = None if n_jobs < 0 else n_jobs
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(self._sample_raw, seeds))

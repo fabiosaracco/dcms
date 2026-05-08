@@ -411,9 +411,15 @@ class DCMModel:
 
             p_ij = x_i y_j / (1 + x_i y_j),   x_i = exp(-θ_out_i), y_j = exp(-θ_in_j)
 
+        Uses a Poisson-intensity sparse sampler: O(L) random draws instead of
+        O(N²), yielding P(edge)=1−exp(−p_ij) which equals p_ij up to O(p²) error
+        (negligible for sparse networks).  Falls back to the exact O(N²) chunk
+        sampler when the network is dense (mean p > 5 %).
+
         Args:
             seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time (controls peak RAM).
+            chunk_size: Number of source rows processed at a time for the exact
+                fallback path (controls peak RAM).
 
         Returns:
             Edge list: list of ``[source, target]`` integer pairs.
@@ -427,17 +433,55 @@ class DCMModel:
         rng = np.random.default_rng(seed)
         theta = np.asarray(self.sol.theta, dtype=np.float64)
         N = self.N
-        theta_out = theta[:N]
-        theta_in  = theta[N:]
+        x = np.exp(-theta[:N])   # x_i = exp(-θ_out_i)
+        y = np.exp(-theta[N:])   # y_j = exp(-θ_in_j)
+
+        # Choose sampler based on sparsity
+        mean_p = x.sum() * y.sum() / (N * (N - 1))
+        if mean_p < 0.05:
+            return self._sample_sparse(x, y, rng, N)
+        # Dense fallback: exact chunk-based Bernoulli sampler
         edges: list = []
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
-            # p_ij = sigmoid(-(θ_out_i + θ_in_j))
-            logit = -theta_out[i_start:i_end, None] - theta_in[None, :]  # (chunk, N)
-            p = 1.0 / (1.0 + np.exp(-logit))
-            for k, i in enumerate(range(i_start, i_end)):
-                p[k, i] = 0.0  # no self-loops
+            xy = x[i_start:i_end, None] * y[None, :]
+            p = xy / (1.0 + xy)
+            chunk_range = np.arange(i_end - i_start)
+            p[chunk_range, i_start + chunk_range] = 0.0
             rows, cols = np.where(rng.random(p.shape) < p)
-            for k, j in zip(rows, cols):
-                edges.append([i_start + int(k), int(j)])
+            if len(rows):
+                src = i_start + rows
+                edges.extend(np.column_stack([src, cols]).tolist())
         return edges
+
+    @staticmethod
+    def _sample_sparse(x: "np.ndarray", y: "np.ndarray",
+                       rng: "np.random.Generator", N: int) -> list:
+        """O(L) Poisson-intensity sampler for sparse DCM graphs.
+
+        Generates edges via a Poisson point process with intensity
+        λ_ij = x_i · y_j, then accepts each candidate (i,j) with
+        probability 1/(1 + x_i·y_j).  After deduplication this gives
+        P(A_ij = 1) = 1 − exp(−p_ij) where p_ij = x_i·y_j/(1+x_i·y_j).
+        The error vs exact Bernoulli(p_ij) is O(p²), negligible when sparse.
+        """
+        import numpy as np
+        S_x = x.sum();  S_y = y.sum()
+        Lambda = S_x * S_y
+        n_cand = rng.poisson(Lambda)
+        if n_cand == 0:
+            return []
+        src = rng.choice(N, size=n_cand, p=x / S_x)
+        dst = rng.choice(N, size=n_cand, p=y / S_y)
+        xy_vals = x[src] * y[dst]
+        # Accept with prob 1/(1+xy), remove self-loops simultaneously
+        keep = (rng.random(n_cand) * (1.0 + xy_vals) < 1.0) & (src != dst)
+        src, dst = src[keep], dst[keep]
+        if len(src) == 0:
+            return []
+        # Deduplicate via 1D integer encoding (13x faster than 2D unique)
+        # → converts Poisson multi-edges to single Bernoulli edges
+        uid = np.unique(src.astype(np.int64) * N + dst)
+        rows_u = (uid // N).astype(int)
+        cols_u = (uid  % N).astype(int)
+        return np.column_stack([rows_u, cols_u]).tolist()

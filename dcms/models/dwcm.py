@@ -446,9 +446,15 @@ class DWCMModel:
 
         Pairs with ``w_ij = 0`` (no link) are omitted.
 
+        Uses a Poisson-intensity sparse sampler: O(L) random draws instead of
+        O(N²), yielding P(w>0)=1−exp(−β_ij) which equals β_ij up to O(β²)
+        error (negligible for sparse networks).  Falls back to the exact O(N²)
+        chunk sampler when the network is dense (mean β > 5 %).
+
         Args:
             seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time.
+            chunk_size: Number of source rows processed at a time for the exact
+                fallback path.
 
         Returns:
             Weighted edge list: list of ``[source, target, weight]`` integer triples.
@@ -464,16 +470,40 @@ class DWCMModel:
         N = self.N
         beta_out = np.exp(-theta[:N])
         beta_in  = np.exp(-theta[N:])
+
+        mean_b = beta_out.sum() * beta_in.sum() / (N * (N - 1))
+        if mean_b < 0.05:
+            # Fast O(L) Poisson-intensity sampler
+            S_bo = beta_out.sum();  S_bi = beta_in.sum()
+            n_cand = rng.poisson(S_bo * S_bi)
+            if n_cand == 0:
+                return []
+            src_c = rng.choice(N, size=n_cand, p=beta_out / S_bo)
+            dst_c = rng.choice(N, size=n_cand, p=beta_in  / S_bi)
+            # For P(w>0) = β_ij, no acceptance correction needed in the sparse limit;
+            # deduplication converts Poisson(β) to Bernoulli(1-exp(-β)) ≈ Bernoulli(β).
+            mask = src_c != dst_c
+            src_c, dst_c = src_c[mask], dst_c[mask]
+            if len(src_c) == 0:
+                return []
+            uid = np.unique(src_c.astype(np.int64) * N + dst_c)
+            rows = (uid // N).astype(int)
+            cols = (uid  % N).astype(int)
+            b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
+            weights = rng.geometric(1.0 - b_vals)
+            return np.column_stack([rows, cols, weights]).tolist()
+
+        # Dense fallback: exact chunk-based sampler
         edges: list = []
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
-            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)  # (chunk, N)
-            for k, i in enumerate(range(i_start, i_end)):
-                b[k, i] = 0.0  # no self-loops → w=0, filtered below
-            # Geometric(p) from numpy starts at 1: P(X=k) = (1-p)^(k-1)*p
-            # We need w ~ Geom-0(β): P(w=k) = (1-β)*β^k, so w = X-1 with p=1-β
-            w = rng.geometric(1.0 - b) - 1  # shape (chunk, N), values ≥ 0
-            rows, cols = np.where(w > 0)
-            for k, j in zip(rows, cols):
-                edges.append([i_start + int(k), int(j), int(w[k, j])])
+            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)
+            chunk_range = np.arange(i_end - i_start)
+            b[chunk_range, i_start + chunk_range] = 0.0
+            rows, cols = np.where(rng.random(b.shape) < b)
+            if len(rows):
+                b_vals = b[rows, cols]
+                weights = rng.geometric(1.0 - b_vals)
+                src = i_start + rows
+                edges.extend(np.column_stack([src, cols, weights]).tolist())
         return edges

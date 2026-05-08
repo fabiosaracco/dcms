@@ -674,7 +674,9 @@ class qDECMModel:
         else:
             self.ic_topo = _torch.as_tensor(ic_topo, dtype=_torch.float64)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-        _sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+        # note: as the topology always work, using a better precision on th esolution may help the convergence of the weights
+        topo_tol_help=10**-3
+        _sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         
         if len(_sol_topo.message)>0:
             print(f'Topology: {_sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
@@ -745,26 +747,57 @@ class qDECMModel:
         import numpy as np
         rng = np.random.default_rng(seed)
         N = self.N
+        # Precompute fitnesses once — avoids N² exp() calls
         theta_topo = np.asarray(self.sol.best_theta[:2 * N], dtype=np.float64)
-        theta_out  = theta_topo[:N]
-        theta_in   = theta_topo[N:]
-        theta_w   = np.asarray(self.sol.best_theta[2 * N:], dtype=np.float64)
-        beta_out  = np.exp(-theta_w[:N])
-        beta_in   = np.exp(-theta_w[N:])
+        x = np.exp(-theta_topo[:N])   # topology out-fitnesses
+        y = np.exp(-theta_topo[N:])   # topology in-fitnesses
+        theta_w  = np.asarray(self.sol.best_theta[2 * N:], dtype=np.float64)
+        beta_out = np.exp(-theta_w[:N])
+        beta_in  = np.exp(-theta_w[N:])
+
+        # Step 1: topology — use fast sparse sampler when network is sparse
+        mean_p = x.sum() * y.sum() / (N * (N - 1))
+        if mean_p < 0.05:
+            S_x = x.sum();  S_y = y.sum()
+            n_cand = rng.poisson(S_x * S_y)
+            if n_cand > 0:
+                src_c = rng.choice(N, size=n_cand, p=x / S_x)
+                dst_c = rng.choice(N, size=n_cand, p=y / S_y)
+                xy_vals = x[src_c] * y[dst_c]
+                keep = (rng.random(n_cand) * (1.0 + xy_vals) < 1.0) & (src_c != dst_c)
+                src_c, dst_c = src_c[keep], dst_c[keep]
+                if len(src_c):
+                    uid = np.unique(src_c.astype(np.int64) * N + dst_c)
+                    rows = (uid // N).astype(int)
+                    cols = (uid  % N).astype(int)
+                else:
+                    rows = cols = np.empty(0, dtype=int)
+            else:
+                rows = cols = np.empty(0, dtype=int)
+        else:
+            # Dense fallback: exact chunk-based sampler
+            rows_list, cols_list = [], []
+            for i_start in range(0, N, chunk_size):
+                i_end = min(i_start + chunk_size, N)
+                xy = x[i_start:i_end, None] * y[None, :]
+                p = xy / (1.0 + xy)
+                chunk_range = np.arange(i_end - i_start)
+                p[chunk_range, i_start + chunk_range] = 0.0
+                r, c = np.where(rng.random(p.shape) < p)
+                if len(r):
+                    rows_list.append(i_start + r)
+                    cols_list.append(c)
+            if rows_list:
+                rows = np.concatenate(rows_list)
+                cols = np.concatenate(cols_list)
+            else:
+                rows = cols = np.empty(0, dtype=int)
+
         edges: list = []
-        for i_start in range(0, N, chunk_size):
-            i_end = min(i_start + chunk_size, N)
-            # Step 1: topology
-            logit = -theta_out[i_start:i_end, None] - theta_in[None, :]
-            p = 1.0 / (1.0 + np.exp(-logit))
-            for k, i in enumerate(range(i_start, i_end)):
-                p[k, i] = 0.0
-            A = rng.random(p.shape) < p  # (chunk, N) bool
-            # Step 2: weights on present links — Geom(1-β) starting at 1
-            b = (beta_out[i_start:i_end, None] * beta_in[None, :]).clip(0.0, 1.0 - 1e-12)
-            rows, cols = np.where(A)
-            for k, j in zip(rows, cols):
-                w = int(rng.geometric(1.0 - b[k, j]))
-                edges.append([i_start + int(k), int(j), w])
+        if len(rows):
+            # Step 2: weights only on present edges
+            b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
+            weights = rng.geometric(1.0 - b_vals)
+            edges = np.column_stack([rows, cols, weights]).tolist()
         return edges
 

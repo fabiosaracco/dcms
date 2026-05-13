@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import functools
 import math
+import time as _time
 from typing import Union
 
 import torch
@@ -655,6 +656,15 @@ class DECMModel:
 
         _FALLBACK_ICS = ["qdecm", "random"]
 
+        t_global_start = _time.perf_counter()
+
+        def _remaining() -> float:
+            """Return remaining wall-clock budget (0 = no limit)."""
+            if max_time <= 0:
+                return 0.0
+            remaining = max_time - (_time.perf_counter() - t_global_start)
+            return max(remaining, 0.0)
+
         def _run_once(ic_name: str, theta0_override=None):
             theta0 = (
                 _torch.as_tensor(theta0_override, dtype=_torch.float64)
@@ -673,7 +683,7 @@ class DECMModel:
                 variant=variant,
                 chunk_size=0,
                 anderson_depth=anderson_depth,
-                max_time=max_time,
+                max_time=_remaining(),
                 backend=backend,
                 num_threads=num_threads,
                 verbose=verbose,
@@ -698,6 +708,9 @@ class DECMModel:
             for fallback in _FALLBACK_ICS:
                 if fallback == ic:
                     continue
+                # If the global time budget is exhausted, stop trying fallbacks.
+                if max_time > 0 and _remaining() <= 0:
+                    break
                 fb_result = _run_once(fallback)
                 if fb_result.message:
                     print(fb_result.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True

@@ -695,10 +695,20 @@ class DECMModel:
             print(self.sol.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 
         if multi_start and not self.sol.converged:
+            # When the time limit was hit, seed fallback runs from the best
+            # point found so far (warm start — avoids wasting the next budget
+            # rediscovering the same region).  When the run stagnated instead,
+            # fresh ICs explore different parts of the solution space.
+            hit_time_limit = (
+                max_time > 0
+                and bool(self.sol.message)
+                and "Time limit" in self.sol.message
+            )
             for fallback in _FALLBACK_ICS:
                 if fallback == ic:
                     continue
-                fb_result = _run_once(fallback)
+                theta0_override = self.sol.best_theta if hit_time_limit else None
+                fb_result = _run_once(fallback, theta0_override=theta0_override)
                 if fb_result.message:
                     print(fb_result.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
                 if fb_result.residuals[-1] < self.sol.residuals[-1]:

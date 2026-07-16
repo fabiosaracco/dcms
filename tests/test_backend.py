@@ -30,10 +30,10 @@ class TestResolveBackend:
         assert resolve_backend("auto", N=100) == "pytorch"
 
     def test_auto_large_N(self):
-        # AUTO_NUMBA_THRESHOLD is 50_000; N=10_000 should use pytorch
+        # AUTO_NUMBA_THRESHOLD is 100_000; N=10_000 should use pytorch
         assert resolve_backend("auto", N=10_000) == "pytorch"
         # N above threshold should use numba (when available)
-        assert resolve_backend("auto", N=100_000) == "numba"
+        assert resolve_backend("auto", N=200_000) == "numba"
 
     def test_pytorch_explicit(self):
         assert resolve_backend("pytorch", N=100) == "pytorch"

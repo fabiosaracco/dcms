@@ -98,11 +98,12 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 ### Dettagli implementativi comuni
 - Chunked computation per N > 5000: non materializzare mai la matrice N×N completa, calcolare a blocchi di chunk×N
 - **Backend selezionabile**: ogni solver accetta un parametro `backend` (`"auto"`, `"pytorch"`, `"numba"`).
-  - `"auto"` (default): PyTorch dense per N ≤ 5000, Numba scalar per N > 5000
+  - `"auto"` (default): PyTorch chunked per N ≤ 100 000, Numba scalar per N > 100 000 (soglia aggiornata al 2026-07-13 in base a benchmark reali su DECM N=50k/100k/200k su stella: RAM di picco praticamente identica tra i due backend a tutte le scale — Numba NON offre vantaggio di RAM come si credeva in origine; PyTorch è più veloce fino a N≈50k, Numba diventa ~13-14% più veloce solo da N≥100k)
   - `"pytorch"`: forza PyTorch (dense o chunked a seconda di N)
-  - `"numba"`: forza Numba JIT-compilato (O(N) RAM, nessuna matrice N×N)
+  - `"numba"`: forza Numba JIT-compilato
   - Fallback automatico con warning se il backend richiesto non è disponibile
   - Numba è opzionale: `pip install dcms[numba]`
+  - Nota: Numba non è necessario per supportare Python < 3.9 — PyTorch da solo gira correttamente su Python 3.8 (testato); il vincolo `requires-python>=3.9` in `pyproject.toml` è una scelta di packaging, non un limite tecnico legato al backend
 - Zero-strength/zero-degree nodes: fissare θ = θ_MAX e non aggiornare mai
 - Convergenza: ‖F‖∞ < tol (default 1e-5)
 - Profiling: ogni solver restituisce `SolverResult` con theta, converged, iterations, residuals, elapsed_time, peak_ram_bytes

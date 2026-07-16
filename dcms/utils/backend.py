@@ -4,12 +4,14 @@ Three backends are supported:
 
 * ``"pytorch"`` — dense or chunked PyTorch tensor operations (always available).
 * ``"numba"``   — JIT-compiled scalar loops via Numba (optional dependency).
-* ``"auto"``    — automatic selection: PyTorch chunked for N ≤ 50 000, Numba scalar
-                  for N > 50 000.  Falls back transparently if the preferred
-                  backend is not installed.  At N = 30 000 the chunked PyTorch
-                  path uses ≈ 0.7 GB peak RAM (chunk × N × 8 bytes) and is
-                  ≈ 3.5× faster than Numba, so Numba is only needed for very
-                  large networks (N ≳ 50 000) where physical RAM is a constraint.
+* ``"auto"``    — automatic selection: PyTorch chunked for N ≤ 100 000, Numba
+                  scalar for N > 100 000.  Falls back transparently if the
+                  preferred backend is not installed.  Benchmarked on DECM
+                  (N up to 200 000): peak RAM is essentially identical between
+                  the two backends at every scale tested (Numba is *not* a
+                  RAM-saving option in practice), while PyTorch is faster up
+                  to N ≈ 50 000 and Numba becomes ≈ 13–14% faster only at
+                  N ≥ 100 000.
 
 The :func:`resolve_backend` function is the single entry-point used by every
 solver to decide which kernel set to use at runtime.
@@ -50,10 +52,14 @@ def _has_numba() -> bool:
 # ---------------------------------------------------------------------------
 
 #: Default N threshold above which ``"auto"`` prefers the Numba backend.
-#: PyTorch chunked uses ≈ chunk × N × 8 bytes RAM (about 0.7 GB at N=30 000,
-#: 2.5 GB at N=100 000) and is ≈ 3.5× faster than Numba, so we keep PyTorch
-#: up to N=50 000.  Only truly large networks (N > 50 000) benefit from Numba.
-AUTO_NUMBA_THRESHOLD: int = 50_000
+#: Benchmarked on DECM at N=50k/100k/200k (2026-07-13, stella): peak RAM is
+#: essentially identical between PyTorch (chunked) and Numba at every scale
+#: (≈4.5 GB at N=50k, ≈7.2 GB at N=100k, ≈16.9 GB at N=200k for both) — Numba
+#: offers *no* RAM advantage in practice.  Speed: PyTorch is faster up to
+#: N ≈ 50 000 (e.g. ≈307 s/iter vs ≈373 s/iter at N=50k), while Numba becomes
+#: ≈13–14% faster at N ≥ 100 000 (e.g. 818 s/iter vs 955 s/iter at N=100k).
+#: The threshold is set at the confirmed crossover point.
+AUTO_NUMBA_THRESHOLD: int = 100_000
 
 BackendStr = Literal["auto", "pytorch", "numba"]
 
@@ -108,9 +114,9 @@ def resolve_backend(
                    ``"numba"``).
         N:         Problem size (number of nodes).  Used only when
                    ``backend="auto"`` to decide the crossover (default
-                   threshold: N > 50 000 → Numba).
+                   threshold: N > 100 000 → Numba).
         threshold: N threshold for the ``"auto"`` crossover.  Defaults to
-                   :data:`AUTO_NUMBA_THRESHOLD` (5 000).
+                   :data:`AUTO_NUMBA_THRESHOLD` (100 000).
 
     Returns:
         One of ``"pytorch"`` or ``"numba"`` — the *concrete* backend to use.

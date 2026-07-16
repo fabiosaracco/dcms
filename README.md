@@ -33,7 +33,7 @@ Install from GitHub (the package is not yet on PyPI):
 pip install git+https://github.com/fabiosaracco/dcms.git
 ```
 
-To include optional [Numba](https://numba.pydata.org/) support for large networks (N > 5 000):
+To include optional [Numba](https://numba.pydata.org/) support (only beneficial for very large networks, N ≳ 100 000 — see §3.8 for benchmarked RAM/speed trade-offs):
 
 ```bash
 pip install "dcms[numba] @ git+https://github.com/fabiosaracco/dcms.git"
@@ -192,8 +192,8 @@ The coefficients `c` are found by a small `m×m` least-squares system (O(m²) pe
 
 All four files share the same algorithmic skeleton:
 
-1. **Dense path** (N ≤ 2 000): materialise the N×N probability/weight matrix once per iteration.
-2. **Chunked path** (N > 2 000): process rows in blocks of 512 to keep peak RAM at O(chunk × N) rather than O(N²).
+1. **Dense path** (N ≤ threshold): materialise the N×N probability/weight matrix once per iteration.
+2. **Chunked path** (N > threshold): process rows in blocks of 512 to keep peak RAM at O(chunk × N) rather than O(N²).  The dense/chunked crossover threshold is **5 000** for DCM/DWCM and **2 000** for qDECM/DECM (`DCM_LARGE_N_THRESHOLD`, `DWCM_LARGE_N_THRESHOLD`, `qDECM_LARGE_N_THRESHOLD` in `dcms/models/parameters.py`).
 3. **Node-level Newton fallback**: when `|Δθ_FP| > _FP_NEWTON_FALLBACK_DELTA` for a node, replace the FP step with an exact diagonal Newton step `Δθ = -F_i / (∂F_i/∂θ_i)`.
 4. **Best-θ tracking**: the result always returns the lowest-residual iterate seen, not the final one.
 
@@ -258,7 +258,7 @@ Internally, each file has a `_theta_newton_step_chunked` (and optionally `_theta
 | `_Z_G_CLAMP` | `1e-8` | Minimum `z = θ_out + θ_in` before clamping |
 | `_Z_NEWTON_FLOOR` | `1e-8` | Hard floor on `z` after each Newton step |
 | `_Z_NEWTON_FRAC` | `0.5` | Max fractional decrease of `z` per step (prevents period-2 oscillation) |
-| `max_step` | `1.0` | Max `|Δθ|` per coordinate per step (reduces for heterogeneous hubs) |
+| `max_step` | `1.0` (DCM/DWCM/qDECM), `0.5` (DECM) | Max `|Δθ|` per coordinate per step (reduces for heterogeneous hubs) |
 | `_ANDERSON_BLOWUP_FACTOR` | `5000` | Residual-jump ratio that triggers history clear |
 
 **Literature:**
@@ -365,7 +365,9 @@ Additional model methods:
 | `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess: `"degrees"` (default) or `"random"` |
-| `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.7) | — `DWCMModel`
+| `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.7) |
+
+### 3.2 DWCM — `DWCMModel`
 
 ```python
 from dcms.models.dwcm import DWCMModel
@@ -645,7 +647,7 @@ All solvers accept a `backend` parameter that controls which compute engine exec
 
 | Value | Behaviour |
 |-------|-----------|
-| `"auto"` (default) | PyTorch dense/chunked for N ≤ 50 000; Numba parallel scalar loops for N > 50 000. |
+| `"auto"` (default) | PyTorch chunked for N ≤ 100 000; Numba parallel scalar loops for N > 100 000. |
 | `"pytorch"` | Always use PyTorch (dense or chunked depending on N). |
 | `"numba"` | Always use Numba JIT-compiled scalar loops. |
 
@@ -653,8 +655,12 @@ All solvers accept a `backend` parameter that controls which compute engine exec
 
 **Why two backends?**
 
-* **PyTorch** is a hard dependency and is always available.  For small N it is very fast because it materialises the full N×N matrix once and uses vectorised operations.  For large N the chunked variant avoids OOM but still allocates `chunk × N` temporary tensors.  At N = 30 000 the chunked path uses ≈ 0.7 GB peak RAM and is ≈ 3.5× faster than Numba.
-* **Numba** (optional: `pip install numba`) compiles the update loop to native code with O(N) peak memory.  All kernels are parallelised with `prange` (OpenMP/TBB) so they can use multiple CPU cores.  For N > 50 000 it is the only option that keeps RAM under control.
+Benchmarked on DECM at N = 50 000 / 100 000 / 200 000 (2026-07-13):
+
+* **Peak RAM is essentially identical between the two backends at every scale tested** (≈4.5 GB at N=50k, ≈7.2 GB at N=100k, ≈16.9 GB at N=200k for both PyTorch-chunked and Numba). Numba does **not** offer a RAM advantage in practice — the widely-assumed "Numba saves RAM" rationale is not borne out by measurement.
+* **Speed** is the only real differentiator, and it is scale-dependent: **PyTorch is faster up to N ≈ 50 000** (e.g. ≈307 s/iter vs ≈373 s/iter at N=50k on a representative server), while **Numba becomes ≈13–14% faster only at N ≥ 100 000** (e.g. 818 s/iter vs 955 s/iter at N=100k, 3305 s/iter vs 3820 s/iter at N=200k). The `"auto"` threshold (100 000) is set at this measured crossover point.
+* **Numba is not required for old Python versions either.** PyTorch alone runs correctly on Python 3.8 (tested); `pyproject.toml`'s `requires-python` floor is a packaging choice, not a technical necessity tied to the backend.
+* **Numba** (optional: `pip install numba`) compiles the update loop to native code and is parallelised with `prange` (OpenMP/TBB) so it can use multiple CPU cores; this is its main advantage over PyTorch at very large N, independent of RAM.
 
 **Controlling the number of threads (Numba only).**  Each `solve_tool()` accepts a `num_threads` parameter:
 
@@ -832,11 +838,11 @@ The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which
 
 | Method | Model | Convergence | RAM per iteration | Scales to large N? |
 |--------|-------|-------------|-------------------|--------------------|
-| FP-GS Anderson(10) | DCM, DWCM, qDECM | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 2 000) |
+| FP-GS Anderson(10) | DCM, DWCM, qDECM | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 5 000, or N > 2 000 for qDECM) |
 | θ-Newton Anderson(10) | DCM, DWCM, qDECM | superlinear | O(chunk × N) | ✓ (same chunked path) |
-| Alternating GS-Newton Anderson(10) | DECM | superlinear | O(chunk × N) | ✓ (2 passes per iteration) |
+| Alternating GS-Newton Anderson(10) | DECM | superlinear | O(chunk × N) | ✓ (2 passes per iteration, chunked path for N > 2 000) |
 
-All methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path (N ≤ 2 000) materialises the full N×N matrix once per step; for N > 2 000 rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
+All methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path materialises the full N×N matrix once per step (threshold: N ≤ 5 000 for DCM/DWCM, N ≤ 2 000 for qDECM/DECM); above the threshold rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
 
 The DECM solver performs 2 passes per iteration (out-group and in-group), compared to 1 pass for DCM/DWCM and 2 passes for qDECM.  This makes the per-iteration cost approximately equal to qDECM.
 
@@ -870,7 +876,7 @@ python -m dcms.benchmarks.qdecm_comparison --sizes 1000 --n_seeds 10 --fast
 python -m dcms.benchmarks.qdecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
 
 # DECM comparison (N=1000, 10 seeds)
-python -m dcms.benchmarks.decm_comparison --phase6
+python -m dcms.benchmarks.decm_comparison --n 1000 --n_seeds 10
 
 # DECM at custom size/seeds
 python -m dcms.benchmarks.decm_comparison --n 500 --n_seeds 5

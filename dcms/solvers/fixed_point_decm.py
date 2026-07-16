@@ -756,7 +756,15 @@ def solve_fixed_point_decm(
     # Scale-adaptive Anderson blowup: generous for tiny networks (where wild
     # Anderson excursions can find good iterates), strict for large ones
     # (where residual cascades corrupt history for hundreds of iterations).
-    eff_blowup = max(50.0, min(5000.0, 200_000.0 / N))
+    # EXPERIMENT (crisi_dico2 quasi-fixed-point trap, 2026-07-16): raising
+    # the floor 50 -> 200 lets instabilities run longer before rollback,
+    # giving the trajectory more room to escape a quasi-fixed point instead
+    # of always being pulled back to the same one. Real but modest effect
+    # (~1.8x faster net progress, one genuine escape to a better plateau
+    # observed at N=15168) -- best of the options tried so far (a
+    # recent-anchor rollback, tried as an alternative, was worse: see git
+    # history / RESUME.md). Kept at 200 pending a better idea.
+    eff_blowup = max(200.0, min(5000.0, 200_000.0 / N))
 
     n_iter = 0
     residuals: list[float] = []
@@ -771,6 +779,15 @@ def solve_fixed_point_decm(
     _and_g: list[torch.Tensor] = []
     _and_r: list[torch.Tensor] = []
     _best_res_for_anderson: float = float("inf")
+
+    # EXPERIMENT (crisi_dico2 quasi-fixed-point trap, option 2, 2026-07-16):
+    # tried rolling back to a "recent" anchor (theta from _ROLLBACK_LOOKBACK
+    # iterations ago) instead of the global best_theta, hoping to avoid
+    # always snapping back to the same unstable fixed point. Result was
+    # WORSE: a 15-iteration lookback isn't long enough to guarantee a clean
+    # pre-blowup anchor when the instability itself takes ~14+ iterations to
+    # build, so the rollback landed on an already-corrupted point and
+    # settled into a new, worse quasi-fixed point. Reverted to best_theta.
 
     # Precompute verbose targets once (split into topo and weights parts)
     _v_targets = torch.cat([k_out, k_in, s_out, s_in])
@@ -993,7 +1010,21 @@ def solve_fixed_point_decm(
                 _best_res_for_anderson = min(_best_res_for_anderson, res_norm)
 
                 if _blowup_recovered:
-                    theta_next = theta_fp
+                    # Don't continue from the corrupted current theta: a plain
+                    # Newton step from there still has to crawl back across
+                    # whatever distance the bad Anderson mix introduced, which
+                    # empirically costs 100+ iterations. Restart the plain
+                    # Newton step from the best iterate seen so far instead.
+                    theta_rb, _ = _step(best_theta)
+                    eta_old_rb = best_theta[2 * N :]
+                    eta_new_rb = theta_rb[2 * N :]
+                    _eta_floor_rb = (eta_old_rb * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
+                    eta_new_rb = torch.where(
+                        eta_new_rb > 0,
+                        torch.maximum(eta_new_rb, _eta_floor_rb),
+                        eta_new_rb,
+                    )
+                    theta_next = torch.cat([theta_rb[:2 * N], eta_new_rb])
                 else:
                     r_k = theta_fp - theta
                     # Hub exclusion: zero hub components in r_k so Anderson

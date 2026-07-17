@@ -75,6 +75,7 @@ _STAGNATION_RTOL: float = 0.01
 def _anderson_mixing(
     fp_outputs: list[torch.Tensor],
     residuals_hist: list[torch.Tensor],
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Anderson mixing: compute the next iterate from FP history.
 
@@ -84,6 +85,20 @@ def _anderson_mixing(
     Args:
         fp_outputs:     List of g(θ_k) values, each shape (M,).
         residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (M,).
+        weights:        Optional per-component weight, shape (M,), used only
+                        in the degeneracy-reduced path (see
+                        :func:`solve_fixed_point_decm_degenerate`). The
+                        mixing coefficients are found by minimising a
+                        WEIGHTED norm of the combined residual instead of
+                        the plain L2 norm -- needed because in the reduced
+                        representation each group entry stands in for
+                        ``mult[g]`` original nodes; without this weighting,
+                        a group of 500 identical nodes and a singleton group
+                        would count equally in the least-squares fit, unlike
+                        in the unreduced (per-node) system where the group
+                        of 500 implicitly contributes 500 identical rows.
+                        None (default) reproduces the original unweighted
+                        behaviour exactly.
 
     Returns:
         Anderson-mixed next iterate, shape (M,).
@@ -98,7 +113,10 @@ def _anderson_mixing(
     w = R.abs().max(dim=1, keepdim=True).values.clamp(min=1e-15)
     R_w = R / w
 
-    RtR = R_w.T @ R_w
+    if weights is not None:
+        RtR = R_w.T @ (weights[:, None] * R_w)
+    else:
+        RtR = R_w.T @ R_w
     RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
     ones = torch.ones(m, dtype=RtR.dtype)
     try:
@@ -269,6 +287,227 @@ def _decm_step_dense(
         delta_eta_in < 0,
         (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
         torch.ones(N, dtype=torch.float64),
+    )
+    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
+    eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
+
+    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
+    return theta_new, F_current
+
+
+# -------------------------------------------------------------------------
+# Degenerate-multiplier reduction (Vallarano et al., Sci. Rep. 11:15227, 2021)
+# -------------------------------------------------------------------------
+# Nodes that share the exact same (k_out, s_out, k_in, s_in) 4-tuple have
+# identical (theta_out, eta_out, theta_in, eta_in) at the true DECM
+# solution. Proof sketch: the network log-likelihood is exactly invariant
+# under simultaneously swapping two such nodes' full identities (in AND out
+# roles together), and since the likelihood is strictly concave the unique
+# maximizer must respect that symmetry.
+#
+# IMPORTANT: this requires the FULL 4-tuple to match. Matching only
+# (k_out, s_out) or only (k_in, s_in) is NOT sufficient -- each node's own
+# equation structurally excludes its own self-loop term, and that excluded
+# term depends on the node's own (k_in, s_in) identity (for the out
+# equations) or (k_out, s_out) identity (for the in equations), breaking
+# exact degeneracy on either 2-tuple alone. Verified analytically (a
+# label-swap argument) and confirmed with the user 2026-07-16.
+#
+# Reducing the N per-node unknowns to M := #unique-4-tuples group-level
+# unknowns can shrink the problem substantially for real degree/strength
+# distributions with a heavy low-degree bulk (e.g. one real network in
+# production use: N=15168 -> M=3003, ~5x fewer unknowns and ~25x fewer
+# pairwise entries per iteration).
+
+def compute_degeneracy_groups(
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group nodes by identical (k_out, k_in, s_out, s_in).
+
+    Args:
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+
+    Returns:
+        group_of:  (N,) long tensor mapping each original node to its group
+            index in [0, M).
+        mult:      (M,) float tensor, multiplicity (node count) of each
+            group.
+        k_out_g, k_in_g, s_out_g, s_in_g: (M,) float tensors, the shared
+            target values for each group.
+    """
+    N = k_out.shape[0]
+    key = torch.stack([k_out, k_in, s_out, s_in], dim=1)
+    uniq, group_of = torch.unique(key, dim=0, return_inverse=True)
+    M = uniq.shape[0]
+    mult = torch.zeros(M, dtype=torch.float64)
+    mult.scatter_add_(0, group_of, torch.ones(N, dtype=torch.float64))
+    k_out_g, k_in_g, s_out_g, s_in_g = uniq[:, 0], uniq[:, 1], uniq[:, 2], uniq[:, 3]
+    return group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g
+
+
+def _decm_step_dense_weighted(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    zero_k_out: torch.Tensor,
+    zero_k_in: torch.Tensor,
+    zero_s_out: torch.Tensor,
+    zero_s_in: torch.Tensor,
+    max_step: float,
+    mult: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One alternating GS-Newton step for the degeneracy-reduced DECM.
+
+    Identical algebra to :func:`_decm_step_dense`, generalised so each
+    group ``g`` stands in for ``mult[g]`` original nodes. The "no
+    self-loop" exclusion (``P.fill_diagonal_(0.0)`` in the per-node
+    version) becomes "subtract exactly one diagonal term" here, which is
+    the exact generalisation: a group of ``mult[g]`` identical nodes
+    contributes ``mult[g] * mult[h]`` ordered pairs to group pair ``(g,
+    h)`` when ``g != h``, but only ``mult[g] * (mult[g] - 1)`` when ``g ==
+    h`` (self-pairs excluded). Dividing by ``mult[g]`` to get the
+    per-member equation gives ``sum_h mult[h] * P_gh - P_gg`` -- i.e. the
+    full weighted row sum (diagonal included) minus one diagonal term.
+    With ``mult`` all-ones (M == N, one node per group) this reduces
+    exactly to :func:`_decm_step_dense`'s per-node formula.
+
+    Args:
+        theta:  Current 4M parameter vector [th_out|th_in|eta_out|eta_in],
+            one entry per group.
+        k_out, k_in, s_out, s_in: Group-level target sequences, shape (M,).
+        zero_k_out, zero_k_in, zero_s_out, zero_s_in: Boolean masks, shape
+            (M,).
+        max_step: Maximum |Delta theta| per group per step.
+        mult: Group multiplicities (node count per group), shape (M,).
+
+    Returns:
+        ``(theta_new, F_current)``, both shape (4M,)/(4M,); ``F_current``
+        is the exact per-member residual (identical for every original
+        node in a group), evaluated at the *input* theta.
+    """
+    M = k_out.shape[0]
+    theta_out = theta[:M]
+    theta_in = theta[M : 2 * M]
+    eta_out = theta[2 * M : 3 * M]
+    eta_in = theta[3 * M :]
+
+    # ------- Pass 1: compute all sums at current state -------
+    eta = eta_out[:, None] + eta_in[None, :]       # (M, M)
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    G = -1.0 / torch.expm1(-eta_safe)
+    log_q = -torch.log(torch.expm1(eta_safe))
+    logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+    P = torch.sigmoid(logit_p)
+
+    # NOTE: no fill_diagonal_ here -- P[g,g] is a real, used quantity (the
+    # "would-be self-interaction" of group g), handled via the one-term
+    # diagonal subtraction below rather than blanket zeroing.
+    W = P * G
+    pq = P * (1.0 - P)
+    PGG1 = P * G * (G - 1.0)
+    CORR = pq * G.pow(2)
+
+    P_diag = P.diagonal()
+    W_diag = W.diagonal()
+    pq_diag = pq.diagonal()
+    H_s_diag = (PGG1 + CORR).diagonal()
+
+    k_out_hat = (P * mult[None, :]).sum(1) - P_diag
+    k_in_hat = (P * mult[:, None]).sum(0) - P_diag
+    s_out_hat = (W * mult[None, :]).sum(1) - W_diag
+    s_in_hat = (W * mult[:, None]).sum(0) - W_diag
+
+    H_k_out = ((pq * mult[None, :]).sum(1) - pq_diag).clamp(min=1e-15)
+    H_s_out = (((PGG1 + CORR) * mult[None, :]).sum(1) - H_s_diag).clamp(min=1e-15)
+
+    F_current = torch.cat(
+        [k_out_hat - k_out, k_in_hat - k_in,
+         s_out_hat - s_out, s_in_hat - s_in]
+    )
+
+    # ------- Update θ_out (Newton step on F_k_out) -------
+    delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
+    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
+
+    # ------- Update η_out (Newton step on F_s_out, with z-floor) -------
+    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
+
+    # z_min_out[g] = min over h of eta_gh, excluding the diagonal only for
+    # singleton groups (mult==1: no real edge behind that entry). For
+    # mult>1, the diagonal represents real edges between distinct members
+    # of the same group and must stay eligible for the z-floor guard.
+    eta_for_min = eta_safe.clone()
+    singleton = mult <= 1.0
+    if singleton.any():
+        idx = singleton.nonzero(as_tuple=True)[0]
+        eta_for_min[idx, idx] = float("inf")
+    z_min_out = eta_for_min.min(1).values.clamp(min=_Z_G_CLAMP)
+    nz_in = s_in > 0
+    if nz_in.any():
+        z_min_out = torch.minimum(z_min_out, eta_out + eta_in[nz_in].min())
+
+    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
+    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
+    alpha_out = torch.where(
+        delta_eta_out < 0,
+        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
+        torch.ones(M, dtype=torch.float64),
+    )
+    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
+    eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
+
+    # ------- Pass 2: recompute col sums with updated θ_out, η_out -------
+    eta2 = eta_out_new[:, None] + eta_in[None, :]
+    eta2_safe = eta2.clamp(min=_Z_G_CLAMP)
+    G2 = -1.0 / torch.expm1(-eta2_safe)
+    log_q2 = -torch.log(torch.expm1(eta2_safe))
+    logit_p2 = -theta_out_new[:, None] - theta_in[None, :] + log_q2
+    P2 = torch.sigmoid(logit_p2)
+
+    W2 = P2 * G2
+    pq2 = P2 * (1.0 - P2)
+    PGG1_2 = P2 * G2 * (G2 - 1.0)
+    CORR_2 = pq2 * G2.pow(2)
+
+    P2_diag = P2.diagonal()
+    W2_diag = W2.diagonal()
+    pq2_diag = pq2.diagonal()
+    H_s_in2_diag = (PGG1_2 + CORR_2).diagonal()
+
+    k_in_hat2 = (P2 * mult[:, None]).sum(0) - P2_diag
+    s_in_hat2 = (W2 * mult[:, None]).sum(0) - W2_diag
+    H_k_in2 = ((pq2 * mult[:, None]).sum(0) - pq2_diag).clamp(min=1e-15)
+    H_s_in2 = (((PGG1_2 + CORR_2) * mult[:, None]).sum(0) - H_s_in2_diag).clamp(min=1e-15)
+
+    # ------- Update θ_in (Newton step on F_k_in) -------
+    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
+    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
+
+    # ------- Update η_in (Newton step on F_s_in, with z-floor) -------
+    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
+
+    eta2_for_min = eta2_safe.clone()
+    if singleton.any():
+        idx = singleton.nonzero(as_tuple=True)[0]
+        eta2_for_min[idx, idx] = float("inf")
+    z_min_in = eta2_for_min.min(0).values.clamp(min=_Z_G_CLAMP)
+    nz_out = s_out > 0
+    if nz_out.any():
+        z_min_in = torch.minimum(z_min_in, eta_out_new[nz_out].min() + eta_in)
+
+    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
+    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
+    alpha_in = torch.where(
+        delta_eta_in < 0,
+        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
+        torch.ones(M, dtype=torch.float64),
     )
     eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
     eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
@@ -502,6 +741,7 @@ def _bisect_hub_eta_decm(
     s_target: float,
     self_idx: int,
     n_bisect: int = 60,
+    mult: "np.ndarray | None" = None,
 ) -> float:
     """Find η such that Σ_{j≠i} p_ij(η) · G_ij(η) = s_target via bisection.
 
@@ -528,6 +768,14 @@ def _bisect_hub_eta_decm(
         s_target:    Observed strength to match (must be positive).
         self_idx:    Index of the hub node (to zero out the diagonal term).
         n_bisect:    Number of bisection steps.
+        mult:        Optional group multiplicities, length N (degeneracy-
+                     reduced path only). When given, each "other" index j
+                     stands in for mult[j] original nodes, and the sum is
+                     weighted accordingly with a single diagonal term
+                     subtracted for self-exclusion (same "weighted sum
+                     minus one diagonal entry" pattern as
+                     :func:`_decm_step_dense_weighted`). None (default)
+                     reproduces the original per-node behaviour exactly.
 
     Returns:
         Scalar η* such that f(η*) ≈ s_target.
@@ -545,8 +793,12 @@ def _bisect_hub_eta_decm(
         logit_p = -theta_self - theta_other + log_q
         p = 1.0 / (1.0 + _np.exp(-logit_p))        # sigmoid
         W = p * G
-        W[self_idx] = 0.0                           # exclude diagonal
-        return float(W.sum()) - s_target
+        if mult is not None:
+            total = float((W * mult).sum()) - float(W[self_idx])
+        else:
+            W[self_idx] = 0.0                        # exclude diagonal
+            total = float(W.sum())
+        return total - s_target
 
     # Bracket: [_ETA_MIN, _ETA_MAX]; f is decreasing so f(lo) > 0 > f(hi)
     eta_lo = _ETA_MIN
@@ -593,6 +845,8 @@ def solve_fixed_point_decm(
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
     backtracking_gamma: float = 0.0,
+    mult: torch.Tensor | None = None,
+    weight_anderson: bool = True,
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -648,6 +902,16 @@ def solve_fixed_point_decm(
                         until the condition is met.  Typical value: ``2.0``.
                         Default 0 (disabled).  Anderson history is cleared
                         whenever a dampened step is accepted.
+        mult:           Internal use by :func:`solve_fixed_point_decm_degenerate`.
+                        When provided (shape (M,)), ``k_out``/``k_in``/``s_out``/
+                        ``s_in``/``theta0`` are interpreted as *group-level*
+                        quantities (one entry per unique (k_out,s_out,k_in,s_in)
+                        4-tuple) and the step uses :func:`_decm_step_dense_weighted`
+                        instead of the per-node dense/chunked/Numba paths.
+                        Not compatible with ``hub_sk_threshold`` or
+                        ``backtracking_gamma`` (not yet implemented for the
+                        reduced case) or ``backend="numba"``.  Default None
+                        (standard per-node behaviour, unaffected).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -659,6 +923,17 @@ def solve_fixed_point_decm(
         )
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+    if mult is not None:
+        if backtracking_gamma > 0.0:
+            raise NotImplementedError(
+                "backtracking_gamma is not yet supported together with the "
+                "degeneracy-reduced (mult) path."
+            )
+        if backend == "numba":
+            raise NotImplementedError(
+                "backend='numba' is not yet supported together with the "
+                "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
+            )
 
     # Convert inputs
     def _t(x):
@@ -712,7 +987,14 @@ def solve_fixed_point_decm(
         effective_chunk = chunk_size
 
     # Step function with bound arguments
-    if _use_numba and variant == "theta-newton":
+    if mult is not None:
+        def _step(th):
+            return _decm_step_dense_weighted(
+                th, k_out, k_in, s_out, s_in,
+                zero_k_out, zero_k_in, zero_s_out, zero_s_in,
+                max_step, mult,
+            )
+    elif _use_numba and variant == "theta-newton":
         def _step(th):
             to_ = th[:N].numpy()
             ti_ = th[N:2*N].numpy()
@@ -734,7 +1016,9 @@ def solve_fixed_point_decm(
                 np.concatenate([result[4], result[5], result[6], result[7]])
             )
             return theta_new, F_current
-    if effective_chunk > 0:
+    if mult is not None:
+        pass  # _step already bound to _decm_step_dense_weighted above
+    elif effective_chunk > 0:
         def _step(th):
             return _decm_step_chunked(
                 th, k_out, k_in, s_out, s_in,
@@ -748,6 +1032,16 @@ def solve_fixed_point_decm(
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                 max_step,
             )
+
+    # Anderson mixing needs per-component weights in the degeneracy-reduced
+    # path: each of the 4 blocks [theta_out|theta_in|eta_out|eta_in] has one
+    # entry per group, and a group of multiplicity mult[g] should count
+    # mult[g] times in the mixing least-squares fit -- exactly like it would
+    # if those mult[g] identical nodes were each their own row in the
+    # unreduced (per-node) system (see _anderson_mixing's docstring).
+    _anderson_weights = (
+        torch.cat([mult, mult, mult, mult]) if (mult is not None and weight_anderson) else None
+    )
 
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
@@ -801,6 +1095,9 @@ def solve_fixed_point_decm(
     _hub_active = hub_sk_threshold > 0.0 and not _use_numba
     _hub_out_mask: torch.Tensor | None = None   # shape (N,) bool
     _hub_in_mask: torch.Tensor | None = None
+    # Group multiplicities as numpy, for the weighted hub-bisection sum
+    # (degeneracy-reduced path only; None reproduces the per-node behaviour).
+    _mult_np = mult.numpy() if mult is not None else None
 
     if _hub_active:
         # k_hat ≈ k_out (use observed degrees as proxy; also, a node with
@@ -870,6 +1167,7 @@ def solve_fixed_point_decm(
                             eta_other=_eta_in_cur,
                             s_target=float(s_out[_i].item()),
                             self_idx=_i,
+                            mult=_mult_np,
                         )
                         _th_fp_np[2 * N + _i] = _eta_out_new
                     # --- In-hub pass ---
@@ -882,6 +1180,7 @@ def solve_fixed_point_decm(
                             eta_other=_eta_out_cur,
                             s_target=float(s_in[_j].item()),
                             self_idx=_j,
+                            mult=_mult_np,
                         )
                         _th_fp_np[3 * N + _j] = _eta_in_new
                 theta_fp = torch.from_numpy(_th_fp_np)
@@ -1041,7 +1340,7 @@ def solve_fixed_point_decm(
                         _and_r.pop(0)
 
                     if len(_and_g) >= 2:
-                        theta_next = _anderson_mixing(_and_g, _and_r)
+                        theta_next = _anderson_mixing(_and_g, _and_r, weights=_anderson_weights)
 
                         # Enforce η ≥ _ETA_MIN after mixing
                         theta_next[2 * N :] = theta_next[2 * N :].clamp(min=_ETA_MIN)
@@ -1090,4 +1389,145 @@ def solve_fixed_point_decm(
         elapsed_time=elapsed,
         peak_ram_bytes=peak_ram,
         message=message,
+    )
+
+
+def solve_fixed_point_decm_degenerate(
+    theta0: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    tol: float = 1e-8,
+    max_iter: int = 5000,
+    anderson_depth: int = 10,
+    max_step: float = 0.5,
+    max_time: float = 0.0,
+    backend: str = "auto",
+    num_threads: int = 0,
+    verbose: bool = False,
+    monitor: bool = False,
+    weight_anderson: bool = True,
+    hub_sk_threshold: float = 0.0,
+) -> SolverResult:
+    """Degeneracy-reduced alternating GS-Newton solver for the DECM.
+
+    Groups nodes that share the exact same (k_out, s_out, k_in, s_in)
+    4-tuple -- which are proven to share identical (theta_out, eta_out,
+    theta_in, eta_in) at the true DECM solution, see the module-level note
+    above :func:`compute_degeneracy_groups` -- and solves the resulting
+    M-unknown reduced system (M = number of unique 4-tuples <= N) instead
+    of the full 4N-unknown system. The returned ``SolverResult`` is
+    expanded back to the original per-node shape (4N,) so it is a drop-in
+    replacement for :func:`solve_fixed_point_decm` at the call site.
+
+    ``hub_sk_threshold`` IS supported: hub identification and the exact 1D
+    bisection both operate at group granularity, with the bisection's
+    strength sum weighted by group multiplicity (see
+    :func:`_bisect_hub_eta_decm`'s ``mult`` parameter). Does not (yet)
+    support ``backtracking_gamma`` (unavailable in this reduced path -- see
+    :func:`solve_fixed_point_decm`'s ``mult`` parameter docs) or
+    ``backend="numba"``.
+
+    Args:
+        theta0: Initial guess [theta_out|theta_in|eta_out|eta_in], shape
+            (4N,). Nodes sharing a 4-tuple should already carry identical
+            values here (true for the standard "degrees"-based initial
+            guess); if not, one representative member's value is used for
+            the whole group.
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        (all other args): see :func:`solve_fixed_point_decm`.
+
+    Returns:
+        :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
+        expanded back to shape (4N,).
+    """
+    k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
+    k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
+    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
+    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
+    k_out = k_out.to(dtype=torch.float64)
+    k_in = k_in.to(dtype=torch.float64)
+    s_out = s_out.to(dtype=torch.float64)
+    s_in = s_in.to(dtype=torch.float64)
+    theta0 = (
+        theta0 if isinstance(theta0, torch.Tensor) else torch.tensor(theta0, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+
+    N = k_out.shape[0]
+    group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g = compute_degeneracy_groups(
+        k_out, k_in, s_out, s_in
+    )
+    M = k_out_g.shape[0]
+
+    # Reduce theta0: take one representative member per group (the first
+    # node index encountered). Degenerate nodes are expected to already
+    # carry identical theta0 values (true for "degrees"-based initial
+    # guesses, which are themselves a function of (k, s) alone); this is
+    # only an approximation for initial guesses that break that pattern,
+    # and only affects the *starting point*, not the converged solution.
+    _first_idx = torch.zeros(M, dtype=torch.long)
+    _seen = torch.zeros(M, dtype=torch.bool)
+    _group_of_list = group_of.tolist()
+    for _i, _g in enumerate(_group_of_list):
+        if not _seen[_g]:
+            _seen[_g] = True
+            _first_idx[_g] = _i
+    theta0_g = torch.cat(
+        [
+            theta0[:N][_first_idx],
+            theta0[N : 2 * N][_first_idx],
+            theta0[2 * N : 3 * N][_first_idx],
+            theta0[3 * N :][_first_idx],
+        ]
+    )
+
+    def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
+        zero_k_out_g = k_out_g == 0
+        zero_k_in_g = k_in_g == 0
+        zero_s_out_g = s_out_g == 0
+        zero_s_in_g = s_in_g == 0
+        return _decm_step_dense_weighted(
+            theta_m, k_out_g, k_in_g, s_out_g, s_in_g,
+            zero_k_out_g, zero_k_in_g, zero_s_out_g, zero_s_in_g,
+            max_step, mult,
+        )[1]
+
+    result_g = solve_fixed_point_decm(
+        _residual_fn_g,
+        theta0_g,
+        k_out_g, k_in_g, s_out_g, s_in_g,
+        tol=tol,
+        max_iter=max_iter,
+        variant="theta-newton",
+        anderson_depth=anderson_depth,
+        max_step=max_step,
+        max_time=max_time,
+        backend=backend,
+        num_threads=num_threads,
+        verbose=verbose,
+        monitor=monitor,
+        mult=mult,
+        weight_anderson=weight_anderson,
+        hub_sk_threshold=hub_sk_threshold,
+    )
+
+    def _expand(theta_m):
+        import numpy as np
+        g = group_of.numpy()
+        to_ = theta_m[:M][g]
+        ti_ = theta_m[M : 2 * M][g]
+        eo_ = theta_m[2 * M : 3 * M][g]
+        ei_ = theta_m[3 * M :][g]
+        return np.concatenate([to_, ti_, eo_, ei_])
+
+    return SolverResult(
+        theta=_expand(result_g.theta),
+        best_theta=_expand(result_g.best_theta),
+        converged=result_g.converged,
+        iterations=result_g.iterations,
+        residuals=result_g.residuals,
+        elapsed_time=result_g.elapsed_time,
+        peak_ram_bytes=result_g.peak_ram_bytes,
+        message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
     )

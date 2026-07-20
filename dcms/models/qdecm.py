@@ -418,6 +418,45 @@ class qDECMModel:
         ).item()
         return dot_term + log_total
 
+    def neg_log_likelihood(
+        self,
+        theta_topo: _ArrayLike,
+        theta_weight: _ArrayLike,
+    ) -> float:
+        """Return the qDECM's full (generalized) −L, for both steps together.
+
+        Unlike DCM, DWCM, and DECM, qDECM is not fit by jointly maximising
+        a single log-likelihood: it is solved as two *sequential* steps
+        (topology via a plain DCM, then weights via a DWCM conditioned on
+        that fixed topology). There is therefore no single quantity whose
+        gradient is the residual of *both* steps at once the way DECM's
+        ``neg_log_likelihood`` is. What this method returns is the
+        **generalized likelihood** in the sense of Parisi, F., Squartini, T.,
+        & Garlaschelli, D. (2020), *A faster horse on a safer trail:
+        generalized inference for the efficient reconstruction of weighted
+        networks*, New Journal of Physics, 22, 053053 — the sum of what each
+        step actually maximises:
+
+            −L_generalized(θ_topo, θ_weight) = −L_topo(θ_topo) + −L_w(θ_β | θ_topo)
+
+        where −L_topo is the plain DCM log-likelihood (:meth:`DCMModel.neg_log_likelihood`)
+        and −L_w is the weight-step log-likelihood conditioned on the topology
+        (:meth:`neg_log_likelihood_strength`). This is a diagnostic/reporting
+        quantity (e.g. for AIC/BIC model comparison against DECM) — the solver
+        never minimises it directly; each step is still solved on its own.
+
+        Args:
+            theta_topo:   Topology parameters [θ_out | θ_in], shape (2N,).
+            theta_weight: Weight parameters [θ_β_out | θ_β_in], shape (2N,).
+
+        Returns:
+            Scalar −L_generalized(θ_topo, θ_weight).
+        """
+        return (
+            self._dcm.neg_log_likelihood(theta_topo)
+            + self.neg_log_likelihood_strength(theta_topo, theta_weight)
+        )
+
     # ------------------------------------------------------------------
     # Initial-guess utilities
     # ------------------------------------------------------------------

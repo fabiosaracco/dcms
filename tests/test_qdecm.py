@@ -218,6 +218,36 @@ class TestNegLogLikelihoodStrength:
         assert torch.allclose(grad_fd, -F, atol=1e-4)
 
 
+class TestNegLogLikelihoodGeneralized:
+    """Tests for the full (generalized) qDECM log-likelihood -- the sum of
+    the topology and weight-step log-likelihoods, per Parisi, Squartini &
+    Garlaschelli (2020)."""
+
+    def test_finite(self) -> None:
+        model, theta_topo, theta_weight = make_qdecm_model(N=6)
+        nll = model.neg_log_likelihood(theta_topo, theta_weight)
+        assert np.isfinite(nll)
+
+    def test_equals_sum_of_topo_and_weight_terms(self) -> None:
+        model, theta_topo, theta_weight = make_qdecm_model(N=8, seed=3)
+        nll = model.neg_log_likelihood(theta_topo, theta_weight)
+        expected = (
+            model._dcm.neg_log_likelihood(theta_topo)
+            + model.neg_log_likelihood_strength(theta_topo, theta_weight)
+        )
+        assert nll == pytest.approx(expected)
+
+    def test_matches_full_dcm_likelihood_at_true_topology(self) -> None:
+        """At the true topology solution, the topology term of the
+        generalized likelihood must equal the standalone DCMModel's own
+        neg_log_likelihood on the same (k_out, k_in) -- confirms self._dcm
+        is a faithful, independently-usable DCM sub-model, not a stub."""
+        model, theta_topo, theta_weight = make_qdecm_model(N=8, seed=6)
+        standalone_dcm = DCMModel(model.k_out, model.k_in)
+        assert model._dcm.neg_log_likelihood(theta_topo) == pytest.approx(
+            standalone_dcm.neg_log_likelihood(theta_topo)
+        )
+
 # ---------------------------------------------------------------------------
 # initial_theta_weight
 # ---------------------------------------------------------------------------

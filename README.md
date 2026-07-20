@@ -358,7 +358,15 @@ On real-world networks with heavy-tailed degree/strength distributions, most of 
 | qDECM (weight step) | ita_elections_dico2 | 20914 → 4070 | 23.5× |
 | DECM | crisi_dico2 | 15168 → 3003 | ~10–25× |
 
-**Status:** implemented at the solver-function layer for all four models (`solve_fixed_point_*_degenerate` in each `dcms/solvers/fixed_point_*.py`); not yet wired into the model classes' `solve_tool()` as an opt-in flag — call the standalone functions directly (§3.7) for now.
+**Status:** on by default. Every model's `solve_tool()` accepts `reduce_degeneracy: bool = True` (§3.1-3.4) — set it to `False` to force the full (unreduced) solver. It's automatically bypassed (with a printed note) when the requested options aren't supported by the reduced path: `variant != "theta-newton"`, `backend == "numba"`, or (qDECM/DECM only) `backtracking_gamma > 0`.
+
+```python
+model = DCMModel(k_out, k_in)
+converged = model.solve_tool(tol=1e-9)                       # reduced by default
+converged = model.solve_tool(tol=1e-9, reduce_degeneracy=False)  # force the full solver
+```
+
+The standalone `solve_fixed_point_*_degenerate` functions (§3.7) remain available directly, e.g. to pass a custom residual function or when not using the model wrapper:
 
 **Example:**
 
@@ -401,6 +409,7 @@ converged = model.solve_tool(
     backend="auto",         # "auto" (default), "pytorch", or "numba"
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
+    reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in) into groups (see §2.5); default True
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -433,6 +442,7 @@ converged = model.solve_tool(
     num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
+    reduce_degeneracy=True, # collapse nodes sharing (s_out,s_in) into groups (see §2.5); default True
 )
 theta = model.sol.theta     # converged parameters, shape (2N,)
 ```
@@ -478,6 +488,7 @@ converged = model.solve_tool(
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
+    reduce_degeneracy=True, # collapse degenerate node groups in both steps (see §2.5); default True
 )
 # solve_tool returns True if *both* topology and weight steps converged
 # sol.theta has shape (4N,): [θ_out_topo, θ_in_topo, θ_β_out, θ_β_in]
@@ -525,6 +536,7 @@ converged = model.solve_tool(
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
+    reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]

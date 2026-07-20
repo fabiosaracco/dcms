@@ -106,6 +106,7 @@ _FPGS_NEWTON_AND_DEPTH: int = 5
 def _anderson_mixing(
     fp_outputs: list[torch.Tensor],
     residuals_hist: list[torch.Tensor],
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Anderson mixing: compute the next iterate from history.
 
@@ -128,6 +129,11 @@ def _anderson_mixing(
     Args:
         fp_outputs:     List of g(θ_k) values (FP outputs), each shape (2N,).
         residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (2N,).
+        weights:        Optional per-row multiplicity weight, shape (2N,).
+                        Used by the degeneracy-reduced (``mult``) path -- see
+                        the analogous DECM/DCM/DWCM fix
+                        (``dcms.solvers.fixed_point_decm._anderson_mixing``).
+                        ``None`` (default) reproduces the old behaviour.
 
     Returns:
         Anderson-mixed next iterate θ_{k+1}, shape (2N,).
@@ -144,7 +150,10 @@ def _anderson_mixing(
     R_w = R / w  # (2N, m): each row scaled to max-absolute-value 1
 
     # Normal equations on the weighted system: (R_w^T R_w) c ∝ ones
-    RtR = R_w.T @ R_w  # (m, m)
+    if weights is not None:
+        RtR = R_w.T @ (weights[:, None] * R_w)
+    else:
+        RtR = R_w.T @ R_w  # (m, m)
     RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
     ones = torch.ones(m, dtype=RtR.dtype)
     try:
@@ -717,6 +726,8 @@ def _bisect_hub_beta(
     beta_other: "np.ndarray",
     s_target: float,
     n_bisect: int = 60,
+    self_idx: int | None = None,
+    mult: "np.ndarray | None" = None,
 ) -> float:
     """Find β such that Σ_j p_j / (1 − β·b_j) = s_target via bisection.
 
@@ -730,11 +741,25 @@ def _bisect_hub_beta(
 
     Args:
         p_row:      Connection probabilities to neighbours (length N, diagonal
-                    entry excluded and assumed zero).
+                    entry excluded and assumed zero -- or, in the
+                    degeneracy-reduced path, length M with a real value at
+                    ``self_idx`` that must be excluded via ``mult``).
         beta_other: Current β values of the other side (β_in for an out-hub,
-                    β_out for an in-hub), length N.
+                    β_out for an in-hub), length N (or M, reduced path).
         s_target:   Observed strength to match (must be positive).
         n_bisect:   Number of bisection iterations (default 60).
+        self_idx:   Internal use by the degeneracy-reduced path: index of
+                    this hub's own group within ``p_row``/``beta_other``,
+                    whose term must be excluded from the sum (see ``mult``).
+                    ``None`` (default) reproduces the old per-node behaviour.
+        mult:       Internal use by the degeneracy-reduced path: group
+                    multiplicities, length M. When given (together with
+                    ``self_idx``), the sum becomes the "weighted sum minus
+                    one diagonal term" generalisation used throughout the
+                    reduction (see
+                    ``dcms.solvers.fixed_point_decm._bisect_hub_eta_decm``
+                    for the combinatorial justification). ``None`` (default)
+                    reproduces the old unweighted per-node sum exactly.
 
     Returns:
         Scalar β* such that f(β*) ≈ s_target.
@@ -756,13 +781,155 @@ def _bisect_hub_beta(
         beta_mid = 0.5 * (beta_lo + beta_hi)
         z = beta_mid * beta_other
         z = _np.minimum(z, 1.0 - 1e-12)
-        f = (p_row / (1.0 - z)).sum() - s_target
+        terms = p_row / (1.0 - z)
+        if mult is not None:
+            f = float((terms * mult).sum()) - float(terms[self_idx]) - s_target
+        else:
+            f = terms.sum() - s_target
         if f < 0.0:
             beta_lo = beta_mid
         else:
             beta_hi = beta_mid
 
     return 0.5 * (beta_lo + beta_hi)
+
+
+# -------------------------------------------------------------------------
+# Degeneracy reduction for the weight step (Vallarano et al., Sci Rep
+# 11:15227, 2021)
+# -------------------------------------------------------------------------
+#
+# The qDECM topology step is a plain DCM -- already reduced by
+# solve_fixed_point_dcm_degenerate (2-tuple (k_out,k_in) groups). The weight
+# step's own unknowns (theta_beta_out, theta_beta_in) additionally depend on
+# (s_out, s_in) through the strength targets, so its degeneracy condition is
+# the FULL 4-tuple (k_out,k_in,s_out,s_in) -- exactly DECM's condition (see
+# compute_degeneracy_groups in fixed_point_decm.py), reused as-is rather
+# than re-derived: a node's weight-step equations here are structurally
+# identical to DECM's eta-only sub-problem, just with the geometric weight
+# multiplied by a *fixed* p_ij (from the already-solved topology) instead of
+# p_ij being coupled to the same theta being solved for. Since every node in
+# a weight-degeneracy group already shares the same (k_out,k_in) 2-tuple (a
+# coarser condition implied by sharing the full 4-tuple), it also shares the
+# same theta_topo value -- so reducing theta_topo down to weight-group
+# granularity is always exact, never an approximation.
+
+def _qdecm_step_dense_weighted(
+    theta_weight: torch.Tensor,
+    P: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    max_step: float,
+    mult: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One theta-Newton (GS) step for the degeneracy-reduced qDECM weight step.
+
+    Identical algebra to :func:`_theta_newton_step_dense`, generalised so
+    each group ``g`` stands in for ``mult[g]`` original nodes -- same
+    "weighted sum minus one diagonal term" pattern used throughout the
+    reduction (see DECM's ``_decm_step_dense_weighted`` for the
+    combinatorial justification). ``P`` here is the group-level topology
+    probability matrix (M, M), already fixed (not re-derived from
+    ``theta_weight``). With ``mult`` all-ones (M == N) this reduces exactly
+    to the per-node formula.
+
+    Args:
+        theta_weight: Current 2M parameter vector [theta_b_out|theta_b_in].
+        P: Group-level DCM probability matrix, shape (M, M).
+        s_out, s_in: Group-level target sequences, shape (M,).
+        max_step: Maximum |Delta theta| per group per step.
+        mult: Group multiplicities, shape (M,).
+
+    Returns:
+        ``(theta_new, F_current)``, both shape (2M,).
+    """
+    M = s_out.shape[0]
+    theta_b_out = theta_weight[:M]
+    theta_b_in = theta_weight[M:]
+
+    z = theta_b_out[:, None] + theta_b_in[None, :]
+    z_safe = z.clamp(min=_Z_G_CLAMP)
+    G = -1.0 / torch.expm1(-z_safe)
+    G_diag = G.diagonal()
+
+    PG = P * G
+    PG_diag = PG.diagonal()
+    PGG1 = P * G * (G - 1.0)
+    PGG1_diag = PGG1.diagonal()
+
+    F_out = (PG * mult[None, :]).sum(1) - PG_diag - s_out
+    # F_in_current: the *returned* residual's in-part, evaluated at the
+    # INPUT state (PG, pre-update) -- distinct from F_in below, which is
+    # evaluated at the GS-updated state and used only for the delta_in
+    # Newton step. Mirrors the unreduced dense function's F_in_current vs.
+    # F_in split exactly (see _theta_newton_step_dense).
+    F_in_current = (PG * mult[:, None]).sum(0) - PG_diag - s_in
+    # neg_H_out is the *positive* Hessian magnitude (mirrors the unreduced
+    # chunked path's `neg_H_out = sum_PGG1_out.clamp(min=1e-15)` -- PGG1 is
+    # positive, so no extra negation is needed here, unlike H_out in the
+    # dense per-node function which tracks the raw (<=0) Hessian value).
+    neg_H_out = ((PGG1 * mult[None, :]).sum(1) - PGG1_diag).clamp(min=1e-15)
+    delta_out = (F_out / neg_H_out).clamp(-max_step, max_step)
+
+    nz_in_mask = s_in > 0
+    _z_ls_out = z.clone()
+    singleton = mult <= 1.0
+    if singleton.any():
+        idx = singleton.nonzero(as_tuple=True)[0]
+        _z_ls_out[idx, idx] = float("inf")
+    if not nz_in_mask.all():
+        _z_ls_out[:, ~nz_in_mask] = float("inf")
+    z_min_out = _z_ls_out.min(dim=1).values
+    z_floor_out = torch.clamp(z_min_out * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
+    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
+    needed_out = delta_out.abs().clamp(min=1e-30)
+    alpha_out = torch.where(
+        delta_out < 0,
+        (available_out / needed_out).clamp(max=1.0),
+        torch.ones(M, dtype=theta_b_out.dtype),
+    )
+    theta_b_out_new = (theta_b_out + alpha_out * delta_out).clamp(-_ETA_MAX, _ETA_MAX)
+    theta_b_out_new = torch.where(
+        s_out == 0, torch.full_like(theta_b_out_new, _ETA_MAX), theta_b_out_new
+    )
+
+    z2 = theta_b_out_new[:, None] + theta_b_in[None, :]
+    z2_safe = z2.clamp(min=_Z_G_CLAMP)
+    G2 = -1.0 / torch.expm1(-z2_safe)
+    G2_diag = G2.diagonal()
+
+    PG2 = P * G2
+    PG2_diag = PG2.diagonal()
+    PGG12 = P * G2 * (G2 - 1.0)
+    PGG12_diag = PGG12.diagonal()
+
+    F_in = (PG2 * mult[:, None]).sum(0) - PG2_diag - s_in
+    neg_H_in = ((PGG12 * mult[:, None]).sum(0) - PGG12_diag).clamp(min=1e-15)
+    delta_in = (F_in / neg_H_in).clamp(-max_step, max_step)
+
+    nz_out_mask = s_out > 0
+    _z_ls_in = z2.clone()
+    if singleton.any():
+        idx = singleton.nonzero(as_tuple=True)[0]
+        _z_ls_in[idx, idx] = float("inf")
+    if not nz_out_mask.all():
+        _z_ls_in[~nz_out_mask, :] = float("inf")
+    z_min_in = _z_ls_in.min(dim=0).values
+    z_floor_in = torch.clamp(z_min_in * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
+    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
+    needed_in = delta_in.abs().clamp(min=1e-30)
+    alpha_in = torch.where(
+        delta_in < 0,
+        (available_in / needed_in).clamp(max=1.0),
+        torch.ones(M, dtype=theta_b_in.dtype),
+    )
+    theta_b_in_new = (theta_b_in + alpha_in * delta_in).clamp(-_ETA_MAX, _ETA_MAX)
+    theta_b_in_new = torch.where(
+        s_in == 0, torch.full_like(theta_b_in_new, _ETA_MAX), theta_b_in_new
+    )
+
+    F_current = torch.cat([F_out, F_in_current])
+    return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
 
 
 def solve_fixed_point_qdecm(
@@ -786,6 +953,8 @@ def solve_fixed_point_qdecm(
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
     backtracking_gamma: float = 0.0,
+    mult: torch.Tensor | None = None,
+    weight_anderson: bool = True,
 ) -> SolverResult:
     """Fixed-point iteration for the qDECM weight step.
 
@@ -843,10 +1012,33 @@ def solve_fixed_point_qdecm(
                      (allow at most a 2× residual increase).  Default 0
                      (disabled).  Anderson history is cleared whenever a
                      dampened step is accepted.
+        mult:        Internal use by :func:`solve_fixed_point_qdecm_degenerate`.
+                     When provided (shape (M,)), ``s_out``/``s_in``/``theta0``/
+                     ``theta_topo``/``P`` are interpreted as *group-level*
+                     quantities (one entry per unique weight-degeneracy
+                     group) and the step uses
+                     :func:`_qdecm_step_dense_weighted`. Only supported with
+                     ``variant="theta-newton"`` and ``backend="pytorch"``.
+                     Default None.
+        weight_anderson: Makes Anderson mixing multiplicity-aware in the
+                     reduced (``mult``) path -- see
+                     :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
+                     parameter of the same name. Default True.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
     """
+    if mult is not None:
+        if variant != "theta-newton":
+            raise NotImplementedError(
+                "mult (degeneracy-reduced path) only supports "
+                "variant='theta-newton'."
+            )
+        if backend == "numba":
+            raise NotImplementedError(
+                "backend='numba' is not yet supported together with the "
+                "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
+            )
     if variant not in ("jacobi", "gauss-seidel", "theta-newton"):
         raise ValueError(
             f"Unknown variant {variant!r}. "
@@ -896,7 +1088,13 @@ def solve_fixed_point_qdecm(
         _numba_mod.set_num_threads(_safe_threads)
 
     # Decide chunked vs dense (PyTorch path only)
-    if chunk_size == 0:
+    if mult is not None:
+        # The reduced (mult) path only implements a dense weighted step
+        # (_qdecm_step_dense_weighted) -- M is always << N by construction,
+        # so this mirrors DECM/DCM/DWCM's reduced solvers, which are dense
+        # only too. Force dense regardless of the (M-based) auto-threshold.
+        effective_chunk = 0
+    elif chunk_size == 0:
         effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
     else:
         effective_chunk = chunk_size
@@ -1033,6 +1231,14 @@ def solve_fixed_point_qdecm(
     _v_targets = torch.cat([s_out, s_in])
     _v_nonzero = _v_targets > 0
 
+    # Anderson mixing needs per-component weights in the degeneracy-reduced
+    # path -- see _anderson_mixing's docstring and the analogous DECM/DCM/DWCM fix.
+    _anderson_weights = (
+        torch.cat([mult, mult]) if (mult is not None and weight_anderson) else None
+    )
+    # Group multiplicities as numpy, for the weighted hub-bisection sum.
+    _mult_np = mult.numpy() if mult is not None else None
+
     try:
         for _ in range(max_iter):
             # Wall-clock time limit
@@ -1042,7 +1248,11 @@ def solve_fixed_point_qdecm(
                 )
                 break
 
-            if variant == "theta-newton":
+            if mult is not None:
+                theta_fp, F_current = _qdecm_step_dense_weighted(
+                    theta, P_mat, s_out, s_in, max_step, mult
+                )
+            elif variant == "theta-newton":
                 # θ-space coordinate Newton step.
                 if _use_numba:
                     tbo = theta[:N].numpy()
@@ -1146,7 +1356,9 @@ def solve_fixed_point_qdecm(
                     for _hk, _hi in enumerate(_hub_out_idx):
                         _p_row = _hub_P_out_rows[_hk].numpy()
                         _new_beta = _bisect_hub_beta(
-                            _p_row, _beta_in_fp, s_out[_hi].item()
+                            _p_row, _beta_in_fp, s_out[_hi].item(),
+                            self_idx=(_hi if mult is not None else None),
+                            mult=_mult_np,
                         )
                         if _new_beta > 0.0:
                             _new_theta = float(-_hnp.log(max(_new_beta, 1e-300)))
@@ -1156,7 +1368,9 @@ def solve_fixed_point_qdecm(
                     for _hk, _hj in enumerate(_hub_in_idx):
                         _p_col = _hub_P_in_cols[_hk].numpy()
                         _new_beta = _bisect_hub_beta(
-                            _p_col, _beta_out_fp, s_in[_hj].item()
+                            _p_col, _beta_out_fp, s_in[_hj].item(),
+                            self_idx=(_hj if mult is not None else None),
+                            mult=_mult_np,
                         )
                         if _new_beta > 0.0:
                             _new_theta = float(-_hnp.log(max(_new_beta, 1e-300)))
@@ -1356,7 +1570,7 @@ def solve_fixed_point_qdecm(
                         _and_r.pop(0)
 
                     if len(_and_g) >= 2:
-                        theta_next = _anderson_mixing(_and_g, _and_r)
+                        theta_next = _anderson_mixing(_and_g, _and_r, weights=_anderson_weights)
                         # Geometric floor: prevent Anderson from extrapolating
                         # any θ_i to near 0 (β_i ≈ 1), which would cause blowups.
                         theta_floor = (theta * _ANDERSON_THETA_FLOOR).clamp(
@@ -1490,4 +1704,160 @@ def solve_fixed_point_qdecm(
         elapsed_time=elapsed,
         peak_ram_bytes=peak_ram,
         message=message,
+    )
+
+
+def solve_fixed_point_qdecm_degenerate(
+    theta_topo0: "ArrayLike",  # type: ignore[name-defined]
+    theta_weight0: "ArrayLike",  # type: ignore[name-defined]
+    k_out: "ArrayLike",  # type: ignore[name-defined]
+    k_in: "ArrayLike",  # type: ignore[name-defined]
+    s_out: "ArrayLike",  # type: ignore[name-defined]
+    s_in: "ArrayLike",  # type: ignore[name-defined]
+    tol: float = 1e-8,
+    max_iter: int = 10_000,
+    topo_max_iter: int = 10_000,
+    anderson_depth: int = 10,
+    max_step: float = 1.0,
+    max_time: float = 0.0,
+    backend: str = "auto",
+    num_threads: int = 0,
+    verbose: bool = False,
+    monitor: bool = False,
+    hub_sk_threshold: float = 0.0,
+    weight_anderson: bool = True,
+) -> SolverResult:
+    """Degeneracy-reduced qDECM solver (topology + conditioned-weight step).
+
+    Per the user's guidance: the topology step is a plain DCM, already
+    reduced by :func:`~dcms.solvers.fixed_point_dcm.solve_fixed_point_dcm_degenerate`
+    (2-tuple (k_out,k_in) groups) -- reused here as-is. Only the
+    *conditioned-weight* step needed new reduction work: it depends on the
+    full 4-tuple (k_out,k_in,s_out,s_in), exactly DECM's degeneracy
+    condition, reused via
+    :func:`~dcms.solvers.fixed_point_decm.compute_degeneracy_groups`
+    rather than re-derived (see the module-level note above
+    :func:`_qdecm_step_dense_weighted`).
+
+    Args:
+        theta_topo0: Initial topology guess [theta_out|theta_in], shape (2N,).
+        theta_weight0: Initial weight guess [theta_b_out|theta_b_in], shape (2N,).
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        tol: Convergence tolerance for the weight step (and, since the
+            topology step feeds it, indirectly for topology too via
+            solve_fixed_point_dcm_degenerate's own tol which is set equal).
+        max_iter: Max iterations for the weight step.
+        topo_max_iter: Max iterations for the topology (DCM) step.
+        (all other args): see :func:`solve_fixed_point_qdecm`.
+
+    Returns:
+        :class:`~dcms.solvers.base.SolverResult` for the *weight* step, with
+        ``theta``/``best_theta`` expanded to shape (2N,). The topology
+        solver's convergence status is folded into ``message``.
+    """
+    from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate
+    from dcms.solvers.fixed_point_decm import compute_degeneracy_groups
+
+    k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
+    k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
+    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
+    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
+    k_out, k_in = k_out.to(dtype=torch.float64), k_in.to(dtype=torch.float64)
+    s_out, s_in = s_out.to(dtype=torch.float64), s_in.to(dtype=torch.float64)
+    theta_topo0 = (
+        theta_topo0 if isinstance(theta_topo0, torch.Tensor)
+        else torch.tensor(theta_topo0, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+    theta_weight0 = (
+        theta_weight0 if isinstance(theta_weight0, torch.Tensor)
+        else torch.tensor(theta_weight0, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+
+    N = k_out.shape[0]
+
+    # --- Topology step: plain DCM, already reduced (2-tuple groups) ---
+    # Solved to tighter tolerance than the weight step (matching
+    # qDECMModel.solve_tool's established practice): better topology
+    # precision helps the weight step converge, since p_ij feeds into it
+    # as a fixed input.
+    _topo_tol_help = 1e-3
+    topo_res = solve_fixed_point_dcm_degenerate(
+        theta_topo0, k_out, k_in,
+        tol=tol * _topo_tol_help, max_iter=topo_max_iter, anderson_depth=anderson_depth,
+        max_step=max_step, max_time=max_time, backend=backend,
+        num_threads=num_threads, verbose=verbose, monitor=monitor,
+    )
+    theta_topo = torch.as_tensor(topo_res.best_theta, dtype=torch.float64)
+
+    # --- Weight step: full 4-tuple degeneracy (DECM's grouping, reused) ---
+    group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g = compute_degeneracy_groups(
+        k_out, k_in, s_out, s_in
+    )
+    M = k_out_g.shape[0]
+
+    _first_idx = torch.zeros(M, dtype=torch.long)
+    _seen = torch.zeros(M, dtype=torch.bool)
+    _group_of_list = group_of.tolist()
+    for _i, _g in enumerate(_group_of_list):
+        if not _seen[_g]:
+            _seen[_g] = True
+            _first_idx[_g] = _i
+
+    # Every node in a weight-degeneracy group shares the same (k_out,k_in)
+    # 2-tuple too (a coarser condition implied by the shared 4-tuple), so it
+    # already shares the same theta_topo value -- this reduction is exact,
+    # not an approximation (see module-level note above).
+    theta_topo_out_g = theta_topo[:N][_first_idx]
+    theta_topo_in_g = theta_topo[N:][_first_idx]
+    log_xy_g = -theta_topo_out_g[:, None] - theta_topo_in_g[None, :]
+    P_g = torch.sigmoid(log_xy_g)
+    P_g.fill_diagonal_(0.0)
+
+    theta_weight0_g = torch.cat(
+        [theta_weight0[:N][_first_idx], theta_weight0[N:][_first_idx]]
+    )
+
+    def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
+        return _qdecm_step_dense_weighted(theta_m, P_g, s_out_g, s_in_g, max_step, mult)[1]
+
+    result_g = solve_fixed_point_qdecm(
+        _residual_fn_g,
+        theta_weight0_g,
+        s_out_g, s_in_g,
+        torch.cat([theta_topo_out_g, theta_topo_in_g]),
+        P=P_g,
+        tol=tol,
+        max_iter=max_iter,
+        variant="theta-newton",
+        anderson_depth=anderson_depth,
+        max_step=max_step,
+        max_time=max_time,
+        backend=backend,
+        num_threads=num_threads,
+        verbose=verbose,
+        monitor=monitor,
+        hub_sk_threshold=hub_sk_threshold,
+        mult=mult,
+        weight_anderson=weight_anderson,
+    )
+
+    def _expand(theta_m):
+        import numpy as np
+        g = group_of.numpy()
+        to_ = theta_m[:M][g]
+        ti_ = theta_m[M:][g]
+        return np.concatenate([to_, ti_])
+
+    return SolverResult(
+        theta=_expand(result_g.theta),
+        best_theta=_expand(result_g.best_theta),
+        converged=result_g.converged,
+        iterations=result_g.iterations,
+        residuals=result_g.residuals,
+        elapsed_time=result_g.elapsed_time + topo_res.elapsed_time,
+        peak_ram_bytes=max(result_g.peak_ram_bytes, topo_res.peak_ram_bytes),
+        message=(
+            f"[topo: {topo_res.message}] [weight: {result_g.message} "
+            f"degeneracy-reduced: N={N} -> M={M}]"
+        ),
     )

@@ -847,6 +847,8 @@ def solve_fixed_point_decm(
     backtracking_gamma: float = 0.0,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
+    init_best_theta: torch.Tensor | None = None,
+    init_best_res: float = float("inf"),
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -912,6 +914,23 @@ def solve_fixed_point_decm(
                         ``backtracking_gamma`` (not yet implemented for the
                         reduced case) or ``backend="numba"``.  Default None
                         (standard per-node behaviour, unaffected).
+        init_best_theta: Optional externally-supplied "best theta ever seen"
+                        (same shape as ``theta0``), used to seed this call's
+                        internal best-tracking and Anderson-blowup reference
+                        instead of starting from scratch. Needed for
+                        checkpointed multi-chunk runs: each chunk is normally
+                        a *fresh* call with no memory of the record set by an
+                        earlier chunk, so its own in-call blowup-rollback can
+                        only ever fall back to a chunk-local best -- which
+                        may itself already be far worse than the true
+                        historical record. Passing the true record here lets
+                        the in-call rollback (and the returned
+                        ``best_theta``/``mre``) stay anchored to it across
+                        chunk boundaries. Default None (old behaviour:
+                        start from ``theta0`` with no prior record).
+        init_best_res:  The residual (MRE) achieved by ``init_best_theta``.
+                        Required (and meaningful) only together with
+                        ``init_best_theta``. Default ``inf``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -1065,14 +1084,21 @@ def solve_fixed_point_decm(
     converged = False
     message = "Maximum iterations reached without convergence."
 
-    best_theta: torch.Tensor = theta.clone()
-    best_theta_res: float = float("inf")
+    if init_best_theta is not None:
+        best_theta: torch.Tensor = _t(init_best_theta).clone()
+        best_theta_res: float = float(init_best_res)
+    else:
+        best_theta = theta.clone()
+        best_theta_res = float("inf")
     best_res_recent: float = float("inf")
     best_res_old: float = float("inf")
 
     _and_g: list[torch.Tensor] = []
     _and_r: list[torch.Tensor] = []
-    _best_res_for_anderson: float = float("inf")
+    # Seeded from the same external record (when given) so the Anderson
+    # blowup guard compares against the true cross-chunk best, not just
+    # whatever this chunk has seen so far (see init_best_theta docstring).
+    _best_res_for_anderson: float = best_theta_res
 
     # EXPERIMENT (crisi_dico2 quasi-fixed-point trap, option 2, 2026-07-16):
     # tried rolling back to a "recent" anchor (theta from _ROLLBACK_LOOKBACK
@@ -1389,6 +1415,7 @@ def solve_fixed_point_decm(
         elapsed_time=elapsed,
         peak_ram_bytes=peak_ram,
         message=message,
+        best_mre=best_theta_res,
     )
 
 
@@ -1409,6 +1436,8 @@ def solve_fixed_point_decm_degenerate(
     monitor: bool = False,
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
+    init_best_theta: torch.Tensor | None = None,
+    init_best_res: float = float("inf"),
 ) -> SolverResult:
     """Degeneracy-reduced alternating GS-Newton solver for the DECM.
 
@@ -1437,6 +1466,16 @@ def solve_fixed_point_decm_degenerate(
             the whole group.
         k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
         (all other args): see :func:`solve_fixed_point_decm`.
+        init_best_theta: Optional externally-supplied record theta, same
+            expanded per-node shape (4N,) as ``theta0``/``best_theta``
+            (i.e. *not* pre-reduced) -- reduced internally the same way as
+            ``theta0``. Since a genuine cross-chunk record from this same
+            reduced solver is always exactly uniform within each degeneracy
+            group already, this reduction is exact (not an approximation,
+            unlike the analogous step for an arbitrary ``theta0``). See
+            :func:`solve_fixed_point_decm`'s ``init_best_theta`` docs for why
+            this matters.
+        init_best_res: The residual (MRE) achieved by ``init_best_theta``.
 
     Returns:
         :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
@@ -1482,6 +1521,21 @@ def solve_fixed_point_decm_degenerate(
         ]
     )
 
+    init_best_theta_g = None
+    if init_best_theta is not None:
+        _ibt = (
+            init_best_theta if isinstance(init_best_theta, torch.Tensor)
+            else torch.tensor(init_best_theta, dtype=torch.float64)
+        ).to(dtype=torch.float64)
+        init_best_theta_g = torch.cat(
+            [
+                _ibt[:N][_first_idx],
+                _ibt[N : 2 * N][_first_idx],
+                _ibt[2 * N : 3 * N][_first_idx],
+                _ibt[3 * N :][_first_idx],
+            ]
+        )
+
     def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
         zero_k_out_g = k_out_g == 0
         zero_k_in_g = k_in_g == 0
@@ -1510,6 +1564,8 @@ def solve_fixed_point_decm_degenerate(
         mult=mult,
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
+        init_best_theta=init_best_theta_g,
+        init_best_res=init_best_res,
     )
 
     def _expand(theta_m):
@@ -1530,4 +1586,5 @@ def solve_fixed_point_decm_degenerate(
         elapsed_time=result_g.elapsed_time,
         peak_ram_bytes=result_g.peak_ram_bytes,
         message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
+        best_mre=result_g.best_mre,
     )

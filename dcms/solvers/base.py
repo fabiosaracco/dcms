@@ -47,6 +47,7 @@ class SolverResult:
     elapsed_time: float = 0.0
     peak_ram_bytes: int = 0
     message: str = ""
+    best_mre: float | None = None
 
     # ------------------------------------------------------------------
     # Convenience helpers
@@ -56,9 +57,19 @@ class SolverResult:
     def mre(self) -> float:
         """MRE at the best iterate (``best_theta``).
 
+        Uses ``best_mre`` when the solver set it explicitly -- needed for
+        solvers that accept an externally-seeded record (e.g. DECM's
+        ``init_best_theta``/``init_best_res``): if that seeded record is
+        never beaten during this call, ``best_theta`` correctly stays equal
+        to the seed, but ``residuals`` only ever contains *this call's own*
+        iteration history and would silently disagree. Falls back to the
+        historical ``min(residuals)`` definition otherwise.
+
         For single-phase solvers (DCM, DECM, DWCM): ``min(residuals)``.
         For qDECM (two-phase): ``max(min(residuals_topo), min(residuals_weights))``.
         """
+        if self.best_mre is not None:
+            return self.best_mre
         if self.residuals:
             return min(self.residuals)
         if self.residuals_topo and self.residuals_weights:

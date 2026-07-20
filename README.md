@@ -332,6 +332,55 @@ print(model.sol.mre)
 
 ---
 
+### 2.5 Degeneracy reduction — collapsing symmetric nodes into groups
+
+Two nodes that share the exact same **sufficient statistics** — the observed sequences that pin down the model's Lagrange multipliers — provably have **identical multipliers at the true solution**. This follows from a label-swap symmetry argument: swapping the labels of two such nodes leaves the log-likelihood unchanged, and since the log-likelihood is strictly concave, its unique maximiser must be symmetric under that swap (Vallarano, N. et al. (2021), *Scientific Reports*, 11, 15227).
+
+| Model | Sufficient statistics (degeneracy key) |
+|---|---|
+| DCM | `(k_out, k_in)` |
+| DWCM | `(s_out, s_in)` |
+| qDECM (conditioned-weight step only — the topology step is a plain DCM) | `(k_out, k_in, s_out, s_in)` |
+| DECM | `(k_out, k_in, s_out, s_in)` |
+
+On real-world networks with heavy-tailed degree/strength distributions, most of the tail shares a small number of distinct low-degree/low-strength value combinations, so the number of **groups** `M` (unique keys) is often far smaller than the number of nodes `N`. Solving for `M` group-level unknowns instead of `N` per-node unknowns turns the O(N²) pairwise compute into O(M²) — measured **10–67× faster** on real networks (see table below), with the group and per-node solutions agreeing to machine precision (or the model's own convergence tolerance) once expanded back to per-node shape.
+
+> **DCM has a genuine 1-parameter gauge freedom** (`θ_out += c, θ_in -= c` leaves every `p_ij` unchanged), so the full and reduced solvers are not expected to land on identical raw θ unless both are very tightly converged — compare via the gauge-invariant `p_ij` matrix instead.
+
+**Measured on real bowtie2 networks** (`tol≈1e-9/1e-10`, `theta-newton`, `anderson_depth=10`):
+
+| Model | Network | N → M | Speedup |
+|---|---|---|---|
+| DCM | crisi_dico3 | 1304 → 61 | 24.2× |
+| DCM | ita_elections_dico2 | 20914 → 2310 | 43.5× |
+| DWCM | crisi_dico2 | 15168 → 1860 | 47.1× |
+| DWCM | crisis_dwcm | 31874 → 3083 | 66.8× |
+| qDECM (weight step) | ita_elections_dico2 | 20914 → 4070 | 23.5× |
+| DECM | crisi_dico2 | 15168 → 3003 | ~10–25× |
+
+**Status:** implemented at the solver-function layer for all four models (`solve_fixed_point_*_degenerate` in each `dcms/solvers/fixed_point_*.py`); not yet wired into the model classes' `solve_tool()` as an opt-in flag — call the standalone functions directly (§3.7) for now.
+
+**Example:**
+
+```python
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate
+
+model = DCMModel(k_out, k_in)
+theta0 = model.initial_theta("degrees")
+
+result = solve_fixed_point_dcm_degenerate(
+    theta0, k_out, k_in,
+    tol=1e-9, max_iter=2000, anderson_depth=10,
+)
+# result.theta / result.best_theta are already expanded back to shape (2N,) —
+# a drop-in replacement for solve_fixed_point_dcm's return value.
+print(result.converged, result.mre, result.message)  # message reports "N=... -> M=..."
+```
+
+`solve_fixed_point_dwcm_degenerate` and `solve_fixed_point_qdecm_degenerate` follow the same pattern (`s_out, s_in` in place of `k_out, k_in`; qDECM additionally needs `theta_topo0`/`k_out`/`k_in` since it also runs the topology step internally). `solve_fixed_point_decm_degenerate` additionally supports `hub_sk_threshold` (§2.3) and `weight_anderson` (multiplicity-aware Anderson mixing, on by default — needed because a degeneracy class of `mult` identical nodes must count `mult` times in the Anderson least-squares fit to match the unreduced system exactly).
+
+---
+
 ## 3. API Reference
 
 All three models expose a unified `solve_tool()` method.  Instantiate with the observed sequences, call `solve_tool()`, and inspect the stored result.
@@ -639,6 +688,14 @@ result = solve_fixed_point_dcm(
 
 `solve_fixed_point_dwcm` and `solve_fixed_point_qdecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; qDECM additionally requires `theta_topo`).
 
+Each of the four models also has a **degeneracy-reduced** counterpart —
+`solve_fixed_point_dcm_degenerate`, `solve_fixed_point_dwcm_degenerate`,
+`solve_fixed_point_qdecm_degenerate`, `solve_fixed_point_decm_degenerate` —
+that automatically groups nodes with identical sufficient statistics and
+solves the resulting smaller system, expanding the result back to the
+original per-node shape. See §2.5 for the rationale, measured speedups, and
+a usage example.
+
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 
 ### 3.8 Compute backend and parallelism
@@ -845,6 +902,8 @@ The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which
 All methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path materialises the full N×N matrix once per step (threshold: N ≤ 5 000 for DCM/DWCM, N ≤ 2 000 for qDECM/DECM); above the threshold rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
 
 The DECM solver performs 2 passes per iteration (out-group and in-group), compared to 1 pass for DCM/DWCM and 2 passes for qDECM.  This makes the per-iteration cost approximately equal to qDECM.
+
+**Degeneracy-reduced variants** (§2.5) replace the O(N²) pairwise compute with O(M²), where `M` is the number of distinct sufficient-statistics groups — on real-world networks with heavy-tailed degree/strength distributions, typically `M ≪ N`, giving 10–67× measured wall-clock speedups.
 
 ---
 

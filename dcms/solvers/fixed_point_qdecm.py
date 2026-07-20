@@ -1756,24 +1756,14 @@ def solve_fixed_point_qdecm_degenerate(
         solver's convergence status is folded into ``message``.
     """
     from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate
-    from dcms.solvers.fixed_point_decm import compute_degeneracy_groups
 
     k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
     k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
-    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
-    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
     k_out, k_in = k_out.to(dtype=torch.float64), k_in.to(dtype=torch.float64)
-    s_out, s_in = s_out.to(dtype=torch.float64), s_in.to(dtype=torch.float64)
     theta_topo0 = (
         theta_topo0 if isinstance(theta_topo0, torch.Tensor)
         else torch.tensor(theta_topo0, dtype=torch.float64)
     ).to(dtype=torch.float64)
-    theta_weight0 = (
-        theta_weight0 if isinstance(theta_weight0, torch.Tensor)
-        else torch.tensor(theta_weight0, dtype=torch.float64)
-    ).to(dtype=torch.float64)
-
-    N = k_out.shape[0]
 
     # --- Topology step: plain DCM, already reduced (2-tuple groups) ---
     # Solved to tighter tolerance than the weight step (matching
@@ -1788,6 +1778,87 @@ def solve_fixed_point_qdecm_degenerate(
         num_threads=num_threads, verbose=verbose, monitor=monitor,
     )
     theta_topo = torch.as_tensor(topo_res.best_theta, dtype=torch.float64)
+
+    weight_res = solve_fixed_point_qdecm_weight_degenerate(
+        theta_topo, theta_weight0, k_out, k_in, s_out, s_in,
+        tol=tol, max_iter=max_iter, anderson_depth=anderson_depth,
+        max_step=max_step, max_time=max_time, backend=backend,
+        num_threads=num_threads, verbose=verbose, monitor=monitor,
+        hub_sk_threshold=hub_sk_threshold, weight_anderson=weight_anderson,
+    )
+
+    return SolverResult(
+        theta=weight_res.theta,
+        best_theta=weight_res.best_theta,
+        converged=weight_res.converged,
+        iterations=weight_res.iterations,
+        residuals=weight_res.residuals,
+        elapsed_time=weight_res.elapsed_time + topo_res.elapsed_time,
+        peak_ram_bytes=max(weight_res.peak_ram_bytes, topo_res.peak_ram_bytes),
+        message=f"[topo: {topo_res.message}] [weight: {weight_res.message}]",
+    )
+
+
+def solve_fixed_point_qdecm_weight_degenerate(
+    theta_topo: "ArrayLike",  # type: ignore[name-defined]
+    theta_weight0: "ArrayLike",  # type: ignore[name-defined]
+    k_out: "ArrayLike",  # type: ignore[name-defined]
+    k_in: "ArrayLike",  # type: ignore[name-defined]
+    s_out: "ArrayLike",  # type: ignore[name-defined]
+    s_in: "ArrayLike",  # type: ignore[name-defined]
+    tol: float = 1e-8,
+    max_iter: int = 10_000,
+    anderson_depth: int = 10,
+    max_step: float = 1.0,
+    max_time: float = 0.0,
+    backend: str = "auto",
+    num_threads: int = 0,
+    verbose: bool = False,
+    monitor: bool = False,
+    hub_sk_threshold: float = 0.0,
+    weight_anderson: bool = True,
+) -> SolverResult:
+    """Degeneracy-reduced qDECM **weight step only**, given an already-solved
+    (or otherwise fixed) topology.
+
+    Factored out of :func:`solve_fixed_point_qdecm_degenerate` so callers
+    that already have `theta_topo` from a separate topology solve (e.g.
+    :meth:`~dcms.models.qdecm.qDECMModel.solve_tool`, which tracks topology
+    and weight `SolverResult`s separately for its `residuals_topo`/
+    `residuals_weights` fields) don't need to re-solve or duplicate the
+    reduction logic. `solve_fixed_point_qdecm_degenerate` is the
+    convenience entry point when you don't already have a topology
+    solution; this is the lower-level piece it's built from.
+
+    Args:
+        theta_topo: Topology parameters [theta_out|theta_in], shape (2N,)
+            (e.g. from :func:`~dcms.solvers.fixed_point_dcm.solve_fixed_point_dcm_degenerate`).
+        theta_weight0: Initial weight guess [theta_b_out|theta_b_in], shape (2N,).
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        (all other args): see :func:`solve_fixed_point_qdecm`.
+
+    Returns:
+        :class:`~dcms.solvers.base.SolverResult` for the weight step, with
+        ``theta``/``best_theta`` expanded to shape (2N,).
+    """
+    from dcms.solvers.fixed_point_decm import compute_degeneracy_groups
+
+    k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
+    k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
+    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
+    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
+    k_out, k_in = k_out.to(dtype=torch.float64), k_in.to(dtype=torch.float64)
+    s_out, s_in = s_out.to(dtype=torch.float64), s_in.to(dtype=torch.float64)
+    theta_topo = (
+        theta_topo if isinstance(theta_topo, torch.Tensor)
+        else torch.tensor(theta_topo, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+    theta_weight0 = (
+        theta_weight0 if isinstance(theta_weight0, torch.Tensor)
+        else torch.tensor(theta_weight0, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+
+    N = k_out.shape[0]
 
     # --- Weight step: full 4-tuple degeneracy (DECM's grouping, reused) ---
     group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g = compute_degeneracy_groups(
@@ -1806,7 +1877,8 @@ def solve_fixed_point_qdecm_degenerate(
     # Every node in a weight-degeneracy group shares the same (k_out,k_in)
     # 2-tuple too (a coarser condition implied by the shared 4-tuple), so it
     # already shares the same theta_topo value -- this reduction is exact,
-    # not an approximation (see module-level note above).
+    # not an approximation (see module-level note above
+    # _qdecm_step_dense_weighted).
     theta_topo_out_g = theta_topo[:N][_first_idx]
     theta_topo_in_g = theta_topo[N:][_first_idx]
     log_xy_g = -theta_topo_out_g[:, None] - theta_topo_in_g[None, :]
@@ -1854,10 +1926,7 @@ def solve_fixed_point_qdecm_degenerate(
         converged=result_g.converged,
         iterations=result_g.iterations,
         residuals=result_g.residuals,
-        elapsed_time=result_g.elapsed_time + topo_res.elapsed_time,
-        peak_ram_bytes=max(result_g.peak_ram_bytes, topo_res.peak_ram_bytes),
-        message=(
-            f"[topo: {topo_res.message}] [weight: {result_g.message} "
-            f"degeneracy-reduced: N={N} -> M={M}]"
-        ),
+        elapsed_time=result_g.elapsed_time,
+        peak_ram_bytes=result_g.peak_ram_bytes,
+        message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
     )

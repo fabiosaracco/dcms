@@ -411,3 +411,30 @@ class TestDegeneracyReduction:
             f"reduced (M={len(k_out_g)}) should be meaningfully faster than "
             f"full (N={len(k_out)}): reduced={t_red:.3f}s, full={t_full:.3f}s"
         )
+
+    def test_solve_tool_reduce_degeneracy_default_true(self) -> None:
+        """solve_tool() must use the reduced path by default and agree with
+        reduce_degeneracy=False."""
+        model, k_out, k_in = self._degenerate_model()
+        m1 = DCMModel(k_out, k_in)
+        conv1 = m1.solve_tool(tol=1e-9, max_iter=2000)
+        assert conv1 and "degeneracy-reduced" in m1.sol.message
+
+        m2 = DCMModel(k_out, k_in)
+        conv2 = m2.solve_tool(tol=1e-9, max_iter=2000, reduce_degeneracy=False)
+        assert conv2 and "degeneracy-reduced" not in m2.sol.message
+
+        P1 = 1.0 / (1.0 + np.exp(m1.sol.best_theta[:len(k_out), None] + m1.sol.best_theta[None, len(k_out):]))
+        P2 = 1.0 / (1.0 + np.exp(m2.sol.best_theta[:len(k_out), None] + m2.sol.best_theta[None, len(k_out):]))
+        np.fill_diagonal(P1, 0.0)
+        np.fill_diagonal(P2, 0.0)
+        assert np.max(np.abs(P1 - P2)) < 1e-6
+
+    def test_solve_tool_falls_back_for_gauss_seidel(self) -> None:
+        """reduce_degeneracy=True with variant='gauss-seidel' must fall back
+        to the full solver (not silently ignore the requested variant)."""
+        model, k_out, k_in = self._degenerate_model()
+        m = DCMModel(k_out, k_in)
+        conv = m.solve_tool(tol=1e-9, max_iter=2000, variant="gauss-seidel")
+        assert conv
+        assert "degeneracy-reduced" not in m.sol.message

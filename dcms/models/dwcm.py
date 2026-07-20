@@ -392,7 +392,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False)-> SolverResult:
+    def solve_tool(self, ic='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, reduce_degeneracy:bool=True)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -420,6 +420,16 @@ class DWCMModel:
             monitor (bool): If ``True`` (and ``verbose=True``), overwrite the
                 same terminal line at each iteration (``end='\\r'``) so only
                 the latest status is visible.  Default=False.
+            reduce_degeneracy (bool): If ``True`` (default), nodes sharing the
+                exact same ``(s_out, s_in)`` pair are collapsed into a single
+                group before solving (see README §2.5) — solves M ≤ N group
+                unknowns instead of N per-node ones, often 10-70x faster on
+                real networks with heavy-tailed strength distributions.
+                Mathematically exact (not an approximation); the returned
+                ``theta``/``best_theta`` are expanded back to shape ``(2N,)``.
+                Only supported with ``variant="theta-newton"`` and
+                ``backend != "numba"``; silently falls back to the full
+                (unreduced) solver otherwise, with a printed note.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
@@ -428,8 +438,20 @@ class DWCMModel:
             self.ic = self.initial_theta(ic)
         else:
             self.ic = torch.as_tensor(ic, dtype=torch.float64)
-        from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
-        self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+
+        _use_reduced = reduce_degeneracy and variant == "theta-newton" and backend != "numba"
+        if reduce_degeneracy and not _use_reduced:
+            print(
+                "reduce_degeneracy=True requires variant='theta-newton' and "
+                "backend!='numba' -- falling back to the full (unreduced) solver."
+            )
+
+        if _use_reduced:
+            from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm_degenerate  # lazy import to avoid circular dependency
+            self.sol = solve_fixed_point_dwcm_degenerate(self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+        else:
+            from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
+            self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
         if len(self.sol.message)>0:
             print(self.sol.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
             

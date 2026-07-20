@@ -485,4 +485,28 @@ class TestDegeneracyReduction:
         max_diff = np.max(np.abs(W_f - W_r))
         assert max_diff < 1e-2, f"E[w] mismatch full vs reduced: {max_diff:.3e}"
 
+    def test_solve_tool_reduce_degeneracy_default_true(self) -> None:
+        """solve_tool() must use the reduced path by default (both topology
+        and weight steps) and agree with reduce_degeneracy=False."""
+        k_out, k_in, s_out, s_in = self._degenerate_network()
+        m1 = qDECMModel(k_out, k_in, s_out, s_in)
+        conv1 = m1.solve_tool(tol=1e-9, max_iter=2000)
+        assert conv1
+        assert "degeneracy-reduced" in m1.sol.message
+
+        m2 = qDECMModel(k_out, k_in, s_out, s_in)
+        conv2 = m2.solve_tool(tol=1e-9, max_iter=2000, reduce_degeneracy=False)
+        assert conv2
+        assert "degeneracy-reduced" not in m2.sol.message
+
+    def test_solve_tool_falls_back_for_backtracking_gamma(self) -> None:
+        """reduce_degeneracy=True with backtracking_gamma>0 must fall back
+        to the full solver (backtracking isn't supported in the reduced
+        path)."""
+        k_out, k_in, s_out, s_in = self._degenerate_network()
+        m = qDECMModel(k_out, k_in, s_out, s_in)
+        conv = m.solve_tool(tol=1e-9, max_iter=2000, backtracking_gamma=1.2)
+        assert conv
+        assert "degeneracy-reduced" not in m.sol.message
+
 

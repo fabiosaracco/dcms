@@ -585,6 +585,7 @@ class DECMModel:
         monitor: bool = False,
         hub_sk_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
+        reduce_degeneracy: bool = True,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -647,14 +648,37 @@ class DECMModel:
                            ``backtracking_gamma`` times the current residual,
                            the step is halved (up to 5 times).  Typical value:
                            ``2.0``.  Default=0.0 (disabled).
+            reduce_degeneracy: If ``True`` (default), nodes sharing the exact
+                           same ``(k_out, k_in, s_out, s_in)`` 4-tuple are
+                           collapsed into a single group before solving (see
+                           README §2.5) — solves M ≤ N group unknowns instead
+                           of N per-node ones, often 10-25x faster on real
+                           networks with heavy-tailed degree/strength
+                           distributions. Mathematically exact (not an
+                           approximation). Only supported with
+                           ``variant="theta-newton"``, ``backend != "numba"``,
+                           and ``backtracking_gamma == 0.0``; silently falls
+                           back to the full (unreduced) solver otherwise,
+                           with a printed note.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
         """
         import torch as _torch
-        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm, solve_fixed_point_decm_degenerate
 
         _FALLBACK_ICS = ["qdecm", "random"]
+
+        _use_reduced = (
+            reduce_degeneracy and variant == "theta-newton"
+            and backend != "numba" and backtracking_gamma == 0.0
+        )
+        if reduce_degeneracy and not _use_reduced:
+            print(
+                "reduce_degeneracy=True requires variant='theta-newton', "
+                "backend!='numba', and backtracking_gamma==0.0 -- falling "
+                "back to the full (unreduced) solver."
+            )
 
         t_global_start = _time.perf_counter()
 
@@ -671,6 +695,23 @@ class DECMModel:
                 if theta0_override is not None
                 else self.initial_theta(ic_name)
             )
+            if _use_reduced:
+                return solve_fixed_point_decm_degenerate(
+                    theta0=theta0,
+                    k_out=self.k_out,
+                    k_in=self.k_in,
+                    s_out=self.s_out,
+                    s_in=self.s_in,
+                    tol=tol,
+                    max_iter=max_iter,
+                    anderson_depth=anderson_depth,
+                    max_time=_remaining(),
+                    backend=backend,
+                    num_threads=num_threads,
+                    verbose=verbose,
+                    monitor=monitor,
+                    hub_sk_threshold=hub_sk_threshold,
+                )
             return solve_fixed_point_decm(
                 residual_fn=self.residual,
                 theta0=theta0,

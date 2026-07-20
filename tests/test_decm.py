@@ -430,3 +430,30 @@ class TestDECMSolverConvergence:
         # Even if not converged, the best iterate should be reasonable
         err = model.constraint_error(model.sol.best_theta)
         assert err < 1.0  # sanity check: not wildly wrong
+
+    def test_solve_tool_reduce_degeneracy_default_true(self):
+        """solve_tool() must use the reduced path by default (message tags
+        it) and reduce_degeneracy=False must still converge to the same
+        solution."""
+        model, _ = make_decm_model(N=10, seed=0)
+        m1 = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
+        conv1 = m1.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10)
+        assert conv1
+        assert "degeneracy-reduced" in m1.sol.message
+
+        m2 = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
+        conv2 = m2.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10, reduce_degeneracy=False)
+        assert conv2
+        assert "degeneracy-reduced" not in m2.sol.message
+
+        assert m1.constraint_error(m1.sol.best_theta) < CONV_TOL * 10
+        assert m2.constraint_error(m2.sol.best_theta) < CONV_TOL * 10
+
+    def test_solve_tool_falls_back_for_backtracking_gamma(self):
+        """reduce_degeneracy=True with backtracking_gamma>0 must fall back
+        to the full solver (not supported in the reduced path)."""
+        model, _ = make_decm_model(N=10, seed=0)
+        m = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
+        conv = m.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10, backtracking_gamma=1.2)
+        assert conv
+        assert "degeneracy-reduced" not in m.sol.message

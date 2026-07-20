@@ -564,3 +564,24 @@ class TestDegeneracyReduction:
             f"reduced (M={len(s_out_g)}) should be meaningfully faster than "
             f"full (N={len(s_out)}): reduced={t_red:.3f}s, full={t_full:.3f}s"
         )
+
+    def test_solve_tool_reduce_degeneracy_default_true(self) -> None:
+        """solve_tool() must use the reduced path by default and agree with
+        reduce_degeneracy=False."""
+        model = self._degenerate_model()
+        m1 = DWCMModel(model.s_out, model.s_in)
+        conv1 = m1.solve_tool(tol=1e-9, max_iter=2000)
+        assert conv1 and "degeneracy-reduced" in m1.sol.message
+
+        m2 = DWCMModel(model.s_out, model.s_in)
+        conv2 = m2.solve_tool(tol=1e-9, max_iter=2000, reduce_degeneracy=False)
+        assert conv2 and "degeneracy-reduced" not in m2.sol.message
+
+        N = model.N
+        z1 = m1.sol.best_theta[:N, None] + m1.sol.best_theta[None, N:]
+        z2 = m2.sol.best_theta[:N, None] + m2.sol.best_theta[None, N:]
+        W1 = 1.0 / np.expm1(np.clip(z1, 1e-15, None))
+        W2 = 1.0 / np.expm1(np.clip(z2, 1e-15, None))
+        np.fill_diagonal(W1, 0.0)
+        np.fill_diagonal(W2, 0.0)
+        assert np.max(np.abs(W1 - W2)) < 1e-4

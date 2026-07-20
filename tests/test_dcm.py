@@ -295,3 +295,119 @@ class TestSaturatedNodeBehavior:
         )
         err = model.constraint_error(result.best_theta)
         assert err < 1e-5, f"θ-Newton error with saturated nodes: {err:.3e}"
+
+
+class TestDegeneracyReduction:
+    """Equivalence tests for the degeneracy-reduced DCM solver.
+
+    DCM's parametrisation has a genuine 1-parameter gauge freedom
+    (theta_out += c, theta_in -= c for all nodes leaves p_ij unchanged),
+    so the full and reduced solvers are NOT expected to land on identical
+    theta vectors unless both are converged tightly -- comparisons below
+    use the gauge-invariant connection-probability matrix (or, once fully
+    converged, the residual/constraint error) rather than raw theta.
+    """
+
+    def _degenerate_model(self, seed: int = 0) -> tuple[DCMModel, torch.Tensor, torch.Tensor]:
+        # Degrees drawn from an *actual* realized random directed graph, so
+        # the sequence is guaranteed exactly realizable (unlike an arbitrary
+        # hand-picked (k_out,k_in) pair list, which may be infeasible and
+        # stall the solver at a residual floor unrelated to the reduction
+        # logic under test). Small edge probability + moderate N gives
+        # plenty of nodes sharing the same (k_out,k_in) pair by chance.
+        g = torch.Generator().manual_seed(seed)
+        N = 150
+        adj = (torch.rand(N, N, generator=g) < 0.05).double()
+        adj.fill_diagonal_(0.0)
+        k_out = adj.sum(dim=1)
+        k_in = adj.sum(dim=0)
+        return DCMModel(k_out, k_in), k_out, k_in
+
+    def test_groups_recover_expected_multiplicity(self) -> None:
+        from dcms.solvers.fixed_point_dcm import compute_degeneracy_groups_dcm
+        _, k_out, k_in = self._degenerate_model()
+        group_of, mult, k_out_g, k_in_g = compute_degeneracy_groups_dcm(k_out, k_in)
+        N = k_out.shape[0]
+        M = k_out_g.shape[0]
+        assert M <= len(set(zip(k_out.tolist(), k_in.tolist())))
+        assert mult.sum().item() == N
+        # Every node's target must equal its group's target.
+        assert torch.allclose(k_out_g[group_of], k_out)
+        assert torch.allclose(k_in_g[group_of], k_in)
+
+    def test_reduced_matches_full_solver(self) -> None:
+        """Reduced and full solvers must agree on the connection-probability
+        matrix (gauge-invariant) to near machine precision once converged."""
+        from dcms.solvers.fixed_point_dcm import (
+            solve_fixed_point_dcm,
+            solve_fixed_point_dcm_degenerate,
+        )
+        model, k_out, k_in = self._degenerate_model()
+        theta0 = model.initial_theta("degrees")
+
+        res_full = solve_fixed_point_dcm(
+            model.residual, theta0, k_out, k_in,
+            tol=1e-11, max_iter=3000, variant="theta-newton",
+            anderson_depth=10, backend="pytorch",
+        )
+        res_red = solve_fixed_point_dcm_degenerate(
+            theta0, k_out, k_in,
+            tol=1e-11, max_iter=3000, anderson_depth=10, backend="pytorch",
+        )
+        assert res_full.converged, f"full solver did not converge: mre={res_full.mre:.3e}"
+        assert res_red.converged, f"reduced solver did not converge: mre={res_red.mre:.3e}"
+
+        N = k_out.shape[0]
+        to_f, ti_f = res_full.best_theta[:N], res_full.best_theta[N:]
+        to_r, ti_r = res_red.best_theta[:N], res_red.best_theta[N:]
+        P_f = 1.0 / (1.0 + np.exp(to_f[:, None] + ti_f[None, :]))
+        P_r = 1.0 / (1.0 + np.exp(to_r[:, None] + ti_r[None, :]))
+        max_diff = np.max(np.abs(P_f - P_r))
+        assert max_diff < 1e-7, f"P-matrix mismatch full vs reduced: {max_diff:.3e}"
+
+    def test_reduced_faster_with_heavy_degeneracy(self) -> None:
+        """Reduced solver must be meaningfully faster when M << N.
+
+        Needs N large enough that O(N^2) vs O(M^2) pairwise compute
+        actually dominates wall time over fixed per-call overhead (a small
+        N like the correctness tests above use is too noisy for a timing
+        assertion). Real networks (see RESUME.md) show 10-35x; this just
+        checks the effect is real and directionally large, not the exact
+        ratio.
+        """
+        import time
+        g = torch.Generator().manual_seed(0)
+        N = 1500
+        adj = (torch.rand(N, N, generator=g) < 0.01).double()
+        adj.fill_diagonal_(0.0)
+        k_out = adj.sum(dim=1)
+        k_in = adj.sum(dim=0)
+        model = DCMModel(k_out, k_in)
+
+        from dcms.solvers.fixed_point_dcm import (
+            solve_fixed_point_dcm,
+            solve_fixed_point_dcm_degenerate,
+            compute_degeneracy_groups_dcm,
+        )
+        _, _, k_out_g, _ = compute_degeneracy_groups_dcm(k_out, k_in)
+        theta0 = model.initial_theta("degrees")
+
+        t0 = time.perf_counter()
+        solve_fixed_point_dcm(
+            model.residual, theta0, k_out, k_in,
+            tol=1e-11, max_iter=200, variant="theta-newton",
+            anderson_depth=10, backend="pytorch",
+        )
+        t_full = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        solve_fixed_point_dcm_degenerate(
+            theta0, k_out, k_in,
+            tol=1e-11, max_iter=200, anderson_depth=10, backend="pytorch",
+        )
+        t_red = time.perf_counter() - t0
+
+        assert t_red < 0.7 * t_full, (
+            f"reduced (M={len(k_out_g)}) should be meaningfully faster than "
+            f"full (N={len(k_out)}): reduced={t_red:.3f}s, full={t_full:.3f}s"
+        )

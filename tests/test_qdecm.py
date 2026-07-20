@@ -419,15 +419,20 @@ class TestDegeneracyReduction:
         exact (see test_weighted_step_matches_unreduced_at_mult_one and a
         crafted multi-member-group check done during development, both
         exact to float64 precision). At full-pipeline scale, though, full
-        vs reduced can land on slightly different points of a
-        poorly-conditioned direction of the weight-step likelihood (the
-        Hessian term P*G*(G-1) can be tiny for weakly-coupled node pairs)
-        even though BOTH independently satisfy their own residual to
-        ~1e-10 or tighter -- i.e. both are genuinely valid solutions, they
-        just aren't bit-identical. Observed magnitude: ~2e-3 on
-        crisi_dico2 (N=15168), ~4e-3 on this smaller synthetic network.
-        1e-2 catches real algorithmic bugs (which showed O(1) discrepancies
-        during development) while tolerating this conditioning artifact.
+        vs reduced can land on slightly different points along the
+        weight-step's genuine gauge freedom: G_ij = G(theta_b_out_i +
+        theta_b_in_j) depends only on the pairwise SUM, so
+        theta_b_out += c, theta_b_in -= c leaves every W_ij unchanged
+        exactly (verified numerically to machine precision) -- this is the
+        same gauge direction DCM has (see solve_fixed_point_dcm_degenerate's
+        module docs), just less sharply pinned down by the positivity box
+        here. Both full and reduced independently satisfy their own
+        residual to ~1e-10 or tighter -- i.e. both are genuinely valid
+        solutions, they just aren't bit-identical along that direction.
+        Observed magnitude: ~2e-3 on crisi_dico2 (N=15168), ~4e-3 on this
+        smaller synthetic network. 1e-2 catches real algorithmic bugs
+        (which showed O(1) discrepancies during development) while
+        tolerating this gauge-freedom artifact.
         """
         from dcms.solvers.fixed_point_qdecm import (
             solve_fixed_point_qdecm, solve_fixed_point_qdecm_degenerate,

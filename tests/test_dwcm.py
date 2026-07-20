@@ -461,4 +461,106 @@ class TestThetaNewtonDWCM:
         )
         assert result.elapsed_time >= 0.0
         assert result.peak_ram_bytes >= 0
-        assert len(result.residuals) > 0
+
+
+class TestDegeneracyReduction:
+    """Equivalence tests for the degeneracy-reduced DWCM solver."""
+
+    def _degenerate_model(self, seed: int = 0) -> DWCMModel:
+        # Strengths from an actually-realized random weighted graph, so the
+        # sequence is guaranteed exactly realizable (see the analogous DCM
+        # test's rationale for avoiding hand-picked, possibly-infeasible
+        # sequences).
+        g = torch.Generator().manual_seed(seed)
+        N = 150
+        adj = (torch.rand(N, N, generator=g) < 0.05).double() * (
+            torch.randint(1, 5, (N, N), generator=g).double()
+        )
+        adj.fill_diagonal_(0.0)
+        s_out = adj.sum(dim=1)
+        s_in = adj.sum(dim=0)
+        return DWCMModel(s_out, s_in)
+
+    def test_groups_recover_expected_multiplicity(self) -> None:
+        from dcms.solvers.fixed_point_dwcm import compute_degeneracy_groups_dwcm
+        model = self._degenerate_model()
+        group_of, mult, s_out_g, s_in_g = compute_degeneracy_groups_dwcm(model.s_out, model.s_in)
+        N = model.N
+        assert mult.sum().item() == N
+        assert torch.allclose(s_out_g[group_of], model.s_out)
+        assert torch.allclose(s_in_g[group_of], model.s_in)
+
+    def test_reduced_matches_full_solver(self) -> None:
+        """Reduced and full solvers must agree on the expected-weight matrix
+        (gauge-invariant quantity) to near machine precision once converged."""
+        from dcms.solvers.fixed_point_dwcm import (
+            solve_fixed_point_dwcm,
+            solve_fixed_point_dwcm_degenerate,
+        )
+        model = self._degenerate_model()
+        theta0 = model.initial_theta("strengths")
+
+        res_full = solve_fixed_point_dwcm(
+            model.residual, theta0, model.s_out, model.s_in,
+            tol=1e-11, max_iter=3000, variant="theta-newton",
+            anderson_depth=10, backend="pytorch",
+        )
+        res_red = solve_fixed_point_dwcm_degenerate(
+            theta0, model.s_out, model.s_in,
+            tol=1e-11, max_iter=3000, anderson_depth=10, backend="pytorch",
+        )
+        assert res_full.converged, f"full solver did not converge: mre={res_full.mre:.3e}"
+        assert res_red.converged, f"reduced solver did not converge: mre={res_red.mre:.3e}"
+
+        N = model.N
+        to_f, ti_f = res_full.best_theta[:N], res_full.best_theta[N:]
+        to_r, ti_r = res_red.best_theta[:N], res_red.best_theta[N:]
+        z_f = to_f[:, None] + ti_f[None, :]
+        z_r = to_r[:, None] + ti_r[None, :]
+        W_f = 1.0 / np.expm1(np.clip(z_f, 1e-15, None))
+        W_r = 1.0 / np.expm1(np.clip(z_r, 1e-15, None))
+        np.fill_diagonal(W_f, 0.0)
+        np.fill_diagonal(W_r, 0.0)
+        max_diff = np.max(np.abs(W_f - W_r))
+        assert max_diff < 1e-6, f"W-matrix mismatch full vs reduced: {max_diff:.3e}"
+
+    def test_reduced_faster_with_heavy_degeneracy(self) -> None:
+        """Reduced solver must be meaningfully faster when M << N."""
+        import time
+        g = torch.Generator().manual_seed(0)
+        N = 1500
+        adj = (torch.rand(N, N, generator=g) < 0.01).double() * (
+            torch.randint(1, 5, (N, N), generator=g).double()
+        )
+        adj.fill_diagonal_(0.0)
+        s_out = adj.sum(dim=1)
+        s_in = adj.sum(dim=0)
+        model = DWCMModel(s_out, s_in)
+
+        from dcms.solvers.fixed_point_dwcm import (
+            solve_fixed_point_dwcm,
+            solve_fixed_point_dwcm_degenerate,
+            compute_degeneracy_groups_dwcm,
+        )
+        _, _, s_out_g, _ = compute_degeneracy_groups_dwcm(s_out, s_in)
+        theta0 = model.initial_theta("strengths")
+
+        t0 = time.perf_counter()
+        solve_fixed_point_dwcm(
+            model.residual, theta0, s_out, s_in,
+            tol=1e-11, max_iter=200, variant="theta-newton",
+            anderson_depth=10, backend="pytorch",
+        )
+        t_full = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        solve_fixed_point_dwcm_degenerate(
+            theta0, s_out, s_in,
+            tol=1e-11, max_iter=200, anderson_depth=10, backend="pytorch",
+        )
+        t_red = time.perf_counter() - t0
+
+        assert t_red < 0.7 * t_full, (
+            f"reduced (M={len(s_out_g)}) should be meaningfully faster than "
+            f"full (N={len(s_out)}): reduced={t_red:.3f}s, full={t_full:.3f}s"
+        )

@@ -106,6 +106,7 @@ _FPGS_NEWTON_AND_DEPTH: int = 5
 def _anderson_mixing(
     fp_outputs: list[torch.Tensor],
     residuals_hist: list[torch.Tensor],
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Anderson mixing: compute the next iterate from history.
 
@@ -131,6 +132,16 @@ def _anderson_mixing(
     Args:
         fp_outputs:     List of g(θ_k) values (FP outputs), each shape (2N,).
         residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (2N,).
+        weights:        Optional per-row multiplicity weight, shape (2N,).
+                        Used by the degeneracy-reduced (``mult``) path: a
+                        group of ``mult[g]`` identical nodes contributes
+                        ``mult[g]`` identical rows to this fit in the
+                        unreduced system but only one row in the reduced
+                        system, so without this weight the fit implicitly
+                        under-counts high-multiplicity groups (see the
+                        analogous DECM fix,
+                        ``dcms.solvers.fixed_point_decm._anderson_mixing``).
+                        ``None`` (default) reproduces the old behaviour.
 
     Returns:
         Anderson-mixed next iterate θ_{k+1}, shape (2N,).
@@ -149,7 +160,10 @@ def _anderson_mixing(
     R_w = R / w  # (2N, m): each row scaled to max-absolute-value 1
 
     # Normal equations on the weighted system: (R_w^T R_w) c ∝ ones
-    RtR = R_w.T @ R_w  # (m, m)
+    if weights is not None:
+        RtR = R_w.T @ (weights[:, None] * R_w)
+    else:
+        RtR = R_w.T @ R_w  # (m, m)
     # Regularise to avoid singularity when recent steps are nearly collinear.
     RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
     ones = torch.ones(m, dtype=RtR.dtype)
@@ -173,6 +187,99 @@ def _anderson_mixing(
     return G @ c
 
 
+# -------------------------------------------------------------------------
+# Degeneracy reduction (Vallarano et al., Sci Rep 11:15227, 2021)
+# -------------------------------------------------------------------------
+#
+# Nodes sharing the exact same (s_out, s_in) pair provably share identical
+# (theta_out, theta_in) at the DWCM's unique solution -- same label-swap
+# symmetry + strict concavity argument as DCM's degeneracy (see
+# compute_degeneracy_groups_dcm in fixed_point_dcm.py), specialised to
+# strength constraints on the geometric-weight likelihood instead of degree
+# constraints on the Bernoulli likelihood. A 2-tuple (s_out, s_in) is the
+# right key here, mirroring DCM's (k_out, k_in) exactly -- DWCM has no
+# degree channel to interleave with, unlike DECM's 4-tuple case.
+
+def compute_degeneracy_groups_dwcm(
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group nodes by identical (s_out, s_in).
+
+    Returns:
+        group_of: (N,) long tensor mapping each node to its group in [0, M).
+        mult:     (M,) float tensor, multiplicity of each group.
+        s_out_g, s_in_g: (M,) float tensors, the shared target values.
+    """
+    N = s_out.shape[0]
+    key = torch.stack([s_out, s_in], dim=1)
+    uniq, group_of = torch.unique(key, dim=0, return_inverse=True)
+    M = uniq.shape[0]
+    mult = torch.zeros(M, dtype=torch.float64)
+    mult.scatter_add_(0, group_of, torch.ones(N, dtype=torch.float64))
+    s_out_g, s_in_g = uniq[:, 0], uniq[:, 1]
+    return group_of, mult, s_out_g, s_in_g
+
+
+def _dwcm_step_dense_weighted(
+    theta: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    max_step: float,
+    mult: torch.Tensor,
+    eta_lo: float = _ETA_MIN,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One theta-Newton (GS) step for the degeneracy-reduced DWCM.
+
+    Identical algebra to :func:`_theta_newton_step_dense`, generalised so
+    each group ``g`` stands in for ``mult[g]`` original nodes -- same
+    "weighted sum minus one diagonal term" pattern used in DECM's
+    ``_decm_step_dense_weighted`` and DCM's ``_dcm_step_dense_weighted``
+    (see either docstring for the combinatorial justification). With
+    ``mult`` all-ones (M == N) this reduces exactly to the per-node formula.
+
+    Args:
+        theta: Current 2M parameter vector [theta_out|theta_in].
+        s_out, s_in: Group-level target sequences, shape (M,).
+        max_step: Maximum |Delta theta| per group per step.
+        mult: Group multiplicities, shape (M,).
+        eta_lo: Lower clamp bound (see _theta_newton_step_dense).
+
+    Returns:
+        ``(theta_new, F_current)``, both shape (2M,).
+    """
+    M = s_out.shape[0]
+    theta_out = theta[:M]
+    theta_in = theta[M:]
+
+    z = theta_out[:, None] + theta_in[None, :]
+    W = 1.0 / torch.expm1(z.clamp(min=1e-15))
+    W_diag = W.diagonal()
+    W1W = W * (1.0 + W)
+    W1W_diag = W1W.diagonal()
+
+    F_out = (W * mult[None, :]).sum(1) - W_diag - s_out
+    h_out = -((W1W * mult[None, :]).sum(1) - W1W_diag)
+    delta_out = (-F_out / (h_out - 1e-30)).clamp(-max_step, max_step)
+    theta_out_new = (theta_out + delta_out).clamp(eta_lo, _ETA_MAX)
+    theta_out_new = torch.where(s_out == 0, torch.full_like(theta_out_new, _ETA_MAX), theta_out_new)
+
+    z2 = theta_out_new[:, None] + theta_in[None, :]
+    W2 = 1.0 / torch.expm1(z2.clamp(min=1e-15))
+    W2_diag = W2.diagonal()
+    W1W2 = W2 * (1.0 + W2)
+    W1W2_diag = W1W2.diagonal()
+
+    F_in = (W2 * mult[:, None]).sum(0) - W2_diag - s_in
+    h_in = -((W1W2 * mult[:, None]).sum(0) - W1W2_diag)
+    delta_in = (-F_in / (h_in - 1e-30)).clamp(-max_step, max_step)
+    theta_in_new = (theta_in + delta_in).clamp(eta_lo, _ETA_MAX)
+    theta_in_new = torch.where(s_in == 0, torch.full_like(theta_in_new, _ETA_MAX), theta_in_new)
+
+    F_current = torch.cat([F_out, F_in])
+    return torch.cat([theta_out_new, theta_in_new]), F_current
+
+
 def solve_fixed_point_dwcm(
     residual_fn: Callable[[torch.Tensor], torch.Tensor],
     theta0: "ArrayLike",  # type: ignore[name-defined]
@@ -190,6 +297,8 @@ def solve_fixed_point_dwcm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    mult: torch.Tensor | None = None,
+    weight_anderson: bool = True,
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -237,10 +346,32 @@ def solve_fixed_point_dwcm(
         monitor: If ``True`` (and ``verbose=True``), overwrite the same
             terminal line at each iteration (``end='\\r'``) so only the
             latest status is visible.  Default=False.
+        mult: Internal use by :func:`solve_fixed_point_dwcm_degenerate`.
+            When provided (shape (M,)), ``s_out``/``s_in``/``theta0`` are
+            interpreted as *group-level* quantities (one entry per unique
+            (s_out,s_in) pair) and the step uses
+            :func:`_dwcm_step_dense_weighted`. Only supported with
+            ``variant="theta-newton"`` and ``backend="pytorch"`` (not yet
+            "numba"). Default None (standard per-node behaviour).
+        weight_anderson: Makes Anderson mixing multiplicity-aware in the
+            reduced (``mult``) path -- see
+            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
+            parameter of the same name. Default True.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
     """
+    if mult is not None:
+        if variant != "theta-newton":
+            raise NotImplementedError(
+                "mult (degeneracy-reduced path) only supports "
+                "variant='theta-newton'."
+            )
+        if backend == "numba":
+            raise NotImplementedError(
+                "backend='numba' is not yet supported together with the "
+                "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
+            )
     if variant not in ("gauss-seidel", "theta-newton"):
         raise ValueError(
             f"Unknown variant {variant!r}. Choose 'gauss-seidel' or 'theta-newton'."
@@ -333,6 +464,12 @@ def solve_fixed_point_dwcm(
     _v_targets = torch.cat([s_out, s_in])
     _v_nonzero = _v_targets > 0
 
+    # Anderson mixing needs per-component weights in the degeneracy-reduced
+    # path -- see _anderson_mixing's docstring and the analogous DECM/DCM fix.
+    _anderson_weights = (
+        torch.cat([mult, mult]) if (mult is not None and weight_anderson) else None
+    )
+
     try:
         for _ in range(max_iter):
             # Wall-clock time limit
@@ -342,7 +479,11 @@ def solve_fixed_point_dwcm(
                 )
                 break
 
-            if variant == "theta-newton":
+            if mult is not None:
+                theta_fp, F_current = _dwcm_step_dense_weighted(
+                    theta, s_out, s_in, max_step, mult, eta_lo=_ETA_MIN
+                )
+            elif variant == "theta-newton":
                 # θ-space coordinate Newton step.
                 # Returns (theta_new, F_current) where F_current = F(θ)
                 # at the *input* θ (before the update).
@@ -642,7 +783,7 @@ def solve_fixed_point_dwcm(
                         _and_r.pop(0)
 
                     if len(_and_g) >= 2:
-                        theta_next = _anderson_mixing(_and_g, _and_r)
+                        theta_next = _anderson_mixing(_and_g, _and_r, weights=_anderson_weights)
                         # Geometric floor for ALL variants: prevent Anderson from
                         # extrapolating any θ_i to near 0 (β_i ≈ 1), which would
                         # make W_ij → ∞ for hub-node pairs and cause blowups.
@@ -750,6 +891,105 @@ def solve_fixed_point_dwcm(
         elapsed_time=elapsed,
         peak_ram_bytes=peak_ram,
         message=message,
+    )
+
+
+def solve_fixed_point_dwcm_degenerate(
+    theta0: "ArrayLike",  # type: ignore[name-defined]
+    s_out: "ArrayLike",  # type: ignore[name-defined]
+    s_in: "ArrayLike",  # type: ignore[name-defined]
+    tol: float = 1e-8,
+    max_iter: int = 10_000,
+    anderson_depth: int = 10,
+    max_step: float = 1.0,
+    max_time: float = 0.0,
+    backend: str = "auto",
+    num_threads: int = 0,
+    verbose: bool = False,
+    monitor: bool = False,
+    weight_anderson: bool = True,
+) -> SolverResult:
+    """Degeneracy-reduced theta-Newton solver for the DWCM.
+
+    Groups nodes that share the exact same (s_out, s_in) pair -- which are
+    proven to share identical (theta_out, theta_in) at the true DWCM
+    solution, see :func:`compute_degeneracy_groups_dwcm` -- and solves the
+    resulting M-unknown reduced system (M = number of unique pairs <= N)
+    instead of the full 2N-unknown system. The returned ``SolverResult`` is
+    expanded back to the original per-node shape (2N,) so it is a drop-in
+    replacement for :func:`solve_fixed_point_dwcm` at the call site.
+
+    Args:
+        theta0: Initial guess [theta_out|theta_in], shape (2N,). Nodes
+            sharing an (s_out,s_in) pair should already carry identical
+            values here (true for the standard "degrees"-based initial
+            guess); if not, one representative member's value is used for
+            the whole group.
+        s_out, s_in: Observed sequences, each shape (N,).
+        (all other args): see :func:`solve_fixed_point_dwcm`.
+
+    Returns:
+        :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
+        expanded back to shape (2N,).
+    """
+    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
+    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
+    s_out = s_out.to(dtype=torch.float64)
+    s_in = s_in.to(dtype=torch.float64)
+    theta0 = (
+        theta0 if isinstance(theta0, torch.Tensor) else torch.tensor(theta0, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+
+    N = s_out.shape[0]
+    group_of, mult, s_out_g, s_in_g = compute_degeneracy_groups_dwcm(s_out, s_in)
+    M = s_out_g.shape[0]
+
+    _first_idx = torch.zeros(M, dtype=torch.long)
+    _seen = torch.zeros(M, dtype=torch.bool)
+    _group_of_list = group_of.tolist()
+    for _i, _g in enumerate(_group_of_list):
+        if not _seen[_g]:
+            _seen[_g] = True
+            _first_idx[_g] = _i
+    theta0_g = torch.cat([theta0[:N][_first_idx], theta0[N:][_first_idx]])
+
+    def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
+        return _dwcm_step_dense_weighted(theta_m, s_out_g, s_in_g, max_step, mult)[1]
+
+    result_g = solve_fixed_point_dwcm(
+        _residual_fn_g,
+        theta0_g,
+        s_out_g, s_in_g,
+        tol=tol,
+        max_iter=max_iter,
+        variant="theta-newton",
+        anderson_depth=anderson_depth,
+        max_step=max_step,
+        max_time=max_time,
+        backend=backend,
+        num_threads=num_threads,
+        verbose=verbose,
+        monitor=monitor,
+        mult=mult,
+        weight_anderson=weight_anderson,
+    )
+
+    def _expand(theta_m):
+        import numpy as np
+        g = group_of.numpy()
+        to_ = theta_m[:M][g]
+        ti_ = theta_m[M:][g]
+        return np.concatenate([to_, ti_])
+
+    return SolverResult(
+        theta=_expand(result_g.theta),
+        best_theta=_expand(result_g.best_theta),
+        converged=result_g.converged,
+        iterations=result_g.iterations,
+        residuals=result_g.residuals,
+        elapsed_time=result_g.elapsed_time,
+        peak_ram_bytes=result_g.peak_ram_bytes,
+        message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
     )
 
 

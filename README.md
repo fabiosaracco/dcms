@@ -825,6 +825,57 @@ qdecm.solve_tool(
 
 For DCM, DWCM and DECM pass an array of shape (2N,), (2N,) and (4N,) respectively to `ic`.  For DECM, `multi_start` is automatically disabled when `ic` is an array.
 
+### 3.9.1 Checkpointed multi-chunk runs with stagnation/divergence recovery
+
+For very large or hard instances (e.g. DECM with N in the tens of thousands, or networks with extreme hub s/k ratios), a single unattended `solve_tool()` call may need tens of thousands of iterations. It is safer to run in **chunks** — `max_iter` iterations at a time, checkpointing the state to disk after each chunk — so a crash, timeout or preemption never loses more than one chunk of progress.
+
+**`init_best_theta` / `init_best_res`.** The standalone `solve_fixed_point_*_degenerate` functions (§3.7) accept these two parameters specifically for this use case. Each chunked call is otherwise a *fresh* invocation with no memory of the record set by earlier chunks — its own in-call best-tracking and Anderson-blowup rollback can only fall back to a chunk-local best, which may already be far worse than the true historical record. Passing the previous chunk's record back in via `init_best_theta`/`init_best_res` keeps the in-call rollback (and the returned `best_theta`/`mre`) anchored to the true global best across chunk boundaries:
+
+```python
+global_best_theta, best_mre = None, float("inf")
+theta = None  # None => solver picks the default ic on the first chunk
+
+for chunk in range(n_chunks):
+    res = solve_fixed_point_decm_degenerate(
+        ..., theta0=theta,
+        init_best_theta=global_best_theta, init_best_res=best_mre,
+        max_iter=chunk_iters,
+    )
+    if res.mre < best_mre:
+        best_mre = res.mre
+        global_best_theta = res.best_theta.copy()
+    theta = res.theta          # continue from where this chunk left off
+    save_checkpoint(theta, global_best_theta, best_mre)  # survive a restart
+    if res.converged:
+        break
+```
+
+**Stagnation and divergence recovery.** Two failure modes are common on hard instances left running unattended:
+
+- *Stagnation* — `best_mre_so_far` stops improving for many consecutive chunks (the iterate is orbiting a local basin).
+- *Divergence* — a chunk's endpoint residual jumps far above the record (e.g. `> 100×`), usually after Anderson mixing picks a bad combination that individual in-call blowup protection didn't fully catch across a chunk boundary.
+
+Both are handled the same way: restart the next chunk from `global_best_theta` plus Gaussian noise, instead of continuing from the (stuck or diverged) current iterate. The noise scale should **escalate** on repeated failures and **reset only on a genuine record improvement** — a fixed noise scale on every retry can otherwise loop forever retrying the same perturbation and landing back on the same (bit-identical) stuck point:
+
+```python
+restarts = 0          # escalation counter — increments on ANY restart, resets only on improvement
+BASE_NOISE = 1e-2
+NOISE_CAP_MULT = 16
+
+...
+if res.mre < best_mre:
+    best_mre = res.mre
+    global_best_theta = res.best_theta.copy()
+    restarts = 0                                   # only a genuine improvement resets escalation
+elif stagnated_or_diverged and global_best_theta is not None:
+    restarts += 1
+    noise_mult = min(2 ** (restarts - 1), NOISE_CAP_MULT)
+    noise = np.random.default_rng().normal(scale=BASE_NOISE * noise_mult, size=global_best_theta.shape)
+    theta = global_best_theta + noise               # restart around the record, not the stuck iterate
+```
+
+**Validated on a real hard instance:** DECM on a directed weighted network with N=15 168 (M=3 003 after degeneracy reduction, §2.5), run unattended from scratch (no manual intervention) with `anderson_depth=10`, `hub_sk_threshold=5.0`, chunks of 50 iterations, `stagnation_patience=15` chunks. The run hit one divergence restart and four stagnation restarts, and converged after 9 460 iterations to MRE=9.45×10⁻⁶ — confirming the escalating-noise/global-record recovery is sufficient on its own, without any manual checkpoint adjustment, even on an instance that had previously required iterative manual fixes to reach convergence.
+
 ### 3.10 Network generator (`dcms/utils/wng.py`)
 
 ```python

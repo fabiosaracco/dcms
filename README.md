@@ -478,6 +478,7 @@ Additional model methods:
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `model.wij_matrix(theta)` | `(N, N)` tensor | Expected weight matrix `w_ij = β_i β_j / (1 − β_i β_j)` |
+| `model.pij_matrix(theta)` | `(N, N)` tensor | Link-existence probability `p_ij = P(w_ij > 0) = β_i β_j` |
 | `model.residual(theta)` | `(2N,)` tensor | Constraint violation `F(θ)` |
 | `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
 | `model.bic(theta)` | float | Bayesian Information Criterion, `2N·ln(N(N−1)) − 2·ln L` |

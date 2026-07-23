@@ -100,6 +100,39 @@ class DWCMModel:
             W[:, self.zero_in] = 0.0
         return W
 
+    def pij_matrix(self, theta: _ArrayLike) -> torch.Tensor:
+        """Compute the N×N matrix of link-existence probabilities p_ij = P(w_ij > 0).
+
+        The DWCM's geometric weight distribution has P(w_ij = 0) = 1 − β_out_i·β_in_j,
+        so the probability of a nonzero arc is simply
+
+            p_ij = β_out_i · β_in_j = exp(−(θ_out_i + θ_in_j))     (i ≠ j)
+
+        Equivalently, p_ij = W_ij / (1 + W_ij) in terms of :meth:`wij_matrix`.
+        Diagonal entries are 0 (no self-loops); since θ ≥ _ETA_MIN > 0, z is
+        always positive and exp(−z) needs no numerical safeguarding.
+
+        Args:
+            theta: Parameter vector [θ_out | θ_in], shape (2N,).
+                   All entries should be strictly positive.
+
+        Returns:
+            Probability matrix P, shape (N, N), dtype torch.float64.
+        """
+        theta = _to_tensor(theta)
+        N = self.N
+        theta_out = theta[:N]
+        theta_in = theta[N:]
+        z = theta_out[:, None] + theta_in[None, :]  # (N, N)
+        P = torch.exp(-z)
+        P.fill_diagonal_(0.0)
+        # Zero-strength nodes contribute exactly zero probability.
+        if self.zero_out.any():
+            P[self.zero_out] = 0.0
+        if self.zero_in.any():
+            P[:, self.zero_in] = 0.0
+        return P
+
     # ------------------------------------------------------------------
     # Residual (system of equations)
     # ------------------------------------------------------------------

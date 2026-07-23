@@ -24,6 +24,7 @@ residual is *exactly* zero and the Jacobian columns/rows are zero.
 """
 from __future__ import annotations
 
+import math
 from typing import Union
 
 import torch
@@ -321,6 +322,22 @@ class DCMModel:
             log1p_total += log1p.sum().item()
 
         return dot_term + log1p_total
+
+    def bic(self, theta: _ArrayLike) -> float:
+        """Return the Bayesian Information Criterion, BIC = k·ln(n) − 2·ln L.
+
+        k = 2N (the θ_out_i, θ_in_i Lagrange multipliers) and n = N(N−1)
+        (the directed dyads i≠j summed over by :meth:`neg_log_likelihood`,
+        each contributing one Bernoulli-arc observation).  Lower is better.
+
+        Args:
+            theta: Parameter vector [θ_out | θ_in], shape (2N,).
+
+        Returns:
+            Scalar BIC(θ).
+        """
+        N = self.N
+        return 2 * N * math.log(N * (N - 1)) + 2 * self.neg_log_likelihood(theta)
 
     # ------------------------------------------------------------------
     # Evaluation of constraint satisfaction

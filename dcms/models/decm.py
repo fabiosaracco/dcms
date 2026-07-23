@@ -396,6 +396,23 @@ class DECMModel:
         ).item()
         return dot + sp_total
 
+    def bic(self, theta: _ArrayLike) -> float:
+        """Return the Bayesian Information Criterion, BIC = k·ln(n) − 2·ln L.
+
+        k = 4N (the θ_out_i, θ_in_i, η_out_i, η_in_i Lagrange multipliers)
+        and n = N(N−1) (the directed dyads i≠j summed over by
+        :meth:`neg_log_likelihood`, each contributing one joint
+        existence+weight observation).  Lower is better.
+
+        Args:
+            theta: Full parameter vector [θ_out|θ_in|η_out|η_in], shape (4N,).
+
+        Returns:
+            Scalar BIC(θ,η).
+        """
+        N = self.N
+        return 4 * N * math.log(N * (N - 1)) + 2 * self.neg_log_likelihood(theta)
+
     # ------------------------------------------------------------------
     # Diagonal Jacobian (for Newton step computation)
     # ------------------------------------------------------------------

@@ -446,6 +446,7 @@ Additional model methods:
 | `model.pij_matrix(theta)` | `(N, N)` tensor | Link-probability matrix `p_ij = x_i y_j / (1 + x_i y_j)` |
 | `model.residual(theta)` | `(2N,)` tensor | Constraint violation `F(θ)` |
 | `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
+| `model.bic(theta)` | float | Bayesian Information Criterion, `2N·ln(N(N−1)) − 2·ln L` |
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess: `"degrees"` (default) or `"random"` |
 | `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.7) |
@@ -479,6 +480,7 @@ Additional model methods:
 | `model.wij_matrix(theta)` | `(N, N)` tensor | Expected weight matrix `w_ij = β_i β_j / (1 − β_i β_j)` |
 | `model.residual(theta)` | `(2N,)` tensor | Constraint violation `F(θ)` |
 | `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ)` |
+| `model.bic(theta)` | float | Bayesian Information Criterion, `2N·ln(N(N−1)) − 2·ln L` |
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.max_relative_error(theta)` | float | `max‖F_i‖ / s_i` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess (see below) |
@@ -529,6 +531,8 @@ Additional model methods:
 | `model.wij_matrix_conditioned(theta_topo, theta_weight)` | `(N, N)` tensor | Expected weight matrix |
 | `model.residual_strength(theta_topo, theta_weight)` | `(2N,)` tensor | Strength constraint violation `F_w(θ)` |
 | `model.neg_log_likelihood_strength(theta_topo, theta_weight)` | float | Negative log-likelihood of the weight model |
+| `model.neg_log_likelihood(theta_topo, theta_weight)` | float | Generalized log-likelihood, −L_topo + −L_w (see docstring; comparable to DECM's) |
+| `model.bic(theta_topo, theta_weight)` | float | Bayesian Information Criterion on the generalized likelihood, `4N·ln(N(N−1)) − 2·ln L_generalized` |
 | `model.constraint_error_topology(theta_topo)` | float | Max-abs degree constraint error |
 | `model.constraint_error_strength(theta_topo, theta_weight)` | float | Max-abs strength constraint error |
 | `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative error over all 4N constraints |
@@ -582,6 +586,7 @@ Additional model methods:
 | `model.wij_matrix(theta)` | `(N, N)` tensor | Expected weight matrix `W_ij = p_ij · G_ij` |
 | `model.residual(theta)` | `(4N,)` tensor | Constraint violation `[F_k_out\|F_k_in\|F_s_out\|F_s_in]` |
 | `model.neg_log_likelihood(theta)` | float | Negative log-likelihood `−L(θ,η)` |
+| `model.bic(theta)` | float | Bayesian Information Criterion, `4N·ln(N(N−1)) − 2·ln L` |
 | `model.hessian_diag(theta)` | `(4N,)` tensor | Diagonal Jacobian elements (all ≤ 0) |
 | `model.constraint_error(theta)` | float | `max‖F(θ,η)‖` |
 | `model.max_relative_error(theta)` | float | Max relative error over all 4N non-zero constraints |

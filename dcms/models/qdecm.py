@@ -38,6 +38,7 @@ Reference:
 """
 from __future__ import annotations
 
+import math
 from typing import Union
 
 import torch
@@ -455,6 +456,27 @@ class qDECMModel:
         return (
             self._dcm.neg_log_likelihood(theta_topo)
             + self.neg_log_likelihood_strength(theta_topo, theta_weight)
+        )
+
+    def bic(self, theta_topo: _ArrayLike, theta_weight: _ArrayLike) -> float:
+        """Return the Bayesian Information Criterion, BIC = k·ln(n) − 2·ln L.
+
+        k = 4N (2N topology + 2N weight Lagrange multipliers) and
+        n = N(N−1) (the directed dyads i≠j, same sample as DECM's). Built
+        on the generalized log-likelihood (see :meth:`neg_log_likelihood`),
+        so this is directly comparable to :meth:`DECMModel.bic` for the
+        same network. Lower is better.
+
+        Args:
+            theta_topo:   Topology parameters [θ_out | θ_in], shape (2N,).
+            theta_weight: Weight parameters [θ_β_out | θ_β_in], shape (2N,).
+
+        Returns:
+            Scalar BIC(θ_topo, θ_weight).
+        """
+        N = self.N
+        return 4 * N * math.log(N * (N - 1)) + 2 * self.neg_log_likelihood(
+            theta_topo, theta_weight
         )
 
     # ------------------------------------------------------------------

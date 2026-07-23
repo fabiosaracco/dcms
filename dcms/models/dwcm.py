@@ -22,6 +22,7 @@ The system of equations to solve is F(θ) = 0, where
 """
 from __future__ import annotations
 
+import math
 from typing import Union
 
 import torch
@@ -352,6 +353,22 @@ class DWCMModel:
             log_total += log_chunk.sum().item()
 
         return dot_term + log_total
+
+    def bic(self, theta: _ArrayLike) -> float:
+        """Return the Bayesian Information Criterion, BIC = k·ln(n) − 2·ln L.
+
+        k = 2N (the θ_out_i, θ_in_i Lagrange multipliers) and n = N(N−1)
+        (the directed dyads i≠j summed over by :meth:`neg_log_likelihood`,
+        each contributing one weighted-arc observation).  Lower is better.
+
+        Args:
+            theta: Parameter vector [θ_out | θ_in], shape (2N,).
+
+        Returns:
+            Scalar BIC(θ).
+        """
+        N = self.N
+        return 2 * N * math.log(N * (N - 1)) + 2 * self.neg_log_likelihood(theta)
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------

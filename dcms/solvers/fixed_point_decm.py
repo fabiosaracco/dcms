@@ -846,6 +846,7 @@ def solve_fixed_point_decm(
     weight_anderson: bool = True,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
+    blowup_factor: float | None = None,
     patience: int = 750,
     noise_base: float = 1e-2,
     noise_cap_mult: float = 16.0,
@@ -933,6 +934,23 @@ def solve_fixed_point_decm(
         init_best_res:  The residual (MRE) achieved by ``init_best_theta``.
                         Required (and meaningful) only together with
                         ``init_best_theta``. Default ``inf``.
+        blowup_factor:  Multiplicative threshold for the Anderson blowup
+                        guard: a rollback triggers when the current
+                        iteration's residual exceeds ``blowup_factor`` times
+                        the best residual ever seen this call (a *running
+                        minimum*, so this also catches a slow multi-hundred-
+                        iteration drift away from the record, not just a
+                        sudden single-step spike). ``None`` (default) uses
+                        the built-in scale-adaptive formula
+                        ``max(200, min(5000, 200_000/N))`` -- generous for
+                        small N, strict for large N. Lower this (e.g. 20-50)
+                        on instances that visibly wander far from their best
+                        point over many iterations without any single jump
+                        large enough to trip the default floor; this trades
+                        more frequent, cheap (noise-free) rollbacks for less
+                        wasted exploration of bad regions. A float here
+                        replaces the N-adaptive formula outright, applied as
+                        given regardless of N.
         patience:       Perturbed-restart trigger, in iterations. If
                         ``best_theta_res`` has not improved for ``patience``
                         consecutive iterations, the solver restarts from
@@ -942,7 +960,7 @@ def solve_fixed_point_decm(
                         traps that plain Anderson/Newton alone cannot escape
                         on hard hub-heavy instances. The same recovery also
                         fires when the Anderson blowup guard (see
-                        ``eff_blowup`` below) trips *repeatedly* with no
+                        ``blowup_factor`` above) trips *repeatedly* with no
                         record improvement in between -- an isolated,
                         self-recovering blowup is left alone (existing plain
                         rollback, no noise). Set ``patience <= 0`` to disable
@@ -1122,7 +1140,12 @@ def solve_fixed_point_decm(
     # observed at N=15168) -- best of the options tried so far (a
     # recent-anchor rollback, tried as an alternative, was worse: see git
     # history / RESUME.md). Kept at 200 pending a better idea.
-    eff_blowup = max(200.0, min(5000.0, 200_000.0 / N))
+    # Overridable via `blowup_factor` (see its docstring) for instances that
+    # drift far from their best point without ever tripping this default.
+    eff_blowup = (
+        blowup_factor if blowup_factor is not None
+        else max(200.0, min(5000.0, 200_000.0 / N))
+    )
 
     n_iter = 0
     residuals: list[float] = []
@@ -1428,6 +1451,12 @@ def solve_fixed_point_decm(
                     _and_g.clear()
                     _and_r.clear()
                     _blowup_recovered = True
+                    if verbose:
+                        print(
+                            f"[blowup] res_norm={res_norm:.3e} > "
+                            f"{eff_blowup:.0f}x best={_best_res_for_anderson:.3e} "
+                            f"at iter {n_iter}."
+                        )
 
                 _best_res_for_anderson = min(_best_res_for_anderson, res_norm)
 
@@ -1437,6 +1466,11 @@ def solve_fixed_point_decm(
                     # already failed to escape this trap once, so escalate
                     # to the same perturbed-restart mechanism as stagnation
                     # instead of repeating the same ineffective rollback.
+                    if verbose:
+                        print(
+                            f"[blowup] repeated with no improvement since the "
+                            f"last restart -- escalating to perturbed restart."
+                        )
                     theta_next, _give_up = _perturbed_restart()
                     if _give_up:
                         message = (
@@ -1455,6 +1489,12 @@ def solve_fixed_point_decm(
                     # whatever distance the bad Anderson mix introduced, which
                     # empirically costs 100+ iterations. Restart the plain
                     # Newton step from the best iterate seen so far instead.
+                    if verbose:
+                        print(
+                            f"[blowup] isolated, rolling back to best_theta "
+                            f"(best={best_theta_res:.3e}, no noise) at "
+                            f"iter {n_iter}."
+                        )
                     theta_rb, _ = _step(best_theta)
                     eta_old_rb = best_theta[2 * N :]
                     eta_new_rb = theta_rb[2 * N :]
@@ -1556,6 +1596,7 @@ def solve_fixed_point_decm_degenerate(
     hub_sk_threshold: float = 0.0,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
+    blowup_factor: float | None = None,
     patience: int = 750,
     noise_base: float = 1e-2,
     noise_cap_mult: float = 16.0,
@@ -1599,10 +1640,11 @@ def solve_fixed_point_decm_degenerate(
             :func:`solve_fixed_point_decm`'s ``init_best_theta`` docs for why
             this matters.
         init_best_res: The residual (MRE) achieved by ``init_best_theta``.
-        patience, noise_base, noise_cap_mult, max_stalls, seed: Perturbed
-            restart on stagnation/repeated-blowup, operating at group
-            (M-length) granularity -- see :func:`solve_fixed_point_decm`'s
-            docstring for the full explanation. Forwarded unchanged.
+        blowup_factor, patience, noise_base, noise_cap_mult, max_stalls, seed:
+            Blowup-guard threshold and perturbed restart on stagnation/
+            repeated-blowup, operating at group (M-length) granularity --
+            see :func:`solve_fixed_point_decm`'s docstring for the full
+            explanation. Forwarded unchanged.
 
     Returns:
         :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
@@ -1693,6 +1735,7 @@ def solve_fixed_point_decm_degenerate(
         hub_sk_threshold=hub_sk_threshold,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,
+        blowup_factor=blowup_factor,
         patience=patience,
         noise_base=noise_base,
         noise_cap_mult=noise_cap_mult,

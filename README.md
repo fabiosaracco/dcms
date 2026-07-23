@@ -392,9 +392,13 @@ print(result.converged, result.mre, result.message)  # message reports "N=... ->
 Even with Anderson acceleration and the blowup guard (§2.1), some hub-heavy instances get stuck at a **quasi-fixed point**: progress halts for hundreds of iterations, or the Anderson blowup guard keeps tripping and rolling back to the same point without ever improving on it. Plain rollback-and-retry alone cannot escape a genuine trap — the deterministic Newton/Anderson dynamics just reproduce the same trajectory. The fix is to occasionally add noise:
 
 - **Stagnation:** if `best_theta_res` hasn't improved for `patience` consecutive iterations, restart from `best_theta` plus Gaussian noise instead of continuing from the stuck iterate.
-- **Repeated blowup:** the existing blowup guard's plain rollback-to-`best_theta` is left untouched for an *isolated* blowup (common and self-resolving on hub-heavy networks — see the `eff_blowup` note in the source). Only if the guard trips **again with no record improvement in between** does it escalate to the same noisy restart — this is the "quasi-fixed-point trap" case, not routine Anderson housekeeping.
+- **Repeated blowup:** the existing blowup guard's plain rollback-to-`best_theta` is left untouched for an *isolated* blowup (common and self-resolving on hub-heavy networks — see `blowup_factor` below). Only if the guard trips **again with no record improvement in between** does it escalate to the same noisy restart — this is the "quasi-fixed-point trap" case, not routine Anderson housekeeping.
 
 Both triggers share **one** escalation counter: noise scale starts at `noise_base` and doubles on each consecutive restart that fails to improve the record (`noise_base × min(2^(restarts-1), noise_cap_mult)`), capped at `noise_base × noise_cap_mult`, and resets to `noise_base` only on a genuine improvement. (An earlier, external version of this mechanism kept blowup-retries and stagnation-retries on separate counters, one of them with a *fixed*, non-escalating noise scale — that combination produced a real infinite loop, 59 consecutive chunks converging on the exact same stuck point, on the network below. A single shared, always-escalating counter is what actually fixed it.) Give up (`converged=False`) after `max_stalls` restarts *at the noise cap* in a row without improving the record — i.e. only once the strongest available kick has been tried repeatedly and still hasn't helped; restarts made while still escalating don't count toward this limit.
+
+**The blowup guard's sensitivity is tunable via `blowup_factor`.** A rollback triggers when the current iteration's residual exceeds `blowup_factor` times the best residual ever seen this call (a *running minimum*, so this catches a slow multi-hundred-iteration drift away from the record just as well as a sudden spike). Default `None` uses the built-in scale-adaptive formula `max(200, min(5000, 200_000/N))` — generous for small N, strict for large N. On instances that visibly wander far from their best point over many iterations without any single jump large enough to trip that default floor, pass a smaller value (e.g. `20`-`50`) to get more frequent, cheap (noise-free) rollbacks instead of letting the trajectory drift until `patience` iterations finally force a (noisy) restart.
+
+**With `verbose=True`, every intervention prints a message** — `[blowup] ...` when the guard trips (one line for an isolated rollback, another when it escalates), and `[perturbed-restart] restart #N ...` for both stagnation- and blowup-triggered noisy restarts — so an unattended run's log shows exactly when and why the trajectory was redirected, not just silent MRE fluctuation.
 
 **Status:** on by default (`DECMModel.solve_tool()` and the standalone `solve_fixed_point_decm[_degenerate]`). Inert for well-behaved instances that never stagnate or blow up — no default-value tuning is needed to get the old behaviour on easy networks. Set `patience<=0` to fully disable and restore the old fail-fast-on-stagnation behaviour.
 
@@ -402,6 +406,7 @@ Both triggers share **one** escalation counter: noise scale starts at `noise_bas
 model = DECMModel(k_out, k_in, s_out, s_in)
 model.solve_tool(
     max_iter=20000,
+    blowup_factor=None,   # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner
     patience=750,        # restart after 750 iterations with no record improvement
     noise_base=1e-2,      # first restart's noise std. dev.
     noise_cap_mult=16.0,  # noise saturates at noise_base * 16
@@ -567,6 +572,7 @@ converged = model.solve_tool(
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
+    blowup_factor=None,     # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner (see §2.6)
     patience=750,           # restart from best_theta+noise after this many iters with no improvement (see §2.6)
     noise_base=1e-2,        # std. dev. of the first perturbed restart's noise (see §2.6)
     noise_cap_mult=16.0,    # noise scale saturates at noise_base * noise_cap_mult (see §2.6)

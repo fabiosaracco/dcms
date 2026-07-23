@@ -603,6 +603,7 @@ class DECMModel:
         hub_sk_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
         reduce_degeneracy: bool = True,
+        blowup_factor: float | None = None,
         patience: int = 750,
         noise_base: float = 1e-2,
         noise_cap_mult: float = 16.0,
@@ -682,6 +683,20 @@ class DECMModel:
                            and ``backtracking_gamma == 0.0``; silently falls
                            back to the full (unreduced) solver otherwise,
                            with a printed note.
+            blowup_factor: Multiplicative threshold for the Anderson blowup
+                           guard: a rollback triggers when the current
+                           iteration's residual exceeds ``blowup_factor``
+                           times the best residual ever seen this call (a
+                           running minimum, so this also catches a slow
+                           drift away from the record over many iterations,
+                           not just a sudden spike). ``None`` (default) uses
+                           the built-in scale-adaptive formula
+                           ``max(200, min(5000, 200_000/N))``. Lower this
+                           (e.g. 20-50) on instances that visibly wander far
+                           from their best point without any single jump
+                           large enough to trip the default floor -- trades
+                           more frequent, cheap (noise-free) rollbacks for
+                           less wasted exploration of bad regions.
             patience:      If ``best_theta_res`` has not improved for this
                            many consecutive iterations, restart from
                            ``model.sol.best_theta`` plus escalating Gaussian
@@ -764,6 +779,7 @@ class DECMModel:
                     verbose=verbose,
                     monitor=monitor,
                     hub_sk_threshold=hub_sk_threshold,
+                    blowup_factor=blowup_factor,
                     patience=patience,
                     noise_base=noise_base,
                     noise_cap_mult=noise_cap_mult,
@@ -789,6 +805,7 @@ class DECMModel:
                 monitor=monitor,
                 hub_sk_threshold=hub_sk_threshold,
                 backtracking_gamma=backtracking_gamma,
+                blowup_factor=blowup_factor,
                 patience=patience,
                 noise_base=noise_base,
                 noise_cap_mult=noise_cap_mult,

@@ -64,9 +64,6 @@ _Z_NEWTON_FRAC: float = 0.5
 _THETA_MAX: float = 50.0
 _ANDERSON_THETA_FLOOR: float = 0.1
 
-_STAGNATION_WINDOW: int = 200
-_STAGNATION_RTOL: float = 0.01
-
 
 # -------------------------------------------------------------------------
 # Anderson mixing (identical to the version in fixed_point_qdecm.py)
@@ -849,6 +846,11 @@ def solve_fixed_point_decm(
     weight_anderson: bool = True,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
+    patience: int = 750,
+    noise_base: float = 1e-2,
+    noise_cap_mult: float = 16.0,
+    max_stalls: int = 5,
+    seed: int | None = None,
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -931,6 +933,49 @@ def solve_fixed_point_decm(
         init_best_res:  The residual (MRE) achieved by ``init_best_theta``.
                         Required (and meaningful) only together with
                         ``init_best_theta``. Default ``inf``.
+        patience:       Perturbed-restart trigger, in iterations. If
+                        ``best_theta_res`` has not improved for ``patience``
+                        consecutive iterations, the solver restarts from
+                        ``best_theta`` plus Gaussian noise instead of
+                        continuing from the (stuck) current iterate --
+                        this is what actually resolves the quasi-fixed-point
+                        traps that plain Anderson/Newton alone cannot escape
+                        on hard hub-heavy instances. The same recovery also
+                        fires when the Anderson blowup guard (see
+                        ``eff_blowup`` below) trips *repeatedly* with no
+                        record improvement in between -- an isolated,
+                        self-recovering blowup is left alone (existing plain
+                        rollback, no noise). Set ``patience <= 0`` to disable
+                        and restore the old behaviour (stop immediately
+                        instead of retrying). Default 750, the value
+                        validated end-to-end on a hard N=15168 instance (see
+                        README "Checkpointed multi-chunk runs").
+        noise_base:     Standard deviation of the Gaussian noise added to
+                        ``best_theta`` on the *first* perturbed restart.
+                        Default 1e-2.
+        noise_cap_mult: Each consecutive restart that fails to improve the
+                        record doubles the noise scale (``noise_base *
+                        min(2**(restarts-1), noise_cap_mult)``), so repeated
+                        failures try progressively bigger kicks instead of
+                        looping on the same (ineffective) perturbation size --
+                        capped at ``noise_base * noise_cap_mult`` so it never
+                        degenerates into an unbounded random restart. The
+                        escalation counter resets to 0 only on a genuine
+                        record improvement. Default 16.0.
+        max_stalls:     Give up (stop, ``converged=False``) after this many
+                        restarts *at the noise cap* in a row without
+                        improving the record -- i.e. only once the strongest
+                        available kick has been tried ``max_stalls`` times
+                        and still hasn't helped. Restarts made while still
+                        escalating (noise below the cap) don't count toward
+                        this limit. Default 5.
+        seed:           Seed for the perturbation RNG (a private
+                        ``numpy.random.default_rng``, does not touch global
+                        RNG state). ``None`` (default) means unseeded/
+                        non-reproducible -- only matters for instances that
+                        actually hit a perturbed restart; well-behaved
+                        instances that never stagnate or blow up are
+                        unaffected and fully deterministic regardless.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -1090,8 +1135,49 @@ def solve_fixed_point_decm(
     else:
         best_theta = theta.clone()
         best_theta_res = float("inf")
-    best_res_recent: float = float("inf")
-    best_res_old: float = float("inf")
+
+    # ------------------------------------------------------------------
+    # Stagnation/blowup perturbed-restart state (see `patience` docstring).
+    # `restarts`/`stalls_at_cap` are shared between the patience-triggered
+    # path and the repeated-blowup path -- this is deliberate: an earlier,
+    # external version of this mechanism kept them separate (one fixed,
+    # non-escalating noise scale for blowup-retries, one escalating counter
+    # for stagnation-retries) and that combination produced a genuine
+    # infinite loop (59 consecutive chunks converging on the exact same
+    # bit-identical stuck point) on the crisi_dico2 validation run. A single
+    # shared, monotonically-escalating counter that resets only on a real
+    # record improvement is what actually fixed it.
+    # ------------------------------------------------------------------
+    import numpy as _np
+
+    _restart_rng = _np.random.default_rng(seed)
+    restarts = 0
+    stalls_at_cap = 0
+    iters_since_improve = 0
+    progressed_since_restart = True  # True until the first no-progress restart
+
+    def _perturbed_restart() -> tuple[torch.Tensor, bool]:
+        """Build a noisy restart around `best_theta`; escalate + maybe give up."""
+        nonlocal restarts, stalls_at_cap
+        restarts += 1
+        noise_mult = min(2.0 ** (restarts - 1), noise_cap_mult)
+        give_up = False
+        if noise_mult >= noise_cap_mult:
+            stalls_at_cap += 1
+            give_up = stalls_at_cap >= max_stalls
+        noise_scale = noise_base * noise_mult
+        noise = torch.from_numpy(
+            _restart_rng.normal(scale=noise_scale, size=tuple(best_theta.shape))
+        )
+        theta_restart = best_theta + noise
+        theta_restart[: 2 * N] = theta_restart[: 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
+        theta_restart[2 * N :] = theta_restart[2 * N :].clamp(_ETA_MIN, _ETA_MAX)
+        if verbose:
+            print(
+                f"[perturbed-restart] restart #{restarts} (noise_scale={noise_scale:.1e}) "
+                f"around best={best_theta_res:.3e}."
+            )
+        return theta_restart, give_up
 
     _and_g: list[torch.Tensor] = []
     _and_r: list[torch.Tensor] = []
@@ -1297,30 +1383,41 @@ def solve_fixed_point_decm(
             if res_norm < best_theta_res:
                 best_theta_res = res_norm
                 best_theta = theta.clone()
+                restarts = 0
+                stalls_at_cap = 0
+                iters_since_improve = 0
+                progressed_since_restart = True
+            else:
+                iters_since_improve += 1
 
             if res_norm < tol:
                 converged = True
                 message = f"Converged in {n_iter} iteration(s)."
                 break
 
-            # Stagnation detection
-            if res_norm < best_res_recent:
-                best_res_recent = res_norm
-            if n_iter % _STAGNATION_WINDOW == 0:
-                if n_iter > _STAGNATION_WINDOW:
-                    improvement = (best_res_old - best_res_recent) / max(best_res_old, 1e-30)
-                    if 0.0 <= improvement < _STAGNATION_RTOL:
-                        message = (
-                            f"Stagnation: residual improved by only {improvement:.2%} "
-                            f"over last {_STAGNATION_WINDOW} iterations "
-                            f"(best={best_res_recent:.3e}). Stopping at iter {n_iter}."
-                        )
-                        break
-                best_res_old = best_res_recent
-                best_res_recent = float("inf")
+            # Stagnation detection: no record improvement for `patience`
+            # iterations straight -> perturbed restart around best_theta
+            # (see `patience` docstring for why, and for the shared
+            # escalation counter with the repeated-blowup path below).
+            _patience_restart_theta: torch.Tensor | None = None
+            if patience > 0 and iters_since_improve >= patience:
+                _patience_restart_theta, _give_up = _perturbed_restart()
+                iters_since_improve = 0
+                progressed_since_restart = False
+                if _give_up:
+                    message = (
+                        f"Stagnation recovery exhausted: {max_stalls} restarts at "
+                        f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
+                        f"improving best={best_theta_res:.3e}. Stopping at iter {n_iter}."
+                    )
+                    break
 
             # Anderson acceleration
-            if anderson_depth > 1:
+            if _patience_restart_theta is not None:
+                # Already decided by the patience check above -- skip the
+                # normal Anderson/blowup handling for this iteration.
+                theta_next = _patience_restart_theta
+            elif anderson_depth > 1:
                 # Blowup guard
                 _blowup_recovered = False
                 if (
@@ -1334,7 +1431,25 @@ def solve_fixed_point_decm(
 
                 _best_res_for_anderson = min(_best_res_for_anderson, res_norm)
 
-                if _blowup_recovered:
+                if _blowup_recovered and not progressed_since_restart:
+                    # This blowup recurred with no record improvement since
+                    # the last restart (of either kind) -- a plain rollback
+                    # already failed to escape this trap once, so escalate
+                    # to the same perturbed-restart mechanism as stagnation
+                    # instead of repeating the same ineffective rollback.
+                    theta_next, _give_up = _perturbed_restart()
+                    if _give_up:
+                        message = (
+                            f"Stagnation recovery exhausted: {max_stalls} restarts at "
+                            f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
+                            f"improving best={best_theta_res:.3e}. Stopping at iter {n_iter}."
+                        )
+                        break
+                elif _blowup_recovered:
+                    # Isolated/first blowup since the last improvement: leave
+                    # the existing, cheap recovery alone (no noise) -- on
+                    # hub-heavy networks this fires often and normally
+                    # self-resolves within a few iterations, see eff_blowup.
                     # Don't continue from the corrupted current theta: a plain
                     # Newton step from there still has to crawl back across
                     # whatever distance the bad Anderson mix introduced, which
@@ -1350,6 +1465,9 @@ def solve_fixed_point_decm(
                         eta_new_rb,
                     )
                     theta_next = torch.cat([theta_rb[:2 * N], eta_new_rb])
+                    # Mark the baseline so a blowup that recurs before any
+                    # further improvement is treated as "repeated" above.
+                    progressed_since_restart = False
                 else:
                     r_k = theta_fp - theta
                     # Hub exclusion: zero hub components in r_k so Anderson
@@ -1438,6 +1556,11 @@ def solve_fixed_point_decm_degenerate(
     hub_sk_threshold: float = 0.0,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
+    patience: int = 750,
+    noise_base: float = 1e-2,
+    noise_cap_mult: float = 16.0,
+    max_stalls: int = 5,
+    seed: int | None = None,
 ) -> SolverResult:
     """Degeneracy-reduced alternating GS-Newton solver for the DECM.
 
@@ -1476,6 +1599,10 @@ def solve_fixed_point_decm_degenerate(
             :func:`solve_fixed_point_decm`'s ``init_best_theta`` docs for why
             this matters.
         init_best_res: The residual (MRE) achieved by ``init_best_theta``.
+        patience, noise_base, noise_cap_mult, max_stalls, seed: Perturbed
+            restart on stagnation/repeated-blowup, operating at group
+            (M-length) granularity -- see :func:`solve_fixed_point_decm`'s
+            docstring for the full explanation. Forwarded unchanged.
 
     Returns:
         :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
@@ -1566,6 +1693,11 @@ def solve_fixed_point_decm_degenerate(
         hub_sk_threshold=hub_sk_threshold,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,
+        patience=patience,
+        noise_base=noise_base,
+        noise_cap_mult=noise_cap_mult,
+        max_stalls=max_stalls,
+        seed=seed,
     )
 
     def _expand(theta_m):

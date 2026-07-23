@@ -387,6 +387,31 @@ print(result.converged, result.mre, result.message)  # message reports "N=... ->
 
 `solve_fixed_point_dwcm_degenerate` and `solve_fixed_point_qdecm_degenerate` follow the same pattern (`s_out, s_in` in place of `k_out, k_in`; qDECM additionally needs `theta_topo0`/`k_out`/`k_in` since it also runs the topology step internally). `solve_fixed_point_decm_degenerate` additionally supports `hub_sk_threshold` (§2.3) and `weight_anderson` (multiplicity-aware Anderson mixing, on by default — needed because a degeneracy class of `mult` identical nodes must count `mult` times in the Anderson least-squares fit to match the unreduced system exactly).
 
+### 2.6 Perturbed restart on stagnation / repeated blowup (DECM)
+
+Even with Anderson acceleration and the blowup guard (§2.1), some hub-heavy instances get stuck at a **quasi-fixed point**: progress halts for hundreds of iterations, or the Anderson blowup guard keeps tripping and rolling back to the same point without ever improving on it. Plain rollback-and-retry alone cannot escape a genuine trap — the deterministic Newton/Anderson dynamics just reproduce the same trajectory. The fix is to occasionally add noise:
+
+- **Stagnation:** if `best_theta_res` hasn't improved for `patience` consecutive iterations, restart from `best_theta` plus Gaussian noise instead of continuing from the stuck iterate.
+- **Repeated blowup:** the existing blowup guard's plain rollback-to-`best_theta` is left untouched for an *isolated* blowup (common and self-resolving on hub-heavy networks — see the `eff_blowup` note in the source). Only if the guard trips **again with no record improvement in between** does it escalate to the same noisy restart — this is the "quasi-fixed-point trap" case, not routine Anderson housekeeping.
+
+Both triggers share **one** escalation counter: noise scale starts at `noise_base` and doubles on each consecutive restart that fails to improve the record (`noise_base × min(2^(restarts-1), noise_cap_mult)`), capped at `noise_base × noise_cap_mult`, and resets to `noise_base` only on a genuine improvement. (An earlier, external version of this mechanism kept blowup-retries and stagnation-retries on separate counters, one of them with a *fixed*, non-escalating noise scale — that combination produced a real infinite loop, 59 consecutive chunks converging on the exact same stuck point, on the network below. A single shared, always-escalating counter is what actually fixed it.) Give up (`converged=False`) after `max_stalls` restarts *at the noise cap* in a row without improving the record — i.e. only once the strongest available kick has been tried repeatedly and still hasn't helped; restarts made while still escalating don't count toward this limit.
+
+**Status:** on by default (`DECMModel.solve_tool()` and the standalone `solve_fixed_point_decm[_degenerate]`). Inert for well-behaved instances that never stagnate or blow up — no default-value tuning is needed to get the old behaviour on easy networks. Set `patience<=0` to fully disable and restore the old fail-fast-on-stagnation behaviour.
+
+```python
+model = DECMModel(k_out, k_in, s_out, s_in)
+model.solve_tool(
+    max_iter=20000,
+    patience=750,        # restart after 750 iterations with no record improvement
+    noise_base=1e-2,      # first restart's noise std. dev.
+    noise_cap_mult=16.0,  # noise saturates at noise_base * 16
+    max_stalls=5,         # give up after 5 restarts at max noise with no improvement
+    seed=None,             # set an int for reproducible restarts (irrelevant if none fire)
+)
+```
+
+**Validated on a real hard instance:** DECM, N=15 168 (M=3 003 after degeneracy reduction, §2.5), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750` (750 iterations translated from the value validated in the external checkpointed-runner prototype, §3.9.1) — one repeated-blowup restart and four stagnation restarts fired, and the run converged after 9 460 iterations to MRE=9.45×10⁻⁶, with no manual intervention.
+
 ---
 
 ## 3. API Reference
@@ -825,11 +850,11 @@ qdecm.solve_tool(
 
 For DCM, DWCM and DECM pass an array of shape (2N,), (2N,) and (4N,) respectively to `ic`.  For DECM, `multi_start` is automatically disabled when `ic` is an array.
 
-### 3.9.1 Checkpointed multi-chunk runs with stagnation/divergence recovery
+### 3.9.1 Checkpointed multi-chunk runs surviving a real crash/preemption
 
-For very large or hard instances (e.g. DECM with N in the tens of thousands, or networks with extreme hub s/k ratios), a single unattended `solve_tool()` call may need tens of thousands of iterations. It is safer to run in **chunks** — `max_iter` iterations at a time, checkpointing the state to disk after each chunk — so a crash, timeout or preemption never loses more than one chunk of progress.
+Stagnation and repeated-blowup recovery are now **built into the DECM solver itself** (§2.6) — a single unattended `solve_tool()`/`solve_fixed_point_decm[_degenerate]` call handles those on its own via `patience`/`noise_base`/`noise_cap_mult`/`max_stalls`, no external orchestration needed.
 
-**`init_best_theta` / `init_best_res`.** The standalone `solve_fixed_point_*_degenerate` functions (§3.7) accept these two parameters specifically for this use case. Each chunked call is otherwise a *fresh* invocation with no memory of the record set by earlier chunks — its own in-call best-tracking and Anderson-blowup rollback can only fall back to a chunk-local best, which may already be far worse than the true historical record. Passing the previous chunk's record back in via `init_best_theta`/`init_best_res` keeps the in-call rollback (and the returned `best_theta`/`mre`) anchored to the true global best across chunk boundaries:
+What a single in-process call *cannot* survive is an actual **crash, timeout, or preemption** of the process itself — a real concern for instances that need tens of thousands of iterations (hours) unattended. For that, run in **chunks** — `max_iter` iterations at a time, checkpointing state to disk after each chunk, so a killed process never loses more than one chunk of progress:
 
 ```python
 global_best_theta, best_mre = None, float("inf")
@@ -840,6 +865,9 @@ for chunk in range(n_chunks):
         ..., theta0=theta,
         init_best_theta=global_best_theta, init_best_res=best_mre,
         max_iter=chunk_iters,
+        # patience/noise_base/noise_cap_mult/max_stalls: leave at their
+        # defaults, or pass explicitly -- they apply within EACH chunk,
+        # independently of the cross-chunk record tracked here.
     )
     if res.mre < best_mre:
         best_mre = res.mre
@@ -850,31 +878,9 @@ for chunk in range(n_chunks):
         break
 ```
 
-**Stagnation and divergence recovery.** Two failure modes are common on hard instances left running unattended:
+`init_best_theta` / `init_best_res` exist specifically for this: each chunked call is otherwise a *fresh* invocation with no memory of the record set by earlier chunks — its own in-call best-tracking (and now, stagnation/blowup recovery) can only fall back to a chunk-local best, which may already be far worse than the true historical record. Passing the previous chunk's record back in keeps everything anchored to the true global best across chunk boundaries.
 
-- *Stagnation* — `best_mre_so_far` stops improving for many consecutive chunks (the iterate is orbiting a local basin).
-- *Divergence* — a chunk's endpoint residual jumps far above the record (e.g. `> 100×`), usually after Anderson mixing picks a bad combination that individual in-call blowup protection didn't fully catch across a chunk boundary.
-
-Both are handled the same way: restart the next chunk from `global_best_theta` plus Gaussian noise, instead of continuing from the (stuck or diverged) current iterate. The noise scale should **escalate** on repeated failures and **reset only on a genuine record improvement** — a fixed noise scale on every retry can otherwise loop forever retrying the same perturbation and landing back on the same (bit-identical) stuck point:
-
-```python
-restarts = 0          # escalation counter — increments on ANY restart, resets only on improvement
-BASE_NOISE = 1e-2
-NOISE_CAP_MULT = 16
-
-...
-if res.mre < best_mre:
-    best_mre = res.mre
-    global_best_theta = res.best_theta.copy()
-    restarts = 0                                   # only a genuine improvement resets escalation
-elif stagnated_or_diverged and global_best_theta is not None:
-    restarts += 1
-    noise_mult = min(2 ** (restarts - 1), NOISE_CAP_MULT)
-    noise = np.random.default_rng().normal(scale=BASE_NOISE * noise_mult, size=global_best_theta.shape)
-    theta = global_best_theta + noise               # restart around the record, not the stuck iterate
-```
-
-**Validated on a real hard instance:** DECM on a directed weighted network with N=15 168 (M=3 003 after degeneracy reduction, §2.5), run unattended from scratch (no manual intervention) with `anderson_depth=10`, `hub_sk_threshold=5.0`, chunks of 50 iterations, `stagnation_patience=15` chunks. The run hit one divergence restart and four stagnation restarts, and converged after 9 460 iterations to MRE=9.45×10⁻⁶ — confirming the escalating-noise/global-record recovery is sufficient on its own, without any manual checkpoint adjustment, even on an instance that had previously required iterative manual fixes to reach convergence.
+**Validated on a real hard instance:** DECM, N=15 168 (M=3 003 after degeneracy reduction, §2.5), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750`, converged after 9 460 iterations to MRE=9.45×10⁻⁶ with no manual intervention — first as a chunked+checkpointed prototype (an earlier iteration of this same recovery idea, before it moved into the solver itself), then reproduced with the built-in mechanism (§2.6).
 
 ### 3.10 Network generator (`dcms/utils/wng.py`)
 

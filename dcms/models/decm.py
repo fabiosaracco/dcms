@@ -586,6 +586,11 @@ class DECMModel:
         hub_sk_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
         reduce_degeneracy: bool = True,
+        patience: int = 750,
+        noise_base: float = 1e-2,
+        noise_cap_mult: float = 16.0,
+        max_stalls: int = 5,
+        seed: int | None = None,
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -660,6 +665,37 @@ class DECMModel:
                            and ``backtracking_gamma == 0.0``; silently falls
                            back to the full (unreduced) solver otherwise,
                            with a printed note.
+            patience:      If ``best_theta_res`` has not improved for this
+                           many consecutive iterations, restart from
+                           ``model.sol.best_theta`` plus escalating Gaussian
+                           noise instead of continuing from the stuck
+                           iterate -- this is what makes hard instances
+                           (hub-heavy networks that would otherwise stall
+                           at a quasi-fixed point) converge unattended. The
+                           same recovery kicks in when the Anderson blowup
+                           guard trips repeatedly with no improvement in
+                           between; an isolated, self-recovering blowup is
+                           left alone. Set ``patience <= 0`` to disable and
+                           get the old fail-fast behaviour (stop immediately
+                           on stagnation). Default 750 (validated end-to-end
+                           on a real N=15168 instance -- see README
+                           "Checkpointed multi-chunk runs"). Inert (zero
+                           effect on the result) for instances that never
+                           stagnate or blow up.
+            noise_base:    Std. dev. of the Gaussian noise on the first
+                           perturbed restart. Default 1e-2.
+            noise_cap_mult: Noise scale doubles on each consecutive restart
+                           that fails to improve the record, capped at
+                           ``noise_base * noise_cap_mult``; resets to
+                           ``noise_base`` on the next genuine improvement.
+                           Default 16.0.
+            max_stalls:    Give up (``converged=False``) after this many
+                           restarts *at the noise cap* in a row without
+                           improving the record. Default 5.
+            seed:          Seed for the perturbation RNG (private, does not
+                           touch global RNG state). ``None`` (default) is
+                           unseeded/non-reproducible -- only relevant for
+                           instances that actually hit a perturbed restart.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -711,6 +747,11 @@ class DECMModel:
                     verbose=verbose,
                     monitor=monitor,
                     hub_sk_threshold=hub_sk_threshold,
+                    patience=patience,
+                    noise_base=noise_base,
+                    noise_cap_mult=noise_cap_mult,
+                    max_stalls=max_stalls,
+                    seed=seed,
                 )
             return solve_fixed_point_decm(
                 residual_fn=self.residual,
@@ -731,6 +772,11 @@ class DECMModel:
                 monitor=monitor,
                 hub_sk_threshold=hub_sk_threshold,
                 backtracking_gamma=backtracking_gamma,
+                patience=patience,
+                noise_base=noise_base,
+                noise_cap_mult=noise_cap_mult,
+                max_stalls=max_stalls,
+                seed=seed,
             )
 
         if not isinstance(ic, str):

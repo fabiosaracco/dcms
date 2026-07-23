@@ -562,6 +562,11 @@ converged = model.solve_tool(
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
+    patience=750,           # restart from best_theta+noise after this many iters with no improvement (see §2.6)
+    noise_base=1e-2,        # std. dev. of the first perturbed restart's noise (see §2.6)
+    noise_cap_mult=16.0,    # noise scale saturates at noise_base * noise_cap_mult (see §2.6)
+    max_stalls=5,           # give up after this many restarts at max noise with no improvement (see §2.6)
+    seed=None,              # seed for the restart RNG; irrelevant if no restart ever fires (see §2.6)
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]

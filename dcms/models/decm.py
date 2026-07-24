@@ -714,8 +714,12 @@ class DECMModel:
                            "Checkpointed multi-chunk runs"). Inert (zero
                            effect on the result) for instances that never
                            stagnate or blow up.
-            noise_base:    Std. dev. of the Gaussian noise on the first
-                           perturbed restart. Default 1e-2.
+            noise_base:    Scale of the multiplicative (log-scale) noise on
+                           the first perturbed restart: every component of
+                           theta is scaled as ``x_i *= exp(N(0, noise_base))``.
+                           See :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`
+                           for why this is multiplicative rather than
+                           additive. Default 1e-2.
             noise_cap_mult: Noise scale doubles on each consecutive restart
                            that fails to improve the record, capped at
                            ``noise_base * noise_cap_mult``; resets to

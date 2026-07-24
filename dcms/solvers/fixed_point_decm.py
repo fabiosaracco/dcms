@@ -968,8 +968,24 @@ def solve_fixed_point_decm(
                         instead of retrying). Default 750, the value
                         validated end-to-end on a hard N=15168 instance (see
                         README "Checkpointed multi-chunk runs").
-        noise_base:     Standard deviation of the Gaussian noise added to
-                        ``best_theta`` on the *first* perturbed restart.
+        noise_base:     Scale of the *multiplicative* (log-scale) Gaussian
+                        noise applied to ``best_theta`` on the *first*
+                        perturbed restart: every component of
+                        [θ_out|θ_in|η_out|η_in] is scaled as
+                        ``x_i *= exp(N(0, noise_base))``, so the perturbation
+                        is relative to each parameter's own current
+                        magnitude rather than one fixed absolute scale. This
+                        matters on hub-heavy networks in both halves of
+                        theta: a topological hub's |θ_out_i| can sit near
+                        the ±``_THETA_MAX`` boundary, where fixed-scale
+                        additive noise is too weak to matter, while a
+                        strength hub's η_i can sit near ``_ETA_MIN``, where
+                        the model is extremely sensitive to *absolute*
+                        changes (``G ~= 1/η``, ``log_q ~= -log(η)``) and the
+                        same fixed-scale additive noise is catastrophic --
+                        observed on crisi_dico2/ita_election_dico3
+                        (2026-07-24): MRE_weights jumping to ~1e5 on the very
+                        first post-restart step under additive noise.
                         Default 1e-2.
         noise_cap_mult: Each consecutive restart that fails to improve the
                         record doubles the noise scale (``noise_base *
@@ -1178,6 +1194,18 @@ def solve_fixed_point_decm(
     stalls_at_cap = 0
     iters_since_improve = 0
     progressed_since_restart = True  # True until the first no-progress restart
+    # Set True whenever theta_next comes from _perturbed_restart(); consumed
+    # on the *next* iteration to (a) skip the blowup check against the
+    # deliberately-large post-restart residual, and (b) re-anchor
+    # `_best_res_for_anderson` to that residual instead of the pre-restart
+    # historical record. Without this, the blowup guard (calibrated for
+    # small steady-state Anderson excursions, not intentional exploration)
+    # immediately re-fires on the noisy restart point itself -- observed on
+    # crisi_dico2, 2026-07-24: two real Newton steps brought the residual
+    # down from 0.397 to 0.060 post-restart (genuine recovery in progress),
+    # but the guard still judged 0.060 against the ancient 3.4e-4 record and
+    # killed the recovery, escalating to a bigger-noise restart instead.
+    _post_restart_reset = False
 
     def _perturbed_restart() -> tuple[torch.Tensor, bool]:
         """Build a noisy restart around `best_theta`; escalate + maybe give up."""
@@ -1192,7 +1220,21 @@ def solve_fixed_point_decm(
         noise = torch.from_numpy(
             _restart_rng.normal(scale=noise_scale, size=tuple(best_theta.shape))
         )
-        theta_restart = best_theta + noise
+        # Both theta and eta get *multiplicative* (log-scale) noise --
+        # theta_i *= exp(noise_i) -- rather than fixed-scale additive noise.
+        # Additive noise of one absolute scale is a poor fit for either
+        # block on hub-heavy networks: a topological hub's |theta_out_i| can
+        # sit near the +-_THETA_MAX boundary, where a small additive kick is
+        # too weak to do anything useful, while a strength hub's eta_i can
+        # sit near _ETA_MIN, where the same small additive kick is
+        # catastrophic -- G = -1/expm1(-eta) ~= 1/eta and log_q ~=
+        # -log(eta) are both wildly sensitive to *absolute* changes when eta
+        # is small (observed on crisi_dico2/ita_election_dico3, 2026-07-24:
+        # MRE_weights jumping to 1e5 on the very first post-restart step).
+        # Scaling the noise by each component's own current magnitude keeps
+        # the *relative* perturbation comparable across boundary and
+        # interior nodes alike, for both theta and eta.
+        theta_restart = best_theta * torch.exp(noise)
         theta_restart[: 2 * N] = theta_restart[: 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
         theta_restart[2 * N :] = theta_restart[2 * N :].clamp(_ETA_MIN, _ETA_MAX)
         if verbose:
@@ -1427,6 +1469,13 @@ def solve_fixed_point_decm(
                 _patience_restart_theta, _give_up = _perturbed_restart()
                 iters_since_improve = 0
                 progressed_since_restart = False
+                # Stale pre-stagnation Anderson history is irrelevant (and
+                # potentially harmful) once we jump to a discontinuous new
+                # point; also arm the post-restart blowup-guard grace (see
+                # `_post_restart_reset` above).
+                _and_g.clear()
+                _and_r.clear()
+                _post_restart_reset = True
                 if _give_up:
                     message = (
                         f"Stagnation recovery exhausted: {max_stalls} restarts at "
@@ -1441,11 +1490,16 @@ def solve_fixed_point_decm(
                 # normal Anderson/blowup handling for this iteration.
                 theta_next = _patience_restart_theta
             elif anderson_depth > 1:
-                # Blowup guard
+                # Blowup guard -- skipped for exactly one iteration right
+                # after a perturbed restart (see `_post_restart_reset`
+                # above): the restart's own residual is deliberately large
+                # by design and must not be judged as a "blowup" against the
+                # pre-restart record.
                 _blowup_recovered = False
                 if (
                     len(_and_g) >= 2
                     and math.isfinite(res_norm)
+                    and not _post_restart_reset
                     and res_norm > eff_blowup * _best_res_for_anderson
                 ):
                     _and_g.clear()
@@ -1458,7 +1512,16 @@ def solve_fixed_point_decm(
                             f"at iter {n_iter}."
                         )
 
-                _best_res_for_anderson = min(_best_res_for_anderson, res_norm)
+                if _post_restart_reset:
+                    # Re-anchor the blowup reference to the restart's own
+                    # residual instead of the (possibly far-off) historical
+                    # record, so subsequent iterations are judged on
+                    # progress *since the restart*, not distance from the
+                    # pre-restart optimum.
+                    _best_res_for_anderson = res_norm
+                    _post_restart_reset = False
+                else:
+                    _best_res_for_anderson = min(_best_res_for_anderson, res_norm)
 
                 if _blowup_recovered and not progressed_since_restart:
                     # This blowup recurred with no record improvement since
@@ -1472,6 +1535,7 @@ def solve_fixed_point_decm(
                             f"last restart -- escalating to perturbed restart."
                         )
                     theta_next, _give_up = _perturbed_restart()
+                    _post_restart_reset = True
                     if _give_up:
                         message = (
                             f"Stagnation recovery exhausted: {max_stalls} restarts at "

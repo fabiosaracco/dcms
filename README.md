@@ -400,6 +400,10 @@ Both triggers share **one** escalation counter: noise scale starts at `noise_bas
 
 **The blowup guard gives every restart a one-iteration grace period.** Right after a perturbed restart, the very first evaluated residual is the raw noisy point itself — deliberately far from the record by design — and must not be judged as a "blowup" against the pre-restart optimum. Without this grace, the guard's own trigger (calibrated for small steady-state Anderson excursions) could kill a restart's recovery before Newton/Anderson got even one real chance to reconverge, escalating straight to a bigger-noise restart instead: observed on crisi_dico2, where two genuine post-restart Newton steps brought the residual down 6.6× (0.397 → 0.060) before the guard, still anchored to the ancient record, discarded that progress and forced restart #2. The fix re-anchors the guard's reference (`_best_res_for_anderson`) to the restart's own residual for that one grace iteration, so later checks judge progress *since the restart*, not distance from history.
 
+**The isolated-blowup rollback applies the same hub-eta correction a normal step gets.** On hub-heavy networks (`hub_sk_threshold > 0`), every regular iteration corrects hub nodes' η exactly via 1D bisection instead of the (less stable) global Newton step. The rollback branch used to skip this — its one-step `theta_rb = _step(best_theta)` bypassed the hub-bisection block entirely, leaving hub η only as accurate as one global Newton step right at the moment recovery needs it most. Fixed 2026-07-24 by factoring hub-bisection into a shared helper applied in both places.
+
+**A restart that actually fires resets the "isolated vs. repeated" clock.** The distinction between an isolated blowup (cheap rollback) and a repeated one (escalate) is tracked by "has there been a record improvement since the last intervention"; a successful perturbed restart used to *not* count as an intervention for this purpose, so it never reset the clock — meaning the very next blowup after a restart, however far downstream and however much clean progress happened first, was always misread as "still the same trap" and escalated immediately, regardless of how well that restart had actually gone. Observed on crisi_dico2, 2026-07-24: restart #1 ran cleanly for 95 iterations with zero blowups, yet the blowup that eventually occurred was still classified "repeated" and jumped straight to restart #2 with doubled noise — with every later restart's recovery ceiling landing further from the record than the last (3.6×10⁻⁴ → 4.0×10⁻⁴ → ... → 1.4×10⁻³), never beating it. Fixed by resetting the "no progress" flag on a restart that actually fires, giving the resulting trajectory its own fresh isolated-blowup grace instead of inheriting the trap's history. Together with the hub-bisection fix above, this took the same reproduction from 9 cascading restarts giving up in 24 iterations down to 1 restart followed by 479 iterations of clean, continuously record-improving recovery.
+
 **The blowup guard's sensitivity is tunable via `blowup_factor`.** A rollback triggers when the current iteration's residual exceeds `blowup_factor` times the best residual ever seen this call (a *running minimum*, so this catches a slow multi-hundred-iteration drift away from the record just as well as a sudden spike). Default `None` uses the built-in scale-adaptive formula `max(200, min(5000, 200_000/N))` — generous for small N, strict for large N. On instances that visibly wander far from their best point over many iterations without any single jump large enough to trip that default floor, pass a smaller value (e.g. `20`-`50`) to get more frequent, cheap (noise-free) rollbacks instead of letting the trajectory drift until `patience` iterations finally force a (noisy) restart.
 
 **With `verbose=True`, every intervention prints a message** — `[blowup] ...` when the guard trips (one line for an isolated rollback, another when it escalates), and `[perturbed-restart] restart #N ...` for both stagnation- and blowup-triggered noisy restarts — so an unattended run's log shows exactly when and why the trajectory was redirected, not just silent MRE fluctuation.
@@ -412,8 +416,9 @@ model.solve_tool(
     max_iter=20000,
     blowup_factor=None,   # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner
     patience=750,        # restart after 750 iterations with no record improvement
-    noise_base=1e-2,      # first restart's noise std. dev.
+    noise_base=1e-2,      # first restart's noise scale (multiplicative, see above)
     noise_cap_mult=16.0,  # noise saturates at noise_base * 16
+    noise_growth=2.0,     # noise doubles per consecutive failed restart; lower (e.g. 1.2-1.5) if escalation overshoots
     max_stalls=5,         # give up after 5 restarts at max noise with no improvement
     seed=None,             # set an int for reproducible restarts (irrelevant if none fire)
 )
@@ -578,8 +583,9 @@ converged = model.solve_tool(
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
     blowup_factor=None,     # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner (see §2.6)
     patience=750,           # restart from best_theta+noise after this many iters with no improvement (see §2.6)
-    noise_base=1e-2,        # std. dev. of the first perturbed restart's noise (see §2.6)
+    noise_base=1e-2,        # scale of the first perturbed restart's (multiplicative) noise (see §2.6)
     noise_cap_mult=16.0,    # noise scale saturates at noise_base * noise_cap_mult (see §2.6)
+    noise_growth=2.0,       # noise growth rate per consecutive failed restart (see §2.6)
     max_stalls=5,           # give up after this many restarts at max noise with no improvement (see §2.6)
     seed=None,              # seed for the restart RNG; irrelevant if no restart ever fires (see §2.6)
 )

@@ -850,6 +850,7 @@ def solve_fixed_point_decm(
     patience: int = 750,
     noise_base: float = 1e-2,
     noise_cap_mult: float = 16.0,
+    noise_growth: float = 2.0,
     max_stalls: int = 5,
     seed: int | None = None,
 ) -> SolverResult:
@@ -988,14 +989,26 @@ def solve_fixed_point_decm(
                         first post-restart step under additive noise.
                         Default 1e-2.
         noise_cap_mult: Each consecutive restart that fails to improve the
-                        record doubles the noise scale (``noise_base *
-                        min(2**(restarts-1), noise_cap_mult)``), so repeated
-                        failures try progressively bigger kicks instead of
-                        looping on the same (ineffective) perturbation size --
-                        capped at ``noise_base * noise_cap_mult`` so it never
+                        record grows the noise scale by ``noise_growth``
+                        (``noise_base * min(noise_growth**(restarts-1),
+                        noise_cap_mult)``), so repeated failures try
+                        progressively bigger kicks instead of looping on the
+                        same (ineffective) perturbation size -- capped at
+                        ``noise_base * noise_cap_mult`` so it never
                         degenerates into an unbounded random restart. The
                         escalation counter resets to 0 only on a genuine
                         record improvement. Default 16.0.
+        noise_growth:   Per-restart multiplicative growth rate of the noise
+                        scale (see ``noise_cap_mult``). Default 2.0
+                        (doubling). Lower this (e.g. 1.2-1.5) on instances
+                        where escalating noise makes each successive
+                        recovery attempt land *further* from the record
+                        instead of closer -- a sign the trap's basin is
+                        being overshot rather than escaped, observed on
+                        crisi_dico2 (2026-07-24): with the default doubling,
+                        every restart's post-recovery residual was worse
+                        than the last (3.6e-4 -> 4.0e-4 -> ... -> 1.4e-3),
+                        never beating the pre-restart record.
         max_stalls:     Give up (stop, ``converged=False``) after this many
                         restarts *at the noise cap* in a row without
                         improving the record -- i.e. only once the strongest
@@ -1193,7 +1206,13 @@ def solve_fixed_point_decm(
     restarts = 0
     stalls_at_cap = 0
     iters_since_improve = 0
-    progressed_since_restart = True  # True until the first no-progress restart
+    # True until the first blowup/stagnation intervention; reset back to
+    # True by a genuine record improvement *or* by a restart that actually
+    # fires (a restart is itself a fresh start -- see the two call sites of
+    # _perturbed_restart() below). Only a blowup encountered while this is
+    # already False (i.e. no record beaten and no restart fired since the
+    # last time it went False) counts as "repeated" and escalates.
+    progressed_since_restart = True
     # Set True whenever theta_next comes from _perturbed_restart(); consumed
     # on the *next* iteration to (a) skip the blowup check against the
     # deliberately-large post-restart residual, and (b) re-anchor
@@ -1211,7 +1230,7 @@ def solve_fixed_point_decm(
         """Build a noisy restart around `best_theta`; escalate + maybe give up."""
         nonlocal restarts, stalls_at_cap
         restarts += 1
-        noise_mult = min(2.0 ** (restarts - 1), noise_cap_mult)
+        noise_mult = min(noise_growth ** (restarts - 1), noise_cap_mult)
         give_up = False
         if noise_mult >= noise_cap_mult:
             stalls_at_cap += 1
@@ -1307,6 +1326,47 @@ def solve_fixed_point_decm(
         _hub_in_indices = []
         _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
 
+    def _apply_hub_bisection(theta_fp: torch.Tensor) -> torch.Tensor:
+        """Exact 1D-bisection correction of hub eta components (see the
+        module-level hub-bisection block in the main loop for details).
+        Factored out so the isolated-blowup rollback (below) can apply the
+        same correction its theta_rb -- without it, a hub node's eta right
+        after a rollback is only as good as one global Newton step, exactly
+        the instability hub_sk_threshold exists to avoid, at precisely the
+        moment recovery needs it most (observed on crisi_dico2, 2026-07-24:
+        the rollback's omission of hub-bisection was a likely contributor to
+        why recovery after an isolated blowup sometimes fails to find a new
+        record before the next blowup escalates)."""
+        if not (_hub_active and (_hub_out_indices or _hub_in_indices)):
+            return theta_fp
+        _th_fp_np = theta_fp.numpy()
+        for _sweep in range(3):
+            for _i in _hub_out_indices:
+                _eta_in_cur = _th_fp_np[3 * N:]
+                _tho_cur = _th_fp_np[N:2 * N]
+                _eta_out_new = _bisect_hub_eta_decm(
+                    theta_self=float(_th_fp_np[_i]),
+                    theta_other=_tho_cur,
+                    eta_other=_eta_in_cur,
+                    s_target=float(s_out[_i].item()),
+                    self_idx=_i,
+                    mult=_mult_np,
+                )
+                _th_fp_np[2 * N + _i] = _eta_out_new
+            for _j in _hub_in_indices:
+                _eta_out_cur = _th_fp_np[2 * N:3 * N]
+                _tho_cur = _th_fp_np[:N]
+                _eta_in_new = _bisect_hub_eta_decm(
+                    theta_self=float(_th_fp_np[N + _j]),
+                    theta_other=_tho_cur,
+                    eta_other=_eta_out_cur,
+                    s_target=float(s_in[_j].item()),
+                    self_idx=_j,
+                    mult=_mult_np,
+                )
+                _th_fp_np[3 * N + _j] = _eta_in_new
+        return torch.from_numpy(_th_fp_np)
+
     try:
         for _ in range(max_iter):
             if max_time > 0 and (time.perf_counter() - t0) > max_time:
@@ -1332,35 +1392,7 @@ def solve_fixed_point_decm(
             # via 1D bisection (3 GS sweeps for consistency between out/in).
             # ------------------------------------------------------------------
             if _hub_active and (_hub_out_indices or _hub_in_indices):
-                _th_fp_np = theta_fp.numpy()
-                for _sweep in range(3):
-                    # --- Out-hub pass ---
-                    for _i in _hub_out_indices:
-                        _eta_in_cur = _th_fp_np[3 * N:]       # current η_in
-                        _tho_cur = _th_fp_np[N:2 * N]         # current θ_in
-                        _eta_out_new = _bisect_hub_eta_decm(
-                            theta_self=float(_th_fp_np[_i]),   # θ_out_i
-                            theta_other=_tho_cur,
-                            eta_other=_eta_in_cur,
-                            s_target=float(s_out[_i].item()),
-                            self_idx=_i,
-                            mult=_mult_np,
-                        )
-                        _th_fp_np[2 * N + _i] = _eta_out_new
-                    # --- In-hub pass ---
-                    for _j in _hub_in_indices:
-                        _eta_out_cur = _th_fp_np[2 * N:3 * N] # current η_out
-                        _tho_cur = _th_fp_np[:N]               # current θ_out
-                        _eta_in_new = _bisect_hub_eta_decm(
-                            theta_self=float(_th_fp_np[N + _j]),   # θ_in_j
-                            theta_other=_tho_cur,
-                            eta_other=_eta_out_cur,
-                            s_target=float(s_in[_j].item()),
-                            self_idx=_j,
-                            mult=_mult_np,
-                        )
-                        _th_fp_np[3 * N + _j] = _eta_in_new
-                theta_fp = torch.from_numpy(_th_fp_np)
+                theta_fp = _apply_hub_bisection(theta_fp)
 
                 # Zero out F_current for hub nodes (their strength equation is
                 # exactly satisfied after bisection; keep residual for bookkeeping)
@@ -1468,7 +1500,18 @@ def solve_fixed_point_decm(
             if patience > 0 and iters_since_improve >= patience:
                 _patience_restart_theta, _give_up = _perturbed_restart()
                 iters_since_improve = 0
-                progressed_since_restart = False
+                # A restart is itself a fresh start: give the resulting
+                # trajectory its own first-blowup grace (see
+                # `progressed_since_restart`'s declaration above) instead of
+                # inheriting "no progress" from whatever triggered this
+                # restart. The escalation counter (`restarts`, inside
+                # `_perturbed_restart`) still only resets on a genuine
+                # record improvement, so this doesn't weaken the
+                # loop-prevention guarantee -- it just stops every single
+                # post-restart blowup, however far downstream and however
+                # much clean progress happened first, from being misread as
+                # "still the same trap" and escalating immediately.
+                progressed_since_restart = True
                 # Stale pre-stagnation Anderson history is irrelevant (and
                 # potentially harmful) once we jump to a discontinuous new
                 # point; also arm the post-restart blowup-guard grace (see
@@ -1536,6 +1579,11 @@ def solve_fixed_point_decm(
                         )
                     theta_next, _give_up = _perturbed_restart()
                     _post_restart_reset = True
+                    # See the patience-triggered restart above: a restart is
+                    # a fresh start, so the resulting trajectory gets its
+                    # own first-blowup grace rather than inheriting "no
+                    # progress" from the trap that triggered this restart.
+                    progressed_since_restart = True
                     if _give_up:
                         message = (
                             f"Stagnation recovery exhausted: {max_stalls} restarts at "
@@ -1568,7 +1616,14 @@ def solve_fixed_point_decm(
                         torch.maximum(eta_new_rb, _eta_floor_rb),
                         eta_new_rb,
                     )
-                    theta_next = torch.cat([theta_rb[:2 * N], eta_new_rb])
+                    theta_rb = torch.cat([theta_rb[:2 * N], eta_new_rb])
+                    # Apply the same exact hub-eta correction a normal step
+                    # would get (see `_apply_hub_bisection`'s docstring) --
+                    # without it, hub nodes come out of the rollback only as
+                    # accurate as one global Newton step, exactly the
+                    # instability hub_sk_threshold exists to prevent, right
+                    # when recovery needs it most.
+                    theta_next = _apply_hub_bisection(theta_rb)
                     # Mark the baseline so a blowup that recurs before any
                     # further improvement is treated as "repeated" above.
                     progressed_since_restart = False
@@ -1664,6 +1719,7 @@ def solve_fixed_point_decm_degenerate(
     patience: int = 750,
     noise_base: float = 1e-2,
     noise_cap_mult: float = 16.0,
+    noise_growth: float = 2.0,
     max_stalls: int = 5,
     seed: int | None = None,
 ) -> SolverResult:
@@ -1803,6 +1859,7 @@ def solve_fixed_point_decm_degenerate(
         patience=patience,
         noise_base=noise_base,
         noise_cap_mult=noise_cap_mult,
+        noise_growth=noise_growth,
         max_stalls=max_stalls,
         seed=seed,
     )

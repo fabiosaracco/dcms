@@ -607,6 +607,7 @@ class DECMModel:
         patience: int = 750,
         noise_base: float = 1e-2,
         noise_cap_mult: float = 16.0,
+        noise_growth: float = 2.0,
         max_stalls: int = 5,
         seed: int | None = None,
     ) -> bool:
@@ -720,11 +721,15 @@ class DECMModel:
                            See :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`
                            for why this is multiplicative rather than
                            additive. Default 1e-2.
-            noise_cap_mult: Noise scale doubles on each consecutive restart
-                           that fails to improve the record, capped at
-                           ``noise_base * noise_cap_mult``; resets to
-                           ``noise_base`` on the next genuine improvement.
-                           Default 16.0.
+            noise_cap_mult: Noise scale grows by ``noise_growth`` on each
+                           consecutive restart that fails to improve the
+                           record, capped at ``noise_base * noise_cap_mult``;
+                           resets to ``noise_base`` on the next genuine
+                           improvement. Default 16.0.
+            noise_growth:  Per-restart growth rate of the noise scale.
+                           Default 2.0 (doubling). See
+                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`
+                           for when to lower this.
             max_stalls:    Give up (``converged=False``) after this many
                            restarts *at the noise cap* in a row without
                            improving the record. Default 5.
@@ -787,6 +792,7 @@ class DECMModel:
                     patience=patience,
                     noise_base=noise_base,
                     noise_cap_mult=noise_cap_mult,
+                    noise_growth=noise_growth,
                     max_stalls=max_stalls,
                     seed=seed,
                 )
@@ -813,6 +819,7 @@ class DECMModel:
                 patience=patience,
                 noise_base=noise_base,
                 noise_cap_mult=noise_cap_mult,
+                noise_growth=noise_growth,
                 max_stalls=max_stalls,
                 seed=seed,
             )

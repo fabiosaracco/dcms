@@ -600,6 +600,7 @@ class DECMModel:
         num_threads: int = 0,
         verbose: bool = False,
         monitor: bool = False,
+        topo_weig: bool = False,
         hub_sk_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
         reduce_degeneracy: bool = True,
@@ -659,6 +660,11 @@ class DECMModel:
             monitor:       If ``True`` (and ``verbose=True``), overwrite the
                            same terminal line at each iteration (``end='\\r'``)
                            so only the latest status is visible.  Default=False.
+            topo_weig:     If ``True`` (and ``verbose=True``), the per-iteration
+                           progress line splits the MRE into ``MRE_topo``
+                           (degree part) and ``MRE_weights`` (strength part).
+                           If ``False`` (default), it prints a single global
+                           ``MRE`` instead.
             hub_sk_threshold: When > 0, nodes with observed s_i/k_hat_i above
                            this value are treated as hub nodes and solved
                            exactly each iteration via 1D bisection over η
@@ -787,6 +793,7 @@ class DECMModel:
                     num_threads=num_threads,
                     verbose=verbose,
                     monitor=monitor,
+                    topo_weig=topo_weig,
                     hub_sk_threshold=hub_sk_threshold,
                     blowup_factor=blowup_factor,
                     patience=patience,
@@ -813,6 +820,7 @@ class DECMModel:
                 num_threads=num_threads,
                 verbose=verbose,
                 monitor=monitor,
+                topo_weig=topo_weig,
                 hub_sk_threshold=hub_sk_threshold,
                 backtracking_gamma=backtracking_gamma,
                 blowup_factor=blowup_factor,

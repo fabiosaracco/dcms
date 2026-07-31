@@ -840,6 +840,7 @@ def solve_fixed_point_decm(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    topo_weig: bool = False,
     hub_sk_threshold: float = 0.0,
     backtracking_gamma: float = 0.0,
     mult: torch.Tensor | None = None,
@@ -893,6 +894,12 @@ def solve_fixed_point_decm(
         monitor:        If ``True`` (and ``verbose=True``), overwrite the same
                         terminal line at each iteration (``end='\\r'``) so only
                         the latest status is visible.  Default=False.
+        topo_weig:      If ``True`` (and ``verbose=True``), the per-iteration
+                        progress line splits the MRE into ``MRE_topo``
+                        (degree part) and ``MRE_weights`` (strength part).
+                        If ``False`` (default), it prints a single global
+                        ``MRE`` (the same ℓ∞ relative residual used for the
+                        ``tol`` check) instead.
         hub_sk_threshold: When > 0, nodes whose observed strength-to-degree
                         ratio ``s_i / k_hat_i`` exceeds this value are treated
                         as *hub nodes* and solved exactly each iteration via 1D
@@ -1455,26 +1462,35 @@ def solve_fixed_point_decm(
 
             if verbose:
                 _elapsed = time.perf_counter() - t0
-                _N = len(k_out)
-                _topo_targets = _v_targets[:2 * _N]
-                _topo_nz = _topo_targets > 0
-                _weights_targets = _v_targets[2 * _N:]
-                _weights_nz = _weights_targets > 0
-                _mre_topo = (
-                    (F_current[:2 * _N].abs()[_topo_nz] / _topo_targets[_topo_nz]).max().item()
-                    if _topo_nz.any() else float("nan")
-                )
-                _mre_weights = (
-                    (F_current[2 * _N:].abs()[_weights_nz] / _weights_targets[_weights_nz]).max().item()
-                    if _weights_nz.any() else float("nan")
-                )
-                print(
-                    f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
-                    f"iteration={n_iter:5d}, "
-                    f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
-                    f"MRE_topo={_mre_topo:.5e}, MRE_weights={_mre_weights:.5e}",
-                    end="\r" if monitor else "\n",
-                )
+                if topo_weig:
+                    _N = len(k_out)
+                    _topo_targets = _v_targets[:2 * _N]
+                    _topo_nz = _topo_targets > 0
+                    _weights_targets = _v_targets[2 * _N:]
+                    _weights_nz = _weights_targets > 0
+                    _mre_topo = (
+                        (F_current[:2 * _N].abs()[_topo_nz] / _topo_targets[_topo_nz]).max().item()
+                        if _topo_nz.any() else float("nan")
+                    )
+                    _mre_weights = (
+                        (F_current[2 * _N:].abs()[_weights_nz] / _weights_targets[_weights_nz]).max().item()
+                        if _weights_nz.any() else float("nan")
+                    )
+                    print(
+                        f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
+                        f"iteration={n_iter:5d}, "
+                        f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
+                        f"MRE_topo={_mre_topo:.5e}, MRE_weights={_mre_weights:.5e}",
+                        end="\r" if monitor else "\n",
+                    )
+                else:
+                    print(
+                        f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
+                        f"iteration={n_iter:5d}, "
+                        f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
+                        f"MRE={res_norm:.5e}",
+                        end="\r" if monitor else "\n",
+                    )
                 sys.stdout.flush()
 
             if res_norm < best_theta_res:
@@ -1711,6 +1727,7 @@ def solve_fixed_point_decm_degenerate(
     num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
+    topo_weig: bool = False,
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
     init_best_theta: torch.Tensor | None = None,
@@ -1850,6 +1867,7 @@ def solve_fixed_point_decm_degenerate(
         num_threads=num_threads,
         verbose=verbose,
         monitor=monitor,
+        topo_weig=topo_weig,
         mult=mult,
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,

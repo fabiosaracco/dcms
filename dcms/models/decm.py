@@ -684,12 +684,11 @@ class DECMModel:
                            ``k=1``), where the same relative tolerance
                            demands very tight absolute precision that the
                            global step can struggle to hit. Default=0.0
-                           (disabled). KNOWN LIMITATION (2026-07-31): can
-                           currently *prevent* convergence outright in some
-                           cases and is unvectorized (slow per-node Python
-                           loop) -- see the detailed note on this parameter
-                           in :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`
-                           before relying on it.
+                           (disabled). Applied once per iteration to the
+                           final theta_next (after mixing/restart/rollback),
+                           vectorized across all leaf nodes at once -- see
+                           the detailed note on this parameter in
+                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`.
             backtracking_gamma: When > 0, enables a per-step backtracking
                            line search.  After each Newton step the residual
                            at the proposed iterate is evaluated; if it exceeds

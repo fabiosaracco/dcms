@@ -462,26 +462,29 @@ class TestDECMSolverConvergence:
 # TestDECMLeafBisection
 # ---------------------------------------------------------------------------
 
-def make_leaf_test_network(N: int = 12, n_leaves: int = 2, seed: int = 0):
-    """Return a small *feasible* network (k/s derived from a real theta_true,
-    same recipe as :func:`make_decm_model`) with a couple of nodes pushed to
-    a genuinely low out-/in-degree (~1) via a large θ_out/θ_in.
+def make_leaf_test_network(N: int = 40, n_leaves: int = 2, seed: int = 0):
+    """Return a *feasible* network (k/s derived from a real theta_true, same
+    recipe as :func:`make_decm_model`) where a small *minority* of nodes
+    (``n_leaves`` out of N) have a genuinely low out-/in-degree (<1) via a
+    large θ_out/θ_in, while the rest sit at a moderate-to-high degree.
 
-    Kept deliberately tiny: the current leaf-bisection implementation runs
-    an unvectorized per-node/per-sweep Python bisection loop each iteration,
-    which is expensive relative to the (already fast) dense N=O(10) step --
-    see the performance note on ``leaf_k_threshold`` in solve_tool's
-    docstring. A handful of leaves on a handful of nodes keeps these tests
-    fast; it is not representative of production-scale cost.
+    The minority-vs-majority split matters: with a small/dense N where most
+    nodes end up low-degree anyway, ``leaf_k_threshold`` ends up bisecting
+    ~all of θ every iteration -- a different (and, empirically, much
+    harder) dynamical regime than the intended use case (a handful of
+    stubborn low-degree nodes in an otherwise well-connected network, as in
+    the real motivating case). N=40 with a wide θ range keeps most nodes at
+    k~4-20 so only the forced ``n_leaves`` nodes per side actually trip the
+    default threshold used in these tests (1.0).
     """
     rng = np.random.default_rng(seed)
-    theta_out = rng.uniform(0.5, 2.0, N)
-    theta_in = rng.uniform(0.5, 2.0, N)
+    theta_out = rng.uniform(-1.5, 0.5, N)
+    theta_in = rng.uniform(-1.5, 0.5, N)
     eta_out = rng.uniform(0.5, 1.5, N)
     eta_in = rng.uniform(0.5, 1.5, N)
-    # Push a couple of nodes toward a genuinely low (~1) degree.
-    theta_out[:n_leaves] = rng.uniform(2.6, 3.0, n_leaves)
-    theta_in[n_leaves:2 * n_leaves] = rng.uniform(2.6, 3.0, n_leaves)
+    # Push a couple of nodes toward a genuinely low (<1) degree.
+    theta_out[:n_leaves] = rng.uniform(2.5, 3.0, n_leaves)
+    theta_in[n_leaves:2 * n_leaves] = rng.uniform(2.5, 3.0, n_leaves)
 
     eta_mat = eta_out[:, None] + eta_in[None, :]
     log_q = -np.log(np.expm1(eta_mat))
@@ -503,52 +506,52 @@ class TestDECMLeafBisection:
     """Tests for the leaf_k_threshold exact-bisection mechanism (the θ-side
     analogue of hub_sk_threshold, for low-degree instead of high-s/k nodes).
 
-    Kept to a small iteration budget throughout: see
-    :func:`make_leaf_test_network`'s docstring for why (unvectorized
-    per-node bisection cost, not representative of a converged run)."""
+    Bisection is applied once per iteration, to the *final* theta_next
+    (after Anderson mixing/restart/rollback), not to the pre-mixing
+    proposal -- this keeps it self-consistent with the opposing values that
+    actually carry forward (see the comment at the single call site in
+    solve_fixed_point_decm's main loop). An earlier pre-mixing +
+    freeze-restore design was found to sometimes prevent convergence
+    outright (moving-target self-consistency issue); these tests assert the
+    stronger guarantees the current design is expected to satisfy."""
 
     @pytest.mark.parametrize("reduce_degeneracy", [False, True])
-    def test_leaf_bisection_runs_and_produces_finite_result(self, reduce_degeneracy: bool):
-        """leaf_k_threshold shouldn't crash or produce NaN/Inf.
-
-        KNOWN LIMITATION (not asserted "fixed" here, tracked deliberately):
-        leaf-bisection solves each leaf node's degree equation exactly
-        against a *snapshot* of its opposing nodes' θ/η; Anderson mixing
-        then updates those opposing values before the next iteration, so the
-        fit is against a slightly moving target until the rest of the
-        network settles. This is the same mechanism `hub_sk_threshold` uses
-        (bisect θ_fp, then "freeze"-restore after mixing), and is invisible
-        there because hub targets are large (loose relative tolerance).
-        Leaf targets are small, so the same imprecision is proportionally
-        much larger -- confirmed empirically to sometimes *prevent*
-        convergence outright within a budget the plain solver clears easily
-        (e.g. N=12, reduce_degeneracy=False, 2000 iterations: plain solver
-        converges in ~465 iters from a cold start; with leaf_k_threshold=1.5
-        it was still at mre=5.1e-3 after 2000). Fixing this properly likely
-        means bisecting *after* Anderson mixing (on theta_next, using the
-        opposing values that actually carry forward) rather than before/
-        freeze-after -- not yet done. See
-        test_leaf_bisection_exact_once_settled for the regime (near overall
-        convergence, opposing values ~static) where the mechanism does work
-        as intended.
-        """
-        N, n_leaves = 12, 2
+    def test_leaf_bisection_converges_and_helps(self, reduce_degeneracy: bool):
+        """leaf_k_threshold shouldn't prevent convergence, and (on a network
+        where leaves are a genuine minority, matching the real use case)
+        should reach convergence in no more iterations than the plain
+        solver needs on the same network."""
+        N, n_leaves = 40, 2
         k_out, k_in, s_out, s_in = make_leaf_test_network(N=N, n_leaves=n_leaves)
-        model = DECMModel(k_out, k_in, s_out, s_in)
-        model.solve_tool(
-            tol=CONV_TOL, max_iter=300, anderson_depth=10,
-            leaf_k_threshold=1.5, reduce_degeneracy=reduce_degeneracy,
+
+        model_plain = DECMModel(k_out, k_in, s_out, s_in)
+        conv_plain = model_plain.solve_tool(
+            tol=CONV_TOL, max_iter=3000, anderson_depth=10,
+            reduce_degeneracy=reduce_degeneracy, multi_start=False,
+        )
+        model_leaf = DECMModel(k_out, k_in, s_out, s_in)
+        conv_leaf = model_leaf.solve_tool(
+            tol=CONV_TOL, max_iter=3000, anderson_depth=10,
+            leaf_k_threshold=1.0, reduce_degeneracy=reduce_degeneracy,
             multi_start=False,
         )
-        assert math.isfinite(model.sol.mre)
-        assert np.isfinite(model.sol.best_theta).all()
+        assert conv_plain, f"reduce_degeneracy={reduce_degeneracy}: baseline itself didn't converge"
+        assert conv_leaf, (
+            f"reduce_degeneracy={reduce_degeneracy}: leaf_k_threshold prevented "
+            f"convergence after {model_leaf.sol.iterations} iters, mre={model_leaf.sol.mre:.3e}"
+        )
+        assert model_leaf.sol.iterations <= model_plain.sol.iterations, (
+            f"reduce_degeneracy={reduce_degeneracy}: leaf bisection took more "
+            f"iterations ({model_leaf.sol.iterations}) than plain "
+            f"({model_plain.sol.iterations}) on a minority-leaf network"
+        )
 
     def test_leaf_bisection_exact_once_settled(self):
         """Once the rest of the network is near-converged (opposing values
         essentially static), leaf-bisection should drive the forced
         low-degree nodes' residual to near machine precision -- the regime
         the mechanism is actually meant for."""
-        N, n_leaves = 12, 2
+        N, n_leaves = 40, 2
         k_out, k_in, s_out, s_in = make_leaf_test_network(N=N, n_leaves=n_leaves)
 
         warm = DECMModel(k_out, k_in, s_out, s_in)
@@ -558,7 +561,7 @@ class TestDECMLeafBisection:
         model = DECMModel(k_out, k_in, s_out, s_in)
         model.solve_tool(
             tol=1e-9, max_iter=100, anderson_depth=10, ic=warm.sol.best_theta,
-            leaf_k_threshold=1.5, multi_start=False,
+            leaf_k_threshold=1.0, multi_start=False,
         )
         F = model.residual(torch.as_tensor(model.sol.best_theta))
         out_leaf_res = F[:N][:n_leaves].abs().max().item()
@@ -567,32 +570,22 @@ class TestDECMLeafBisection:
         assert in_leaf_res < 1e-6, f"in-leaf residual too large: {in_leaf_res:.3e}"
 
     def test_leaf_bisection_exact_when_it_fires(self):
-        """When a node stays classified as a leaf across an iteration (no
-        Anderson-mixing drift on its *own* θ), the degree equation for it
-        should be satisfied near machine precision right after bisection."""
-        from dcms.solvers.fixed_point_decm import _bisect_leaf_theta_decm, _Z_G_CLAMP
-
-        N, n_leaves = 12, 2
+        """Right after solve_tool returns, the forced leaf nodes' degree
+        equation should be satisfied near machine precision -- theta was
+        bisected against its own final opposing values on the last
+        iteration that touched it."""
+        N, n_leaves = 40, 2
         k_out, k_in, s_out, s_in = make_leaf_test_network(N=N, n_leaves=n_leaves)
         model = DECMModel(k_out, k_in, s_out, s_in)
         model.solve_tool(
-            tol=CONV_TOL, max_iter=30, anderson_depth=10,
-            leaf_k_threshold=1.5, reduce_degeneracy=False, multi_start=False,
+            tol=CONV_TOL, max_iter=3000, anderson_depth=10,
+            leaf_k_threshold=1.0, reduce_degeneracy=False, multi_start=False,
         )
-        theta = model.sol.theta
-        theta_in = theta[N:2 * N]
-        eta_out0 = theta[2 * N]
-        eta_in = theta[3 * N:]
-        theta_star = _bisect_leaf_theta_decm(
-            theta_other=theta_in, eta_self=eta_out0, eta_other=eta_in,
-            k_target=float(k_out[0]), self_idx=0,
-        )
-        z = np.maximum(eta_out0 + eta_in, _Z_G_CLAMP)
-        log_q = -np.log(np.expm1(z))
-        logit_p = -theta_star - theta_in + log_q
-        p = 1.0 / (1.0 + np.exp(-logit_p))
-        p[0] = 0.0
-        assert abs(p.sum() - k_out[0]) < 1e-6
+        F = model.residual(torch.as_tensor(model.sol.best_theta))
+        out_leaf_res = F[:N][:n_leaves].abs().max().item()
+        in_leaf_res = F[N:2 * N][n_leaves:2 * n_leaves].abs().max().item()
+        assert out_leaf_res < 1e-6, f"out-leaf residual too large: {out_leaf_res:.3e}"
+        assert in_leaf_res < 1e-6, f"in-leaf residual too large: {in_leaf_res:.3e}"
 
     def test_leaf_bisection_disabled_by_default(self):
         """leaf_k_threshold defaults to 0.0 (disabled) and must reproduce
@@ -604,6 +597,59 @@ class TestDECMLeafBisection:
         model_b = DECMModel(k_out, k_in, s_out, s_in)
         model_b.solve_tool(tol=CONV_TOL, max_iter=100, leaf_k_threshold=0.0, seed=7, multi_start=False)
         np.testing.assert_array_equal(model_a.sol.theta, model_b.sol.theta)
+
+    def test_leaf_bisection_batch_matches_per_node(self):
+        """The vectorized batch bisection must match the per-node reference
+        implementation exactly (up to bisection tolerance), node by node."""
+        from dcms.solvers.fixed_point_decm import (
+            _bisect_leaf_theta_decm, _bisect_leaf_theta_decm_batch,
+        )
+
+        rng = np.random.default_rng(4)
+        N = 30
+        theta_other = rng.uniform(-1.0, 2.0, N)
+        eta_self_all = rng.uniform(0.3, 1.5, N)
+        eta_other = rng.uniform(0.3, 1.5, N)
+        k_target_all = rng.uniform(0.5, 2.0, N)
+        leaf_indices = [2, 5, 9, 17, 23]
+
+        batch_result = _bisect_leaf_theta_decm_batch(
+            leaf_indices=leaf_indices, theta_other=theta_other,
+            eta_self_all=eta_self_all, eta_other=eta_other,
+            k_target_all=k_target_all,
+        )
+        for pos, i in enumerate(leaf_indices):
+            single_result = _bisect_leaf_theta_decm(
+                theta_other=theta_other, eta_self=float(eta_self_all[i]),
+                eta_other=eta_other, k_target=float(k_target_all[i]), self_idx=i,
+            )
+            assert batch_result[pos] == pytest.approx(single_result, abs=1e-9)
+
+    def test_hub_bisection_batch_matches_per_node(self):
+        """Same cross-check as above for the hub-side batch bisection."""
+        from dcms.solvers.fixed_point_decm import (
+            _bisect_hub_eta_decm, _bisect_hub_eta_decm_batch,
+        )
+
+        rng = np.random.default_rng(5)
+        N = 30
+        theta_self_all = rng.uniform(-1.0, 2.0, N)
+        theta_other = rng.uniform(-1.0, 2.0, N)
+        eta_other = rng.uniform(0.3, 1.5, N)
+        s_target_all = rng.uniform(1.0, 5.0, N)
+        hub_indices = [1, 4, 8, 16, 22]
+
+        batch_result = _bisect_hub_eta_decm_batch(
+            hub_indices=hub_indices, theta_self_all=theta_self_all,
+            theta_other=theta_other, eta_other=eta_other,
+            s_target_all=s_target_all,
+        )
+        for pos, i in enumerate(hub_indices):
+            single_result = _bisect_hub_eta_decm(
+                theta_self=float(theta_self_all[i]), theta_other=theta_other,
+                eta_other=eta_other, s_target=float(s_target_all[i]), self_idx=i,
+            )
+            assert batch_result[pos] == pytest.approx(single_result, abs=1e-9)
 
     def test_bisect_leaf_theta_decm_matches_bruteforce_root(self):
         """Directly check _bisect_leaf_theta_decm against the equation it

@@ -727,6 +727,237 @@ def _decm_step_chunked(
     return theta_new, F_current
 
 
+def _decm_step_chunked_weighted(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    zero_k_out: torch.Tensor,
+    zero_k_in: torch.Tensor,
+    zero_s_out: torch.Tensor,
+    zero_s_in: torch.Tensor,
+    chunk_size: int,
+    max_step: float,
+    mult: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked alternating GS-Newton step for the degeneracy-reduced DECM.
+
+    Mirrors :func:`_decm_step_dense_weighted` but processes the M×M group
+    matrices in row chunks to keep memory usage at O(chunk_size × M), the
+    same trade :func:`_decm_step_chunked` makes for the per-node case.
+
+    :func:`_decm_step_dense_weighted` has no size guard: it always builds
+    the full M×M matrices regardless of M, which is fine when the
+    degeneracy reduction is substantial (M << N, the common case for real
+    integer degree/strength data with a heavy repeated low-degree bulk)
+    but becomes impractically slow/memory-heavy when it isn't (e.g.
+    continuous-valued or otherwise low-collision degree/strength
+    sequences, where M stays close to N even for N in the tens of
+    thousands). :func:`solve_fixed_point_decm` selects this function
+    instead of the dense one once M exceeds ``_LARGE_N_THRESHOLD``,
+    mirroring exactly the existing dense-vs-chunked selection already
+    used for the non-reduced (``mult is None``) path.
+
+    Produces results equal to :func:`_decm_step_dense_weighted` (up to
+    floating-point summation order) for the same inputs, for any
+    ``chunk_size`` -- unlike :func:`_decm_step_chunked`, which restricts
+    its z-floor line-search to "significant" pairs as a performance/
+    robustness heuristic, this function tracks the exact same z_min as
+    the dense weighted version (including its singleton-diagonal
+    handling), since exact equivalence with the already-verified dense
+    weighted path was the primary correctness target here.
+
+    Args: same as :func:`_decm_step_dense_weighted`, plus:
+        chunk_size: Rows (groups) per processing chunk.
+
+    Returns:
+        ``(theta_new, F_current)``, both shape (4M,)/(4M,).
+    """
+    M = k_out.shape[0]
+    theta_out = theta[:M]
+    theta_in = theta[M : 2 * M]
+    eta_out = theta[2 * M : 3 * M]
+    eta_in = theta[3 * M :]
+
+    singleton = mult <= 1.0
+
+    # ------------------------------------------------------------------
+    # Pass 1: accumulate row sums (out-direction) + preliminary col sums
+    # (in-direction, at the *input* theta -- used for F_current only)
+    # ------------------------------------------------------------------
+    k_out_hat = torch.zeros(M, dtype=torch.float64)
+    k_in_hat = torch.zeros(M, dtype=torch.float64)
+    s_out_hat = torch.zeros(M, dtype=torch.float64)
+    s_in_hat = torch.zeros(M, dtype=torch.float64)
+    H_k_out = torch.zeros(M, dtype=torch.float64)
+    H_s_out = torch.zeros(M, dtype=torch.float64)
+    z_min_out = torch.full((M,), float("inf"), dtype=torch.float64)
+
+    for i_start in range(0, M, chunk_size):
+        i_end = min(i_start + chunk_size, M)
+        local_i = torch.arange(i_end - i_start, dtype=torch.long)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+
+        eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, M)
+        eta_safe = eta_chunk.clamp(min=_Z_G_CLAMP)
+        G_chunk = -1.0 / torch.expm1(-eta_safe)
+        log_q_chunk = -torch.log(torch.expm1(eta_safe))
+        logit_p_chunk = (
+            -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q_chunk
+        )
+        p_chunk = torch.sigmoid(logit_p_chunk)
+        w_chunk = p_chunk * G_chunk
+        pq_chunk = p_chunk * (1.0 - p_chunk)
+        H_s_chunk = p_chunk * G_chunk * (G_chunk - 1.0) + pq_chunk * G_chunk.pow(2)
+
+        # Diagonal entries P[g,g] etc. for g in this chunk -- subtracted
+        # once below rather than zeroed, the same "weighted sum minus one
+        # self-interaction term" generalisation _decm_step_dense_weighted
+        # uses for the degeneracy-reduced self-loop exclusion.
+        diag_p = p_chunk[local_i, global_j]
+        diag_w = w_chunk[local_i, global_j]
+        diag_pq = pq_chunk[local_i, global_j]
+        diag_H_s = H_s_chunk[local_i, global_j]
+
+        k_out_hat[i_start:i_end] = (p_chunk * mult[None, :]).sum(1) - diag_p
+        s_out_hat[i_start:i_end] = (w_chunk * mult[None, :]).sum(1) - diag_w
+        H_k_out[i_start:i_end] = (pq_chunk * mult[None, :]).sum(1) - diag_pq
+        H_s_out[i_start:i_end] = (H_s_chunk * mult[None, :]).sum(1) - diag_H_s
+
+        # Column accumulation (in-direction, at input theta), weighted by
+        # this chunk's own group multiplicities (the row/g side). The
+        # diagonal term for column h=g only ever appears in this chunk
+        # (at its own row g), so it is subtracted exactly once, here.
+        k_in_hat += (p_chunk * mult[i_start:i_end, None]).sum(0)
+        s_in_hat += (w_chunk * mult[i_start:i_end, None]).sum(0)
+        k_in_hat[i_start:i_end] -= diag_p
+        s_in_hat[i_start:i_end] -= diag_w
+
+        # z_min_out[g] = min over h of eta_gh, excluding the diagonal only
+        # for singleton groups (mult==1: no real edge behind that entry;
+        # see _decm_step_dense_weighted).
+        eta_for_min = eta_safe.clone()
+        chunk_singleton = singleton[i_start:i_end]
+        if chunk_singleton.any():
+            rows = local_i[chunk_singleton]
+            eta_for_min[rows, global_j[chunk_singleton]] = float("inf")
+        z_min_out[i_start:i_end] = eta_for_min.min(1).values.clamp(min=_Z_G_CLAMP)
+
+    nz_in = s_in > 0
+    if nz_in.any():
+        z_min_out = torch.minimum(z_min_out, eta_out + eta_in[nz_in].min())
+
+    F_current = torch.cat(
+        [k_out_hat - k_out, k_in_hat - k_in,
+         s_out_hat - s_out, s_in_hat - s_in]
+    )
+
+    H_k_out = H_k_out.clamp(min=1e-15)
+    H_s_out = H_s_out.clamp(min=1e-15)
+
+    # ------- Update θ_out -------
+    delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
+    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_out_new = torch.where(
+        zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
+    )
+
+    # ------- Update η_out (with z-floor line-search) -------
+    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
+    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
+    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
+    alpha_out = torch.where(
+        delta_eta_out < 0,
+        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
+        torch.ones(M, dtype=torch.float64),
+    )
+    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
+    eta_out_new = torch.where(
+        zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
+    )
+
+    # ------------------------------------------------------------------
+    # Pass 2: accumulate col sums using updated (theta_out_new, eta_out_new)
+    # ------------------------------------------------------------------
+    k_in_hat2 = torch.zeros(M, dtype=torch.float64)
+    s_in_hat2 = torch.zeros(M, dtype=torch.float64)
+    H_k_in2 = torch.zeros(M, dtype=torch.float64)
+    H_s_in2 = torch.zeros(M, dtype=torch.float64)
+    z_min_in = torch.full((M,), float("inf"), dtype=torch.float64)
+
+    for i_start in range(0, M, chunk_size):
+        i_end = min(i_start + chunk_size, M)
+        local_i = torch.arange(i_end - i_start, dtype=torch.long)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+
+        eta2_chunk = eta_out_new[i_start:i_end, None] + eta_in[None, :]
+        eta2_safe = eta2_chunk.clamp(min=_Z_G_CLAMP)
+        G2_chunk = -1.0 / torch.expm1(-eta2_safe)
+        log_q2_chunk = -torch.log(torch.expm1(eta2_safe))
+        logit_p2_chunk = (
+            -theta_out_new[i_start:i_end, None] - theta_in[None, :] + log_q2_chunk
+        )
+        p2_chunk = torch.sigmoid(logit_p2_chunk)
+        w2_chunk = p2_chunk * G2_chunk
+        pq2_chunk = p2_chunk * (1.0 - p2_chunk)
+        H_s2_chunk = p2_chunk * G2_chunk * (G2_chunk - 1.0) + pq2_chunk * G2_chunk.pow(2)
+
+        diag_p2 = p2_chunk[local_i, global_j]
+        diag_w2 = w2_chunk[local_i, global_j]
+        diag_pq2 = pq2_chunk[local_i, global_j]
+        diag_H_s2 = H_s2_chunk[local_i, global_j]
+
+        k_in_hat2 += (p2_chunk * mult[i_start:i_end, None]).sum(0)
+        s_in_hat2 += (w2_chunk * mult[i_start:i_end, None]).sum(0)
+        H_k_in2 += (pq2_chunk * mult[i_start:i_end, None]).sum(0)
+        H_s_in2 += (H_s2_chunk * mult[i_start:i_end, None]).sum(0)
+
+        k_in_hat2[i_start:i_end] -= diag_p2
+        s_in_hat2[i_start:i_end] -= diag_w2
+        H_k_in2[i_start:i_end] -= diag_pq2
+        H_s_in2[i_start:i_end] -= diag_H_s2
+
+        eta2_for_min = eta2_safe.clone()
+        chunk_singleton = singleton[i_start:i_end]
+        if chunk_singleton.any():
+            rows = local_i[chunk_singleton]
+            eta2_for_min[rows, global_j[chunk_singleton]] = float("inf")
+        z_min_in = torch.minimum(z_min_in, eta2_for_min.min(0).values)
+
+    z_min_in = z_min_in.clamp(min=_Z_G_CLAMP)
+    nz_out = s_out > 0
+    if nz_out.any():
+        z_min_in = torch.minimum(z_min_in, eta_out_new[nz_out].min() + eta_in)
+
+    H_k_in2 = H_k_in2.clamp(min=1e-15)
+    H_s_in2 = H_s_in2.clamp(min=1e-15)
+
+    # ------- Update θ_in -------
+    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
+    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_in_new = torch.where(
+        zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
+    )
+
+    # ------- Update η_in (with z-floor line-search) -------
+    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
+    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
+    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
+    alpha_in = torch.where(
+        delta_eta_in < 0,
+        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
+        torch.ones(M, dtype=torch.float64),
+    )
+    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
+    eta_in_new = torch.where(
+        zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
+    )
+
+    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
+    return theta_new, F_current
+
+
 # -------------------------------------------------------------------------
 # Hub bisection helper (DECM)
 # -------------------------------------------------------------------------
@@ -1434,12 +1665,20 @@ def solve_fixed_point_decm(
 
     # Step function with bound arguments
     if mult is not None:
-        def _step(th):
-            return _decm_step_dense_weighted(
-                th, k_out, k_in, s_out, s_in,
-                zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                max_step, mult,
-            )
+        if effective_chunk > 0:
+            def _step(th):
+                return _decm_step_chunked_weighted(
+                    th, k_out, k_in, s_out, s_in,
+                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
+                    effective_chunk, max_step, mult,
+                )
+        else:
+            def _step(th):
+                return _decm_step_dense_weighted(
+                    th, k_out, k_in, s_out, s_in,
+                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
+                    max_step, mult,
+                )
     elif _use_numba and variant == "theta-newton":
         def _step(th):
             to_ = th[:N].numpy()

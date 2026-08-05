@@ -1241,23 +1241,34 @@ def solve_fixed_point_decm(
                         wasted exploration of bad regions. A float here
                         replaces the N-adaptive formula outright, applied as
                         given regardless of N.
-        patience:       Perturbed-restart trigger, in iterations. If
+        patience:       Stagnation-recovery trigger, in iterations. If
                         ``best_theta_res`` has not improved for ``patience``
-                        consecutive iterations, the solver restarts from
-                        ``best_theta`` plus Gaussian noise instead of
-                        continuing from the (stuck) current iterate --
+                        consecutive iterations, the solver no longer just
+                        continues from the (stuck) current iterate. The
+                        FIRST such stall since the last record gets the same
+                        cheap, noise-free fix as an isolated blowup (clear
+                        Anderson history, plain Newton step from
+                        ``best_theta``) -- a stagnant Anderson mix can look
+                        identical to a genuine attracting fixed point, and
+                        this is free to try before assuming the latter. Only
+                        if that ALSO fails to beat the record within another
+                        ``patience`` window does the solver escalate to
+                        restarting from ``best_theta`` plus Gaussian noise --
                         this is what actually resolves the quasi-fixed-point
                         traps that plain Anderson/Newton alone cannot escape
-                        on hard hub-heavy instances. The same recovery also
-                        fires when the Anderson blowup guard (see
-                        ``blowup_factor`` above) trips *repeatedly* with no
-                        record improvement in between -- an isolated,
-                        self-recovering blowup is left alone (existing plain
-                        rollback, no noise). Set ``patience <= 0`` to disable
-                        and restore the old behaviour (stop immediately
-                        instead of retrying). Default 750, the value
-                        validated end-to-end on a hard N=15168 instance (see
-                        README "Checkpointed multi-chunk runs").
+                        on hard hub-heavy instances. The same escalation path
+                        is shared with the Anderson blowup guard (see
+                        ``blowup_factor`` above): it also starts with the
+                        cheap no-noise rollback, and only escalates to a
+                        perturbed restart if the blowup trips *repeatedly*
+                        with no record improvement in between. Set
+                        ``patience <= 0`` to disable and restore the old
+                        behaviour (stop immediately instead of retrying).
+                        Default 750, the value validated end-to-end on a hard
+                        N=15168 instance (see README "Checkpointed
+                        multi-chunk runs") -- validated before the soft-reset
+                        first attempt was added, so a stall may now resolve
+                        without ever reaching a perturbed restart at all.
         noise_base:     Scale of the *multiplicative* (log-scale) Gaussian
                         noise applied to ``best_theta`` on the *first*
                         perturbed restart: every component of
@@ -1495,6 +1506,14 @@ def solve_fixed_point_decm(
     restarts = 0
     stalls_at_cap = 0
     iters_since_improve = 0
+    # True until a patience stall has already been given one no-noise
+    # Anderson-reset attempt since the last genuine improvement. Mirrors
+    # the isolated-vs-repeated blowup escalation: the first stall gets the
+    # cheap fix (clear Anderson history, plain Newton step from
+    # best_theta, no noise); only if that ALSO fails to beat the record
+    # within another `patience` window do we escalate to a perturbed
+    # (noisy) restart.
+    _soft_stall_reset_tried = False
     # True until the first blowup/stagnation intervention; reset back to
     # True by a genuine record improvement *or* by a restart that actually
     # fires (a restart is itself a fresh start -- see the two call sites of
@@ -1849,6 +1868,7 @@ def solve_fixed_point_decm(
                 stalls_at_cap = 0
                 iters_since_improve = 0
                 progressed_since_restart = True
+                _soft_stall_reset_tried = False
             else:
                 iters_since_improve += 1
 
@@ -1858,39 +1878,72 @@ def solve_fixed_point_decm(
                 break
 
             # Stagnation detection: no record improvement for `patience`
-            # iterations straight -> perturbed restart around best_theta
-            # (see `patience` docstring for why, and for the shared
+            # iterations straight. Mirrors the isolated-vs-repeated blowup
+            # escalation below: the FIRST stall since the last improvement
+            # gets the same cheap fix as an isolated blowup (clear Anderson
+            # history, plain Newton step from best_theta, no noise) instead
+            # of jumping straight to a perturbed restart -- a stagnant
+            # Anderson mix (ill-conditioned mixing weights reproducing the
+            # same near-best point) can look identical to a genuine
+            # attracting fixed point, and the cheap fix is free to try
+            # first. Only if that ALSO fails to beat the record within
+            # another `patience` window do we escalate to a perturbed
+            # (noisy) restart (see `patience` docstring, and the shared
             # escalation counter with the repeated-blowup path below).
             _patience_restart_theta: torch.Tensor | None = None
             if patience > 0 and iters_since_improve >= patience:
-                _patience_restart_theta, _give_up = _perturbed_restart()
-                iters_since_improve = 0
-                # A restart is itself a fresh start: give the resulting
-                # trajectory its own first-blowup grace (see
-                # `progressed_since_restart`'s declaration above) instead of
-                # inheriting "no progress" from whatever triggered this
-                # restart. The escalation counter (`restarts`, inside
-                # `_perturbed_restart`) still only resets on a genuine
-                # record improvement, so this doesn't weaken the
-                # loop-prevention guarantee -- it just stops every single
-                # post-restart blowup, however far downstream and however
-                # much clean progress happened first, from being misread as
-                # "still the same trap" and escalating immediately.
-                progressed_since_restart = True
-                # Stale pre-stagnation Anderson history is irrelevant (and
-                # potentially harmful) once we jump to a discontinuous new
-                # point; also arm the post-restart blowup-guard grace (see
-                # `_post_restart_reset` above).
-                _and_g.clear()
-                _and_r.clear()
-                _post_restart_reset = True
-                if _give_up:
-                    message = (
-                        f"Stagnation recovery exhausted: {max_stalls} restarts at "
-                        f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
-                        f"improving best={best_theta_res:.3e}. Stopping at iter {n_iter}."
+                if not _soft_stall_reset_tried:
+                    if verbose:
+                        print(
+                            f"[patience] stalled {patience} iters with no "
+                            f"improvement -- soft reset (Anderson clear, no "
+                            f"noise) at iter {n_iter}."
+                        )
+                    theta_rb, _ = _step(best_theta)
+                    eta_old_rb = best_theta[2 * N :]
+                    eta_new_rb = theta_rb[2 * N :]
+                    _eta_floor_rb = (eta_old_rb * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
+                    eta_new_rb = torch.where(
+                        eta_new_rb > 0,
+                        torch.maximum(eta_new_rb, _eta_floor_rb),
+                        eta_new_rb,
                     )
-                    break
+                    theta_rb = torch.cat([theta_rb[:2 * N], eta_new_rb])
+                    _patience_restart_theta = theta_rb
+                    _soft_stall_reset_tried = True
+                    iters_since_improve = 0
+                    _and_g.clear()
+                    _and_r.clear()
+                else:
+                    _patience_restart_theta, _give_up = _perturbed_restart()
+                    iters_since_improve = 0
+                    # A restart is itself a fresh start: give the resulting
+                    # trajectory its own first-blowup grace (see
+                    # `progressed_since_restart`'s declaration above) instead of
+                    # inheriting "no progress" from whatever triggered this
+                    # restart. The escalation counter (`restarts`, inside
+                    # `_perturbed_restart`) still only resets on a genuine
+                    # record improvement, so this doesn't weaken the
+                    # loop-prevention guarantee -- it just stops every single
+                    # post-restart blowup, however far downstream and however
+                    # much clean progress happened first, from being misread as
+                    # "still the same trap" and escalating immediately.
+                    progressed_since_restart = True
+                    # Stale pre-stagnation Anderson history is irrelevant (and
+                    # potentially harmful) once we jump to a discontinuous new
+                    # point; also arm the post-restart blowup-guard grace (see
+                    # `_post_restart_reset` above).
+                    _and_g.clear()
+                    _and_r.clear()
+                    _post_restart_reset = True
+                    _soft_stall_reset_tried = False
+                    if _give_up:
+                        message = (
+                            f"Stagnation recovery exhausted: {max_stalls} restarts at "
+                            f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
+                            f"improving best={best_theta_res:.3e}. Stopping at iter {n_iter}."
+                        )
+                        break
 
             # Anderson acceleration
             if _patience_restart_theta is not None:

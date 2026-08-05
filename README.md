@@ -724,7 +724,9 @@ Calls to `sample()` or `sample_many()` before `solve_tool()` raise `RuntimeError
 
 ### 3.6 Statistical validation — `model.p_value_calculator()`
 
-Available on every **weighted** model (`DWCMModel`, `qDECMModel`, `DECMModel` — not `DCMModel`, which is binary-only). Given an observed weighted edge list, computes the p-value of each edge's weight under the fitted null model: the probability of observing a weight at least as large as the one seen, `p_value(w) = P(W_ij >= w)`. This is the standard ingredient for extracting a *statistically validated backbone* from a weighted network — keep only edges whose weight is unlikely under the null (e.g. `p_value < 0.01`, typically after a multiple-testing correction such as Benjamini–Hochberg).
+Available on every **weighted** model (`DWCMModel`, `qDECMModel`, `DECMModel` — not `DCMModel`, which is binary-only). Given an observed weighted edge list, computes the p-value of each edge's weight under the fitted null model: the probability of observing a weight at least as large as the one seen, `p_value(w) = P(W_ij >= w)`. This is the standard ingredient for extracting a *statistically validated backbone* from a weighted network.
+
+**Multiple-testing correction is required, not optional.** A backbone typically tests *every* edge (potentially thousands to millions) simultaneously, so thresholding the raw `p_value` directly (e.g. `p_value < 0.01`) is statistically wrong — at that significance level, ~1% of edges would be flagged as "significant" by chance alone even under the null model, and that false-positive count grows with the number of edges tested. Control the **false discovery rate (FDR)** instead, e.g. with the Benjamini-Hochberg procedure via `scipy.stats.false_discovery_control` (SciPy ≥ 1.11, already a `dcms` dependency — see the worked example below).
 
 Each model's conditional weight distribution is geometric (see §3.5's sampling formulas), so the survival probability has a closed form:
 
@@ -738,6 +740,7 @@ DWCM's weight distribution starts at 0 (no separate link-existence step), so its
 
 ```python
 import numpy as np
+from scipy.stats import false_discovery_control
 
 # edgelist: (L, 3) array, each row [source_id, target_id, weight]
 # (0-based node indices into k_out/k_in/s_out/s_in; weight >= 1 for
@@ -749,7 +752,10 @@ pvals = model.p_value_calculator(edgelist)
 # also stored as model.p_value
 print(pvals["p_value"])
 
-validated = pvals[pvals["p_value"] < 0.01]
+# FDR control (Benjamini-Hochberg) across all L tested edges at once --
+# NOT pvals["p_value"] < 0.01, which ignores the multiple-testing problem.
+q_values = false_discovery_control(pvals["p_value"], method="bh")
+validated = pvals[q_values < 0.01]
 ```
 
 Raises `RuntimeError` if called before `solve_tool()`.

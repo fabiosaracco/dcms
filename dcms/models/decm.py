@@ -604,6 +604,7 @@ class DECMModel:
         hub_sk_threshold: float = 0.0,
         leaf_k_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
+        z_clamp: float = 1e-8,
         reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
         patience: int = 750,
@@ -695,6 +696,18 @@ class DECMModel:
                            ``backtracking_gamma`` times the current residual,
                            the step is halved (up to 5 times).  Typical value:
                            ``2.0``.  Default=0.0 (disabled).
+            z_clamp:       Floor on the raw z=eta_out+eta_in sum, tied
+                           between the G-curvature damping and the
+                           per-step trust-region floor (both roles must
+                           stay coupled -- decoupling them was tested and
+                           made things worse, reintroducing an
+                           unrecoverable plateau). Default 1e-8 (original
+                           value, unchanged behavior). Raise it (e.g. to
+                           1e-6) if the solver stagnates on a network with
+                           extreme s/k hub nodes -- see
+                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
+                           ``z_clamp`` docs for the full mechanism and
+                           trade-off.
             reduce_degeneracy: If ``True`` (default), nodes sharing the exact
                            same ``(k_out, k_in, s_out, s_in)`` 4-tuple are
                            collapsed into a single group before solving (see
@@ -813,6 +826,7 @@ class DECMModel:
                     topo_weig=topo_weig,
                     hub_sk_threshold=hub_sk_threshold,
                     leaf_k_threshold=leaf_k_threshold,
+                    z_clamp=z_clamp,
                     blowup_factor=blowup_factor,
                     patience=patience,
                     noise_base=noise_base,
@@ -842,6 +856,7 @@ class DECMModel:
                 hub_sk_threshold=hub_sk_threshold,
                 leaf_k_threshold=leaf_k_threshold,
                 backtracking_gamma=backtracking_gamma,
+                z_clamp=z_clamp,
                 blowup_factor=blowup_factor,
                 patience=patience,
                 noise_base=noise_base,

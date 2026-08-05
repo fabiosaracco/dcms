@@ -1088,6 +1088,7 @@ def solve_fixed_point_decm(
     hub_sk_threshold: float = 0.0,
     leaf_k_threshold: float = 0.0,
     backtracking_gamma: float = 0.0,
+    z_clamp: float = 1e-8,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
     init_best_theta: torch.Tensor | None = None,
@@ -1195,6 +1196,35 @@ def solve_fixed_point_decm(
                         until the condition is met.  Typical value: ``2.0``.
                         Default 0 (disabled).  Anderson history is cleared
                         whenever a dampened step is accepted.
+        z_clamp:        Floor applied to the raw z=eta_out+eta_in sum in two
+                        places, both of which govern the same trade-off
+                        between damping near-degenerate-hub curvature
+                        blowups and preserving the solver's gradual
+                        z-approach self-escape: (1) it floors ``eta`` before
+                        computing ``G = -1/expm1(-z)`` in every objective/
+                        step evaluation, which damps the curvature blowup
+                        as z -> 0 for near-degenerate hub pairs; (2) it is
+                        also the hard floor of the per-step trust-region
+                        limiter (``z_floor = max(z_min * 0.5, z_clamp)``)
+                        that governs how far eta can approach z=0 in ONE
+                        iteration -- raising it too far can wall off pairs
+                        whose true z* sits below the new floor, creating an
+                        artificial plateau (confirmed via a controlled A/B
+                        on ita_election_dico3: decoupling this into two
+                        independent module constants was tried and made
+                        things *worse*, not better, so both roles are kept
+                        tied to a single value here by design). Default
+                        1e-8 (the long-standing value, originally tuned for
+                        a different solver's z->0 deadlock and reused here
+                        without re-derivation) leaves existing behaviour
+                        unchanged. Raising it (e.g. to 1e-6) resolved a
+                        real stagnation on a hub-heavy N=28156 network
+                        (ita_election_dico3) that would not converge at the
+                        default; there is currently no general rule for
+                        picking a value beyond "try raising it if the
+                        solver stagnates on a network with extreme s/k
+                        hubs" -- see the DECM z-clamp investigation notes
+                        for the full experimental history.
         mult:           Internal use by :func:`solve_fixed_point_decm_degenerate`.
                         When provided (shape (M,)), ``k_out``/``k_in``/``s_out``/
                         ``s_in``/``theta0`` are interpreted as *group-level*
@@ -1334,6 +1364,11 @@ def solve_fixed_point_decm(
         )
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+
+    global _Z_G_CLAMP, _Z_NEWTON_FLOOR
+    _Z_G_CLAMP = z_clamp
+    _Z_NEWTON_FLOOR = z_clamp
+
     if mult is not None:
         if backtracking_gamma > 0.0:
             raise NotImplementedError(
@@ -2137,6 +2172,7 @@ def solve_fixed_point_decm_degenerate(
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
     leaf_k_threshold: float = 0.0,
+    z_clamp: float = 1e-8,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
     blowup_factor: float | None = None,
@@ -2176,6 +2212,10 @@ def solve_fixed_point_decm_degenerate(
             guess); if not, one representative member's value is used for
             the whole group.
         k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        z_clamp: Forwarded to :func:`solve_fixed_point_decm` unchanged
+            (operates at group/M granularity here, since the reduced eta
+            values are already one entry per degeneracy group). See its
+            docstring for the full explanation.
         (all other args): see :func:`solve_fixed_point_decm`.
         init_best_theta: Optional externally-supplied record theta, same
             expanded per-node shape (4N,) as ``theta0``/``best_theta``
@@ -2282,6 +2322,7 @@ def solve_fixed_point_decm_degenerate(
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
         leaf_k_threshold=leaf_k_threshold,
+        z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,
         blowup_factor=blowup_factor,

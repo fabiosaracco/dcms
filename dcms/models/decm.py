@@ -1001,3 +1001,69 @@ class DECMModel:
         max_workers = None if n_jobs < 0 else n_jobs
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             return list(ex.map(self._sample_raw, seeds))
+
+    def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
+        """Compute the DECM p-value of each observed weight in an edge list.
+
+        Given the link exists, DECM's conditional weight distribution is a
+        geometric distribution starting at 1 (see :meth:`sample`)::
+
+            P(w_ij = k | a_ij = 1) = (1 - beta_ij) * beta_ij**(k - 1),  k = 1, 2, ...
+            beta_ij = exp(-(eta_out_i + eta_in_j))
+
+        so the (unconditional) probability of observing a weight at least as
+        large as the one seen, i.e. the p-value, is the survival probability::
+
+            p_value(w) = P(W_ij >= w) = p_ij * beta_ij**(w - 1)
+                       = p_ij * z_ij**-(w - 1),   z_ij = exp(eta_out_i + eta_in_j) = 1 / beta_ij
+
+        where ``p_ij`` is the DECM link-existence probability (see
+        :meth:`pij_matrix`). Computed directly on the given pairs (no dense
+        N×N matrix is built), so this scales to large networks.
+
+        Args:
+            edgelist: Array-like of shape (L, 3), each row
+                ``[source_id, target_id, weight]`` — 0-based node indices
+                into ``k_out``/``k_in``/``s_out``/``s_in``, and observed
+                weight (``weight >= 1``).
+
+        Returns:
+            Structured NumPy array of length L with fields
+            ``("source_id", int64)``, ``("target_id", int64)``,
+            ``("p_value", float64)``. Also stored as :attr:`p_value`.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        import numpy as np
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        edgelist = np.asarray(edgelist)
+        source_id = edgelist[:, 0].astype(np.int64)
+        target_id = edgelist[:, 1].astype(np.int64)
+        weight = edgelist[:, 2].astype(np.float64)
+
+        N = self.N
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
+        theta_out = theta[:N]
+        theta_in = theta[N : 2 * N]
+        eta_out = theta[2 * N : 3 * N]
+        eta_in = theta[3 * N :]
+
+        eta_edge = eta_out[source_id] + eta_in[target_id]
+        eta_edge = np.clip(eta_edge, _Z_G_CLAMP, None)
+        log_q = -np.log(np.expm1(eta_edge))
+        logit_p = -theta_out[source_id] - theta_in[target_id] + log_q
+        p_ij = 1.0 / (1.0 + np.exp(-logit_p))
+        z_ij = np.exp(eta_edge)
+        p_value = p_ij * z_ij ** (-(weight - 1.0))
+
+        dtype = np.dtype(
+            [("source_id", np.int64), ("target_id", np.int64), ("p_value", np.float64)]
+        )
+        result = np.empty(len(source_id), dtype=dtype)
+        result["source_id"] = source_id
+        result["target_id"] = target_id
+        result["p_value"] = p_value
+        self.p_value = result
+        return self.p_value

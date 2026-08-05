@@ -929,3 +929,70 @@ class qDECMModel:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             return list(ex.map(self._sample_raw, seeds))
 
+    def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
+        """Compute the qDECM p-value of each observed weight in an edge list.
+
+        Given the link exists, the weight-step's conditioned distribution
+        follows the same geometric-starting-at-1 form as DECM (see
+        :meth:`sample`)::
+
+            P(w_ij = k | a_ij = 1) = (1 - beta_ij) * beta_ij**(k - 1),  k = 1, 2, ...
+            beta_ij = exp(-(theta_b_out_i + theta_b_in_j))
+
+        so the p-value (survival probability) is::
+
+            p_value(w) = P(W_ij >= w) = p_ij * beta_ij**(w - 1)
+                       = p_ij * z_ij**-(w - 1),
+            z_ij = exp(theta_b_out_i + theta_b_in_j) = 1 / beta_ij
+
+        where ``p_ij`` is the (topology-only) qDECM/DCM link probability
+        (see :meth:`pij_matrix`). Computed directly on the given pairs (no
+        dense N×N matrix is built), so this scales to large networks.
+
+        Args:
+            edgelist: Array-like of shape (L, 3), each row
+                ``[source_id, target_id, weight]`` — 0-based node indices
+                into ``k_out``/``k_in``/``s_out``/``s_in``, and observed
+                weight (``weight >= 1``).
+
+        Returns:
+            Structured NumPy array of length L with fields
+            ``("source_id", int64)``, ``("target_id", int64)``,
+            ``("p_value", float64)``. Also stored as :attr:`p_value`.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        import numpy as np
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        edgelist = np.asarray(edgelist)
+        source_id = edgelist[:, 0].astype(np.int64)
+        target_id = edgelist[:, 1].astype(np.int64)
+        weight = edgelist[:, 2].astype(np.float64)
+
+        N = self.N
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
+        theta_topo_out = theta[:N]
+        theta_topo_in = theta[N : 2 * N]
+        theta_b_out = theta[2 * N : 3 * N]
+        theta_b_in = theta[3 * N :]
+
+        logit_p = -theta_topo_out[source_id] - theta_topo_in[target_id]
+        p_ij = 1.0 / (1.0 + np.exp(-logit_p))
+
+        z_edge = theta_b_out[source_id] + theta_b_in[target_id]
+        z_edge = np.clip(z_edge, 1e-8, None)
+        z_ij = np.exp(z_edge)
+        p_value = p_ij * z_ij ** (-(weight - 1.0))
+
+        dtype = np.dtype(
+            [("source_id", np.int64), ("target_id", np.int64), ("p_value", np.float64)]
+        )
+        result = np.empty(len(source_id), dtype=dtype)
+        result["source_id"] = source_id
+        result["target_id"] = target_id
+        result["p_value"] = p_value
+        self.p_value = result
+        return self.p_value
+

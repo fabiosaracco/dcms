@@ -602,7 +602,6 @@ class DECMModel:
         monitor: bool = False,
         topo_weig: bool = False,
         hub_sk_threshold: float = 0.0,
-        leaf_k_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
         z_clamp: float = 1e-8,
         reduce_degeneracy: bool = True,
@@ -674,22 +673,6 @@ class DECMModel:
                            networks with nodes having very high s/k ratios
                            (e.g. ``s/k > 5``) that cause stagnation.
                            Default=0.0 (disabled).
-            leaf_k_threshold: When > 0, nodes with observed degree ``k_out``
-                           (resp. ``k_in``) ``<= leaf_k_threshold`` are
-                           treated as leaf nodes and have ``θ_out`` (resp.
-                           ``θ_in``) solved exactly each iteration via 1D
-                           bisection over the degree equation -- the θ-side
-                           analogue of ``hub_sk_threshold``. Use for networks
-                           that stagnate just above ``tol`` with the worst
-                           residuals concentrated at low-degree nodes (e.g.
-                           ``k=1``), where the same relative tolerance
-                           demands very tight absolute precision that the
-                           global step can struggle to hit. Default=0.0
-                           (disabled). Applied once per iteration to the
-                           final theta_next (after mixing/restart/rollback),
-                           vectorized across all leaf nodes at once -- see
-                           the detailed note on this parameter in
-                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`.
             backtracking_gamma: When > 0, enables a per-step backtracking
                            line search.  After each Newton step the residual
                            at the proposed iterate is evaluated; if it exceeds
@@ -825,7 +808,6 @@ class DECMModel:
                     monitor=monitor,
                     topo_weig=topo_weig,
                     hub_sk_threshold=hub_sk_threshold,
-                    leaf_k_threshold=leaf_k_threshold,
                     z_clamp=z_clamp,
                     blowup_factor=blowup_factor,
                     patience=patience,
@@ -854,7 +836,6 @@ class DECMModel:
                 monitor=monitor,
                 topo_weig=topo_weig,
                 hub_sk_threshold=hub_sk_threshold,
-                leaf_k_threshold=leaf_k_threshold,
                 backtracking_gamma=backtracking_gamma,
                 z_clamp=z_clamp,
                 blowup_factor=blowup_factor,

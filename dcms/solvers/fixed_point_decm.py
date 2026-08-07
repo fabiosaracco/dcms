@@ -1049,101 +1049,6 @@ def _bisect_hub_eta_decm(
     return 0.5 * (eta_lo + eta_hi)
 
 
-def _bisect_leaf_theta_decm(
-    theta_other: "np.ndarray",
-    eta_self: float,
-    eta_other: "np.ndarray",
-    k_target: float,
-    self_idx: int,
-    n_bisect: int = 60,
-    mult: "np.ndarray | None" = None,
-) -> float:
-    """Find θ such that Σ_{j≠i} p_ij(θ) = k_target via bisection.
-
-    For a leaf node i (out or in) with low k, the *relative* tolerance
-    (MRE = |residual| / k_target) demands very tight *absolute* precision on
-    the degree equation precisely because k_target itself is small -- e.g.
-    k_target=1 needs an absolute residual below tol itself, while a hub with
-    k_target=1000 tolerates an absolute residual 1000x larger for the same
-    relative tolerance. The global Newton/Anderson step, which sums O(N)
-    small per-edge contributions in floating point, can struggle to land
-    inside that tight an absolute window. This function solves the 1D degree
-    equation exactly, keeping all other parameters (including this node's
-    own η) fixed -- the θ-side analogue of :func:`_bisect_hub_eta_decm`.
-
-    The function
-
-        f(θ_i) = Σ_{j≠i} p_ij
-
-    where z_j = η_i + η_j^{other},  log_q_j = -log(expm1(z_j)),
-    logit(p_ij) = -θ_i - θ_j^{other} + log_q_j
-
-    is strictly *decreasing* in θ_i: as θ_i ↑, logit ↓, p_ij → 0.
-    The bracket is [-_THETA_MAX, _THETA_MAX]; f → (N-1) as θ_i → -∞,
-    f → 0 as θ_i → +∞.
-
-    Args:
-        theta_other: θ parameters of the opposing side (θ_in for an
-                     out-leaf), length N.
-        eta_self:    Current η parameter of the leaf node (η_out_i for an
-                     out-leaf) -- fixed, not the bisection variable.
-        eta_other:   η parameters of the opposing side (η_in for an
-                     out-leaf), length N.
-        k_target:    Observed degree to match (must be positive).
-        self_idx:    Index of the leaf node (to zero out the diagonal term).
-        n_bisect:    Number of bisection steps.
-        mult:        Optional group multiplicities, length N (degeneracy-
-                     reduced path only). Same "weighted sum minus one
-                     diagonal entry" convention as
-                     :func:`_bisect_hub_eta_decm`. None (default) reproduces
-                     the original per-node behaviour exactly.
-
-    Returns:
-        Scalar θ* such that f(θ*) ≈ k_target.
-    """
-    import math as _math
-    import numpy as _np
-
-    z = eta_self + eta_other
-    z = _np.maximum(z, _Z_G_CLAMP)
-    log_q = -_np.log(_np.expm1(z))  # constant w.r.t. theta_self
-
-    def _f(theta_val: float) -> float:
-        logit_p = -theta_val - theta_other + log_q
-        p = 1.0 / (1.0 + _np.exp(-logit_p))  # sigmoid
-        if mult is not None:
-            total = float((p * mult).sum()) - float(p[self_idx])
-        else:
-            p = p.copy()
-            p[self_idx] = 0.0
-            total = float(p.sum())
-        return total - k_target
-
-    # Bracket: [-_THETA_MAX, _THETA_MAX]; f is decreasing so f(lo) > 0 > f(hi)
-    theta_lo = -_THETA_MAX
-    theta_hi = _THETA_MAX
-
-    # If even the maximum θ (most restrictive) still overshoots the target,
-    # or the minimum θ can't reach it, the target is unreachable -> clamp.
-    f_lo = _f(theta_lo)
-    if f_lo <= 0.0:
-        return theta_lo
-    f_hi = _f(theta_hi)
-    if f_hi >= 0.0:
-        return theta_hi
-
-    for _ in range(n_bisect):
-        theta_mid = 0.5 * (theta_lo + theta_hi)
-        if _math.isinf(theta_mid) or _math.isnan(theta_mid):
-            break
-        if _f(theta_mid) > 0.0:
-            theta_lo = theta_mid
-        else:
-            theta_hi = theta_mid
-
-    return 0.5 * (theta_lo + theta_hi)
-
-
 def _bisect_hub_eta_decm_batch(
     hub_indices: "list[int]",
     theta_self_all: "np.ndarray",
@@ -1220,79 +1125,6 @@ def _bisect_hub_eta_decm_batch(
     return _np.where(unreachable, _ETA_MIN, result)
 
 
-def _bisect_leaf_theta_decm_batch(
-    leaf_indices: "list[int]",
-    theta_other: "np.ndarray",
-    eta_self_all: "np.ndarray",
-    eta_other: "np.ndarray",
-    k_target_all: "np.ndarray",
-    n_bisect: int = 60,
-    mult: "np.ndarray | None" = None,
-) -> "np.ndarray":
-    """Vectorized batch version of :func:`_bisect_leaf_theta_decm`: solves θ
-    for every node in ``leaf_indices`` simultaneously. See
-    :func:`_bisect_hub_eta_decm_batch`'s docstring for the general shape of
-    this transformation; see :func:`_bisect_leaf_theta_decm` for the
-    per-node equation being solved.
-
-    Args:
-        leaf_indices:   Indices (into the full length-N arrays) of the leaf
-                         nodes to solve for, length k.
-        theta_other:    θ parameters of the opposing side, length N.
-        eta_self_all:   Full η array for this side (η_out for an out-leaf
-                         batch), length N -- indexed internally by
-                         ``leaf_indices``.
-        eta_other:      η parameters of the opposing side, length N.
-        k_target_all:   Full degree-target array for this side, length N --
-                         indexed internally by ``leaf_indices``.
-        n_bisect:       Number of bisection steps.
-        mult:           Optional group multiplicities, length N (see
-                         :func:`_bisect_leaf_theta_decm`).
-
-    Returns:
-        Array of shape ``(k,)``: θ* for each node in ``leaf_indices``, in
-        the same order.
-    """
-    import numpy as _np
-
-    idx = _np.asarray(leaf_indices, dtype=_np.int64)
-    k = idx.shape[0]
-    rows = _np.arange(k)
-    eta_self = eta_self_all[idx]            # (k,)
-    k_target = k_target_all[idx]            # (k,)
-
-    z = eta_self[:, None] + eta_other[None, :]  # (k, N)
-    z = _np.maximum(z, _Z_G_CLAMP)
-    log_q = -_np.log(_np.expm1(z))              # (k, N), constant w.r.t. θ
-    theta_other_row = theta_other[None, :]
-
-    def _f(theta_val: "_np.ndarray") -> "_np.ndarray":
-        logit_p = -theta_val[:, None] - theta_other_row + log_q
-        p = 1.0 / (1.0 + _np.exp(-logit_p))
-        if mult is not None:
-            total = (p * mult[None, :]).sum(axis=1) - p[rows, idx]
-        else:
-            p = p.copy()
-            p[rows, idx] = 0.0
-            total = p.sum(axis=1)
-        return total - k_target
-
-    theta_lo = _np.full(k, -_THETA_MAX)
-    theta_hi = _np.full(k, _THETA_MAX)
-    unreachable_lo = _f(theta_lo) <= 0.0
-    unreachable_hi = _f(theta_hi) >= 0.0
-
-    for _ in range(n_bisect):
-        theta_mid = 0.5 * (theta_lo + theta_hi)
-        go_lo = _f(theta_mid) > 0.0
-        theta_lo = _np.where(go_lo, theta_mid, theta_lo)
-        theta_hi = _np.where(go_lo, theta_hi, theta_mid)
-
-    result = 0.5 * (theta_lo + theta_hi)
-    result = _np.where(unreachable_lo, -_THETA_MAX, result)
-    return _np.where(unreachable_hi, _THETA_MAX, result)
-
-
 # -------------------------------------------------------------------------
 # Main solver
 # -------------------------------------------------------------------------
@@ -1317,7 +1149,6 @@ def solve_fixed_point_decm(
     monitor: bool = False,
     topo_weig: bool = False,
     hub_sk_threshold: float = 0.0,
-    leaf_k_threshold: float = 0.0,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-8,
     mult: torch.Tensor | None = None,
@@ -1384,41 +1215,6 @@ def solve_fixed_point_decm(
                         Use this for networks with a few nodes that have very
                         high ``s/k`` ratios (e.g. ``s/k > 5``) which cause the
                         global solver to stagnate.  Default=0.0 (disabled).
-        leaf_k_threshold: When > 0, nodes whose observed degree ``k_out_i``
-                        (resp. ``k_in_i``) is ``<= leaf_k_threshold`` are
-                        treated as *leaf nodes* and have ``θ_out_i`` (resp.
-                        ``θ_in_i``) solved exactly each iteration via 1D
-                        bisection over the degree equation, instead of the
-                        global Newton/Anderson step -- the θ-side analogue of
-                        ``hub_sk_threshold``. Low-degree nodes need very tight
-                        *absolute* precision to satisfy the same *relative*
-                        tolerance (MRE = |residual|/k_target, and k_target is
-                        small), which the global step's floating-point
-                        summation can struggle to hit reliably. Use this for
-                        networks that stagnate just above ``tol`` with the
-                        worst offenders concentrated at low-degree nodes
-                        (e.g. ``k=1``). Default=0.0 (disabled). See
-                        :func:`_bisect_leaf_theta_decm` for the exact
-                        equation solved.
-                        Bisection is applied once per iteration, to the
-                        *final* ``theta_next`` (after Anderson mixing/
-                        restart/rollback have all settled it), not to the
-                        pre-mixing proposal -- this is what makes it
-                        self-consistent: the exact fit is against the
-                        opposing values that actually carry into the next
-                        iteration, not a snapshot that then drifts during
-                        mixing. (An earlier pre-mixing + "freeze-restore"
-                        design, mirroring how ``hub_sk_threshold`` alone
-                        still works internally, was found to sometimes
-                        prevent convergence outright for leaf nodes -- large
-                        hub targets make the same imprecision invisible
-                        there, but small leaf targets don't.) Vectorized
-                        across all leaf nodes at once (see
-                        :func:`_bisect_leaf_theta_decm_batch`); still has
-                        some per-iteration overhead relative to the general
-                        step, roughly proportional to the number of leaf
-                        nodes/groups, so it's worth checking on a real
-                        instance before assuming it's free.
         backtracking_gamma (float): When > 0, after each Newton step a
                         backtracking line search is applied: the residual at
                         the proposed ``theta_fp`` is evaluated, and if it
@@ -1462,9 +1258,9 @@ def solve_fixed_point_decm(
                         quantities (one entry per unique (k_out,s_out,k_in,s_in)
                         4-tuple) and the step uses :func:`_decm_step_dense_weighted`
                         instead of the per-node dense/chunked/Numba paths.
-                        ``hub_sk_threshold`` and ``leaf_k_threshold`` operate
-                        at group granularity when ``mult`` is given (both
-                        bisection helpers accept it). Not compatible with
+                        ``hub_sk_threshold`` operates at group granularity
+                        when ``mult`` is given (the bisection helper accepts
+                        it). Not compatible with
                         ``backtracking_gamma`` (not yet implemented for the
                         reduced case) or ``backend="numba"``.  Default None
                         (standard per-node behaviour, unaffected).
@@ -1873,13 +1669,11 @@ def solve_fixed_point_decm(
     _hub_active = hub_sk_threshold > 0.0 and not _use_numba
     _hub_out_mask: torch.Tensor | None = None   # shape (N,) bool
     _hub_in_mask: torch.Tensor | None = None
-    # Group multiplicities as numpy, for the weighted hub/leaf-bisection sum
+    # Group multiplicities as numpy, for the weighted hub-bisection sum
     # (degeneracy-reduced path only; None reproduces the per-node behaviour).
     _mult_np = mult.numpy() if mult is not None else None
-    # Precomputed once: target arrays as numpy, reused by every bisection
-    # call each iteration (both hub and leaf).
-    _k_out_np = k_out.numpy()
-    _k_in_np = k_in.numpy()
+    # Precomputed once: target arrays as numpy, reused by every hub-bisection
+    # call each iteration.
     _s_out_np = s_out.numpy()
     _s_in_np = s_in.numpy()
 
@@ -1950,78 +1744,12 @@ def solve_fixed_point_decm(
                 _th_fp_np[3 * N + _hub_in_idx_arr] = _new_eta_in
         return torch.from_numpy(_th_fp_np)
 
-    # ------------------------------------------------------------------
-    # Leaf precomputation (only when leaf_k_threshold > 0)
-    # ------------------------------------------------------------------
-    _leaf_active = leaf_k_threshold > 0.0 and not _use_numba
-    _leaf_out_mask: torch.Tensor | None = None   # shape (N,) bool
-    _leaf_in_mask: torch.Tensor | None = None
-
-    if _leaf_active:
-        _leaf_out_mask = (k_out <= leaf_k_threshold) & (~zero_k_out)
-        _leaf_in_mask = (k_in <= leaf_k_threshold) & (~zero_k_in)
-
-        _leaf_out_indices = _leaf_out_mask.nonzero(as_tuple=True)[0].tolist()
-        _leaf_in_indices = _leaf_in_mask.nonzero(as_tuple=True)[0].tolist()
-        _leaf_out_idx_arr = _np_hub.array(_leaf_out_indices, dtype=_np_hub.int64)
-        _leaf_in_idx_arr = _np_hub.array(_leaf_in_indices, dtype=_np_hub.int64)
-
-        # Build leaf masks for the 4N Anderson exclusion vector
-        _leaf_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
-        for _idx in _leaf_out_indices:
-            _leaf_4N_mask[_idx] = True                 # θ_out part
-        for _idx in _leaf_in_indices:
-            _leaf_4N_mask[N + _idx] = True              # θ_in part
-
-        if verbose:
-            print(
-                f"[leaf-bisect] threshold={leaf_k_threshold}: "
-                f"{len(_leaf_out_indices)} out-leaves, "
-                f"{len(_leaf_in_indices)} in-leaves identified."
-            )
-    else:
-        _leaf_out_indices = []
-        _leaf_in_indices = []
-        _leaf_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
-
-    # Combined hub+leaf Anderson exclusion mask: both kinds of node get a
-    # component solved exactly by bisection *after* mixing (see the main
-    # loop), so their raw (unstable, unbisected) Newton-step contribution
-    # must not feed into the least-squares mixing fit used for everyone
-    # else -- excluded here, corrected properly by bisection afterward.
-    _exclude_4N_mask = _hub_4N_mask | _leaf_4N_mask
-
-    def _apply_leaf_bisection(theta_fp: torch.Tensor) -> torch.Tensor:
-        """Exact 1D-bisection correction of leaf theta components -- the
-        θ-side analogue of :func:`_apply_hub_bisection`, vectorized across
-        all leaf nodes at once (see :func:`_bisect_leaf_theta_decm_batch`).
-        Same single-call-site-on-theta_next placement as
-        `_apply_hub_bisection`; see its docstring for why."""
-        if not (_leaf_active and (_leaf_out_indices or _leaf_in_indices)):
-            return theta_fp
-        _th_fp_np = theta_fp.numpy()
-        for _sweep in range(3):
-            if _leaf_out_indices:
-                _new_theta_out = _bisect_leaf_theta_decm_batch(
-                    leaf_indices=_leaf_out_indices,
-                    theta_other=_th_fp_np[N:2 * N],
-                    eta_self_all=_th_fp_np[2 * N:3 * N],
-                    eta_other=_th_fp_np[3 * N:],
-                    k_target_all=_k_out_np,
-                    mult=_mult_np,
-                )
-                _th_fp_np[_leaf_out_idx_arr] = _new_theta_out
-            if _leaf_in_indices:
-                _new_theta_in = _bisect_leaf_theta_decm_batch(
-                    leaf_indices=_leaf_in_indices,
-                    theta_other=_th_fp_np[:N],
-                    eta_self_all=_th_fp_np[3 * N:],
-                    eta_other=_th_fp_np[2 * N:3 * N],
-                    k_target_all=_k_in_np,
-                    mult=_mult_np,
-                )
-                _th_fp_np[N + _leaf_in_idx_arr] = _new_theta_in
-        return torch.from_numpy(_th_fp_np)
+    # Anderson exclusion mask: hub nodes get a component solved exactly by
+    # bisection *after* mixing (see the main loop), so their raw (unstable,
+    # unbisected) Newton-step contribution must not feed into the
+    # least-squares mixing fit used for everyone else -- excluded here,
+    # corrected properly by bisection afterward.
+    _exclude_4N_mask = _hub_4N_mask
 
     try:
         for _ in range(max_iter):
@@ -2043,7 +1771,7 @@ def solve_fixed_point_decm(
             )
             theta_fp = torch.cat([theta_fp[:2 * N], eta_part_new])
 
-            # Hub/leaf bisection is applied once, at the very end of the loop
+            # Hub bisection is applied once, at the very end of the loop
             # (to theta_next, after Anderson mixing/restart/rollback have
             # settled it) -- not here. F_current below is therefore the
             # genuine residual of the *input* theta, honest bookkeeping: it
@@ -2315,10 +2043,10 @@ def solve_fixed_point_decm(
                     progressed_since_restart = False
                 else:
                     r_k = theta_fp - theta
-                    # Hub/leaf exclusion: zero their components in r_k so
+                    # Hub exclusion: zero their components in r_k so
                     # Anderson mixing weights focus on convergence of the
                     # rest of the network.
-                    if _hub_active or _leaf_active:
+                    if _hub_active:
                         r_k[_exclude_4N_mask] = 0.0
                     r_k_norm = r_k.abs().max().item()
                     if math.isfinite(r_k_norm) and r_k_norm < _ANDERSON_MAX_NORM:
@@ -2356,7 +2084,7 @@ def solve_fixed_point_decm(
             else:
                 theta_next = theta_fp
 
-            # Hub/leaf bisection: applied once here, to the *final*
+            # Hub bisection: applied once here, to the *final*
             # theta_next for this iteration -- whichever branch produced it
             # (normal Anderson mix, no-history-yet, isolated-blowup
             # rollback, or a patience/blowup-escalation perturbed restart).
@@ -2364,10 +2092,9 @@ def solve_fixed_point_decm(
             # pre-mixing snapshot) is what makes this self-consistent: the
             # exact fit is against the values that actually carry forward
             # into the next iteration, not ones that then drift during
-            # mixing. See _apply_hub_bisection/_apply_leaf_bisection.
-            if _hub_active or _leaf_active:
+            # mixing. See _apply_hub_bisection.
+            if _hub_active:
                 theta_next = _apply_hub_bisection(theta_next)
-                theta_next = _apply_leaf_bisection(theta_next)
 
             theta = theta_next
 
@@ -2410,7 +2137,6 @@ def solve_fixed_point_decm_degenerate(
     topo_weig: bool = False,
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
-    leaf_k_threshold: float = 0.0,
     z_clamp: float = 1e-8,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -2433,13 +2159,12 @@ def solve_fixed_point_decm_degenerate(
     expanded back to the original per-node shape (4N,) so it is a drop-in
     replacement for :func:`solve_fixed_point_decm` at the call site.
 
-    ``hub_sk_threshold`` and ``leaf_k_threshold`` ARE supported: hub/leaf
-    identification and their exact 1D bisections both operate at group
-    granularity, with the bisection sums weighted by group multiplicity
-    (see :func:`_bisect_hub_eta_decm`'s and :func:`_bisect_leaf_theta_decm`'s
-    ``mult`` parameter). A group's degree/strength is shared by every member
-    node by construction, so hub/leaf membership at group granularity is
-    exactly equivalent to per-node membership. Does not (yet) support
+    ``hub_sk_threshold`` IS supported: hub identification and its exact 1D
+    bisection operate at group granularity, with the bisection sum weighted
+    by group multiplicity (see :func:`_bisect_hub_eta_decm`'s ``mult``
+    parameter). A group's degree/strength is shared by every member node
+    by construction, so hub membership at group granularity is exactly
+    equivalent to per-node membership. Does not (yet) support
     ``backtracking_gamma`` (unavailable in this reduced path -- see
     :func:`solve_fixed_point_decm`'s ``mult`` parameter docs) or
     ``backend="numba"``.
@@ -2560,7 +2285,6 @@ def solve_fixed_point_decm_degenerate(
         mult=mult,
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
-        leaf_k_threshold=leaf_k_threshold,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,

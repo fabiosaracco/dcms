@@ -456,4 +456,3 @@ class TestDECMSolverConvergence:
         m = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
         conv = m.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10, backtracking_gamma=1.2)
         assert conv
-        assert "degeneracy-reduced" not in m.sol.message

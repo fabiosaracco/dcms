@@ -617,3 +617,63 @@ class DWCMModel:
         max_workers = None if n_jobs < 0 else n_jobs
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             return list(ex.map(self._sample_raw, seeds))
+
+    def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
+        """Compute the DWCM p-value of each observed weight in an edge list.
+
+        The DWCM weight distribution is geometric starting at 0 (see
+        :meth:`sample`)::
+
+            P(w_ij = k) = (1 - beta_ij) * beta_ij**k,  k = 0, 1, 2, ...
+            beta_ij = exp(-(theta_out_i + theta_in_j))
+
+        so the p-value (probability of observing a weight at least as large
+        as the one seen) is the survival probability::
+
+            p_value(w) = P(W_ij >= w) = beta_ij**w = z_ij**-w,
+            z_ij = exp(theta_out_i + theta_in_j) = 1 / beta_ij
+
+        Computed directly on the given pairs (no dense N×N matrix is
+        built), so this scales to large networks.
+
+        Args:
+            edgelist: Array-like of shape (L, 3), each row
+                ``[source_id, target_id, weight]`` — 0-based node indices
+                into ``s_out``/``s_in``, and observed weight
+                (``weight >= 0``).
+
+        Returns:
+            Structured NumPy array of length L with fields
+            ``("source_id", int64)``, ``("target_id", int64)``,
+            ``("p_value", float64)``. Also stored as :attr:`p_value`.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        import numpy as np
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        edgelist = np.asarray(edgelist)
+        source_id = edgelist[:, 0].astype(np.int64)
+        target_id = edgelist[:, 1].astype(np.int64)
+        weight = edgelist[:, 2].astype(np.float64)
+
+        N = self.N
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
+        theta_out = theta[:N]
+        theta_in = theta[N:]
+
+        z_edge = theta_out[source_id] + theta_in[target_id]
+        z_edge = np.clip(z_edge, 1e-15, None)
+        z_ij = np.exp(z_edge)
+        p_value = z_ij ** (-weight)
+
+        dtype = np.dtype(
+            [("source_id", np.int64), ("target_id", np.int64), ("p_value", np.float64)]
+        )
+        result = np.empty(len(source_id), dtype=dtype)
+        result["source_id"] = source_id
+        result["target_id"] = target_id
+        result["p_value"] = p_value
+        self.p_value = result
+        return self.p_value

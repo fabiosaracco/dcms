@@ -33,7 +33,7 @@ Install from GitHub (the package is not yet on PyPI):
 pip install git+https://github.com/fabiosaracco/dcms.git
 ```
 
-To include optional [Numba](https://numba.pydata.org/) support (only beneficial for very large networks, N ≳ 100 000 — see §3.8 for benchmarked RAM/speed trade-offs):
+To include optional [Numba](https://numba.pydata.org/) support (only beneficial for very large networks, N ≳ 100 000 — see §3.9 for benchmarked RAM/speed trade-offs):
 
 ```bash
 pip install "dcms[numba] @ git+https://github.com/fabiosaracco/dcms.git"
@@ -366,7 +366,7 @@ converged = model.solve_tool(tol=1e-9)                       # reduced by defaul
 converged = model.solve_tool(tol=1e-9, reduce_degeneracy=False)  # force the full solver
 ```
 
-The standalone `solve_fixed_point_*_degenerate` functions (§3.7) remain available directly, e.g. to pass a custom residual function or when not using the model wrapper:
+The standalone `solve_fixed_point_*_degenerate` functions (§3.8) remain available directly, e.g. to pass a custom residual function or when not using the model wrapper:
 
 **Example:**
 
@@ -435,7 +435,7 @@ model.solve_tool(
 )
 ```
 
-**Validated on a real hard instance:** DECM on the same empirical online social network as above (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750` (750 iterations translated from the value validated in the external checkpointed-runner prototype, §3.9.1) — one repeated-blowup restart and four stagnation restarts fired, and the run converged after 9 460 iterations to MRE=9.45×10⁻⁶, with no manual intervention.
+**Validated on a real hard instance:** DECM on the same empirical online social network as above (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750` (750 iterations translated from the value validated in the external checkpointed-runner prototype, §3.10.1) — one repeated-blowup restart and four stagnation restarts fired, and the run converged after 9 460 iterations to MRE=9.45×10⁻⁶, with no manual intervention.
 
 ---
 
@@ -474,7 +474,7 @@ Additional model methods:
 | `model.bic(theta)` | float | Bayesian Information Criterion, `2N·ln(N(N−1)) − 2·ln L` |
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess: `"degrees"` (default) or `"random"` |
-| `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.7) |
+| `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.5) |
 
 ### 3.2 DWCM — `DWCMModel`
 
@@ -510,7 +510,8 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.max_relative_error(theta)` | float | `max‖F_i‖ / s_i` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DWCM (see §3.7) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DWCM (see §3.5) |
+| `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted DWCM (see §3.6) |
 
 `initial_theta` methods for DWCM:
 
@@ -564,7 +565,8 @@ Additional model methods:
 | `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative error over all 4N constraints |
 | `model.initial_theta_topo(method)` | `(2N,)` tensor | Topology initial guess (`"degrees"` or `"random"`) |
 | `model.initial_theta_weight(theta_topo, method)` | `(2N,)` tensor | Weight initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted qDECM (see §3.7) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted qDECM (see §3.5) |
+| `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted qDECM (see §3.6) |
 
 `initial_theta_weight` methods for qDECM:
 
@@ -619,7 +621,8 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ,η)‖` |
 | `model.max_relative_error(theta)` | float | Max relative error over all 4N non-zero constraints |
 | `model.initial_theta(method)` | `(4N,)` tensor | Initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DECM (see §3.7) |
+| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DECM (see §3.5) |
+| `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted DECM (see §3.6) |
 
 `initial_theta` methods for DECM:
 
@@ -719,7 +722,45 @@ Each sample is a contiguous `int64` array — RAM per sample scales as `L × col
 
 Calls to `sample()` or `sample_many()` before `solve_tool()` raise `RuntimeError`.
 
-### 3.6 SolverResult
+### 3.6 Statistical validation — `model.p_value_calculator()`
+
+Available on every **weighted** model (`DWCMModel`, `qDECMModel`, `DECMModel` — not `DCMModel`, which is binary-only). Given an observed weighted edge list, computes the p-value of each edge's weight under the fitted null model: the probability of observing a weight at least as large as the one seen, `p_value(w) = P(W_ij >= w)`. This is the standard ingredient for extracting a *statistically validated backbone* from a weighted network.
+
+**Multiple-testing correction is required, not optional.** A backbone typically tests *every* edge (potentially thousands to millions) simultaneously, so thresholding the raw `p_value` directly (e.g. `p_value < 0.01`) is statistically wrong — at that significance level, ~1% of edges would be flagged as "significant" by chance alone even under the null model, and that false-positive count grows with the number of edges tested. Control the **false discovery rate (FDR)** instead, e.g. with the Benjamini-Hochberg procedure via `scipy.stats.false_discovery_control` (SciPy ≥ 1.11, already a `dcms` dependency — see the worked example below).
+
+Each model's conditional weight distribution is geometric (see §3.5's sampling formulas), so the survival probability has a closed form:
+
+| Model | `p_value(w)` | `z_ij` |
+|-------|--------------|--------|
+| DWCM  | `z_ij ** -w` | `exp(theta_out_i + theta_in_j)` |
+| DECM  | `p_ij * z_ij ** -(w - 1)` | `exp(eta_out_i + eta_in_j)` |
+| qDECM | `p_ij * z_ij ** -(w - 1)` | `exp(theta_b_out_i + theta_b_in_j)` |
+
+DWCM's weight distribution starts at 0 (no separate link-existence step), so its p-value has no `p_ij` factor; DECM/qDECM gate the geometric branch (starting at 1) behind the link-existence probability `p_ij`, so their survival probability carries it. Computed directly on the given `(source_id, target_id)` pairs — no dense N×N matrix is built — so this scales to large networks.
+
+```python
+import numpy as np
+from scipy.stats import false_discovery_control
+
+# edgelist: (L, 3) array, each row [source_id, target_id, weight]
+# (0-based node indices into k_out/k_in/s_out/s_in; weight >= 1 for
+# DECM/qDECM, weight >= 0 for DWCM)
+edgelist = np.array([[0, 1, 5], [2, 3, 12], [7, 0, 1]])
+
+pvals = model.p_value_calculator(edgelist)
+# structured NumPy array, fields: source_id (int64), target_id (int64), p_value (float64)
+# also stored as model.p_value
+print(pvals["p_value"])
+
+# FDR control (Benjamini-Hochberg) across all L tested edges at once --
+# NOT pvals["p_value"] < 0.01, which ignores the multiple-testing problem.
+q_values = false_discovery_control(pvals["p_value"], method="bh")
+validated = pvals[q_values < 0.01]
+```
+
+Raises `RuntimeError` if called before `solve_tool()`.
+
+### 3.7 SolverResult
 
 `solve_tool()` stores results on the model as `model.sol` for all models.  The `SolverResult` dataclass fields are:
 
@@ -738,7 +779,7 @@ result.mre             # float — MRE at best_theta (min of residuals, or max(m
 result.last_mre        # float — MRE at last iterate theta
 ```
 
-### 3.7 Standalone solvers (advanced)
+### 3.8 Standalone solvers (advanced)
 
 The underlying solvers can be called directly without the model wrapper, e.g. to pass a custom residual function or to interleave topology and weight steps manually:
 
@@ -773,7 +814,7 @@ a usage example.
 
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 
-### 3.8 Compute backend and parallelism
+### 3.9 Compute backend and parallelism
 
 All solvers accept a `backend` parameter that controls which compute engine executes the N×N inner loops:
 
@@ -803,7 +844,7 @@ model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to
 
 `num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
 
-**Custom initial conditions (warm restart).**  See §3.9 for details and examples.
+**Custom initial conditions (warm restart).**  See §3.10 for details and examples.
 
 
 ```python
@@ -838,7 +879,7 @@ pip install dcms[numba]          # installs numba as an optional extra
 pip install dcms numba           # equivalent
 ```
 
-### 3.9 Custom initial conditions and warm restart
+### 3.10 Custom initial conditions and warm restart
 
 Each model internally works with a *parameter vector* in log-space.  After `solve_tool()` finishes, the result is stored in `model.sol.theta` for all models.
 
@@ -888,7 +929,7 @@ qdecm.solve_tool(
 
 For DCM, DWCM and DECM pass an array of shape (2N,), (2N,) and (4N,) respectively to `ic`.  For DECM, `multi_start` is automatically disabled when `ic` is an array.
 
-### 3.9.1 Checkpointed multi-chunk runs surviving a real crash/preemption
+### 3.10.1 Checkpointed multi-chunk runs surviving a real crash/preemption
 
 Stagnation and repeated-blowup recovery are now **built into the DECM solver itself** (§2.6) — a single unattended `solve_tool()`/`solve_fixed_point_decm[_degenerate]` call handles those on its own via `patience`/`noise_base`/`noise_cap_mult`/`max_stalls`, no external orchestration needed.
 
@@ -920,7 +961,7 @@ for chunk in range(n_chunks):
 
 **Validated on a real hard instance:** DECM on an empirical online social network (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750`, converged after 9 460 iterations to MRE=9.45×10⁻⁶ with no manual intervention — first as a chunked+checkpointed prototype (an earlier iteration of this same recovery idea, before it moved into the solver itself), then reproduced with the built-in mechanism (§2.6).
 
-### 3.10 Network generator (`dcms/utils/wng.py`)
+### 3.11 Network generator (`dcms/utils/wng.py`)
 
 ```python
 from dcms.utils.wng import k_s_generator_pl

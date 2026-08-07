@@ -727,6 +727,237 @@ def _decm_step_chunked(
     return theta_new, F_current
 
 
+def _decm_step_chunked_weighted(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    zero_k_out: torch.Tensor,
+    zero_k_in: torch.Tensor,
+    zero_s_out: torch.Tensor,
+    zero_s_in: torch.Tensor,
+    chunk_size: int,
+    max_step: float,
+    mult: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked alternating GS-Newton step for the degeneracy-reduced DECM.
+
+    Mirrors :func:`_decm_step_dense_weighted` but processes the M×M group
+    matrices in row chunks to keep memory usage at O(chunk_size × M), the
+    same trade :func:`_decm_step_chunked` makes for the per-node case.
+
+    :func:`_decm_step_dense_weighted` has no size guard: it always builds
+    the full M×M matrices regardless of M, which is fine when the
+    degeneracy reduction is substantial (M << N, the common case for real
+    integer degree/strength data with a heavy repeated low-degree bulk)
+    but becomes impractically slow/memory-heavy when it isn't (e.g.
+    continuous-valued or otherwise low-collision degree/strength
+    sequences, where M stays close to N even for N in the tens of
+    thousands). :func:`solve_fixed_point_decm` selects this function
+    instead of the dense one once M exceeds ``_LARGE_N_THRESHOLD``,
+    mirroring exactly the existing dense-vs-chunked selection already
+    used for the non-reduced (``mult is None``) path.
+
+    Produces results equal to :func:`_decm_step_dense_weighted` (up to
+    floating-point summation order) for the same inputs, for any
+    ``chunk_size`` -- unlike :func:`_decm_step_chunked`, which restricts
+    its z-floor line-search to "significant" pairs as a performance/
+    robustness heuristic, this function tracks the exact same z_min as
+    the dense weighted version (including its singleton-diagonal
+    handling), since exact equivalence with the already-verified dense
+    weighted path was the primary correctness target here.
+
+    Args: same as :func:`_decm_step_dense_weighted`, plus:
+        chunk_size: Rows (groups) per processing chunk.
+
+    Returns:
+        ``(theta_new, F_current)``, both shape (4M,)/(4M,).
+    """
+    M = k_out.shape[0]
+    theta_out = theta[:M]
+    theta_in = theta[M : 2 * M]
+    eta_out = theta[2 * M : 3 * M]
+    eta_in = theta[3 * M :]
+
+    singleton = mult <= 1.0
+
+    # ------------------------------------------------------------------
+    # Pass 1: accumulate row sums (out-direction) + preliminary col sums
+    # (in-direction, at the *input* theta -- used for F_current only)
+    # ------------------------------------------------------------------
+    k_out_hat = torch.zeros(M, dtype=torch.float64)
+    k_in_hat = torch.zeros(M, dtype=torch.float64)
+    s_out_hat = torch.zeros(M, dtype=torch.float64)
+    s_in_hat = torch.zeros(M, dtype=torch.float64)
+    H_k_out = torch.zeros(M, dtype=torch.float64)
+    H_s_out = torch.zeros(M, dtype=torch.float64)
+    z_min_out = torch.full((M,), float("inf"), dtype=torch.float64)
+
+    for i_start in range(0, M, chunk_size):
+        i_end = min(i_start + chunk_size, M)
+        local_i = torch.arange(i_end - i_start, dtype=torch.long)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+
+        eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, M)
+        eta_safe = eta_chunk.clamp(min=_Z_G_CLAMP)
+        G_chunk = -1.0 / torch.expm1(-eta_safe)
+        log_q_chunk = -torch.log(torch.expm1(eta_safe))
+        logit_p_chunk = (
+            -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q_chunk
+        )
+        p_chunk = torch.sigmoid(logit_p_chunk)
+        w_chunk = p_chunk * G_chunk
+        pq_chunk = p_chunk * (1.0 - p_chunk)
+        H_s_chunk = p_chunk * G_chunk * (G_chunk - 1.0) + pq_chunk * G_chunk.pow(2)
+
+        # Diagonal entries P[g,g] etc. for g in this chunk -- subtracted
+        # once below rather than zeroed, the same "weighted sum minus one
+        # self-interaction term" generalisation _decm_step_dense_weighted
+        # uses for the degeneracy-reduced self-loop exclusion.
+        diag_p = p_chunk[local_i, global_j]
+        diag_w = w_chunk[local_i, global_j]
+        diag_pq = pq_chunk[local_i, global_j]
+        diag_H_s = H_s_chunk[local_i, global_j]
+
+        k_out_hat[i_start:i_end] = (p_chunk * mult[None, :]).sum(1) - diag_p
+        s_out_hat[i_start:i_end] = (w_chunk * mult[None, :]).sum(1) - diag_w
+        H_k_out[i_start:i_end] = (pq_chunk * mult[None, :]).sum(1) - diag_pq
+        H_s_out[i_start:i_end] = (H_s_chunk * mult[None, :]).sum(1) - diag_H_s
+
+        # Column accumulation (in-direction, at input theta), weighted by
+        # this chunk's own group multiplicities (the row/g side). The
+        # diagonal term for column h=g only ever appears in this chunk
+        # (at its own row g), so it is subtracted exactly once, here.
+        k_in_hat += (p_chunk * mult[i_start:i_end, None]).sum(0)
+        s_in_hat += (w_chunk * mult[i_start:i_end, None]).sum(0)
+        k_in_hat[i_start:i_end] -= diag_p
+        s_in_hat[i_start:i_end] -= diag_w
+
+        # z_min_out[g] = min over h of eta_gh, excluding the diagonal only
+        # for singleton groups (mult==1: no real edge behind that entry;
+        # see _decm_step_dense_weighted).
+        eta_for_min = eta_safe.clone()
+        chunk_singleton = singleton[i_start:i_end]
+        if chunk_singleton.any():
+            rows = local_i[chunk_singleton]
+            eta_for_min[rows, global_j[chunk_singleton]] = float("inf")
+        z_min_out[i_start:i_end] = eta_for_min.min(1).values.clamp(min=_Z_G_CLAMP)
+
+    nz_in = s_in > 0
+    if nz_in.any():
+        z_min_out = torch.minimum(z_min_out, eta_out + eta_in[nz_in].min())
+
+    F_current = torch.cat(
+        [k_out_hat - k_out, k_in_hat - k_in,
+         s_out_hat - s_out, s_in_hat - s_in]
+    )
+
+    H_k_out = H_k_out.clamp(min=1e-15)
+    H_s_out = H_s_out.clamp(min=1e-15)
+
+    # ------- Update θ_out -------
+    delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
+    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_out_new = torch.where(
+        zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
+    )
+
+    # ------- Update η_out (with z-floor line-search) -------
+    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
+    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
+    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
+    alpha_out = torch.where(
+        delta_eta_out < 0,
+        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
+        torch.ones(M, dtype=torch.float64),
+    )
+    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
+    eta_out_new = torch.where(
+        zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
+    )
+
+    # ------------------------------------------------------------------
+    # Pass 2: accumulate col sums using updated (theta_out_new, eta_out_new)
+    # ------------------------------------------------------------------
+    k_in_hat2 = torch.zeros(M, dtype=torch.float64)
+    s_in_hat2 = torch.zeros(M, dtype=torch.float64)
+    H_k_in2 = torch.zeros(M, dtype=torch.float64)
+    H_s_in2 = torch.zeros(M, dtype=torch.float64)
+    z_min_in = torch.full((M,), float("inf"), dtype=torch.float64)
+
+    for i_start in range(0, M, chunk_size):
+        i_end = min(i_start + chunk_size, M)
+        local_i = torch.arange(i_end - i_start, dtype=torch.long)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+
+        eta2_chunk = eta_out_new[i_start:i_end, None] + eta_in[None, :]
+        eta2_safe = eta2_chunk.clamp(min=_Z_G_CLAMP)
+        G2_chunk = -1.0 / torch.expm1(-eta2_safe)
+        log_q2_chunk = -torch.log(torch.expm1(eta2_safe))
+        logit_p2_chunk = (
+            -theta_out_new[i_start:i_end, None] - theta_in[None, :] + log_q2_chunk
+        )
+        p2_chunk = torch.sigmoid(logit_p2_chunk)
+        w2_chunk = p2_chunk * G2_chunk
+        pq2_chunk = p2_chunk * (1.0 - p2_chunk)
+        H_s2_chunk = p2_chunk * G2_chunk * (G2_chunk - 1.0) + pq2_chunk * G2_chunk.pow(2)
+
+        diag_p2 = p2_chunk[local_i, global_j]
+        diag_w2 = w2_chunk[local_i, global_j]
+        diag_pq2 = pq2_chunk[local_i, global_j]
+        diag_H_s2 = H_s2_chunk[local_i, global_j]
+
+        k_in_hat2 += (p2_chunk * mult[i_start:i_end, None]).sum(0)
+        s_in_hat2 += (w2_chunk * mult[i_start:i_end, None]).sum(0)
+        H_k_in2 += (pq2_chunk * mult[i_start:i_end, None]).sum(0)
+        H_s_in2 += (H_s2_chunk * mult[i_start:i_end, None]).sum(0)
+
+        k_in_hat2[i_start:i_end] -= diag_p2
+        s_in_hat2[i_start:i_end] -= diag_w2
+        H_k_in2[i_start:i_end] -= diag_pq2
+        H_s_in2[i_start:i_end] -= diag_H_s2
+
+        eta2_for_min = eta2_safe.clone()
+        chunk_singleton = singleton[i_start:i_end]
+        if chunk_singleton.any():
+            rows = local_i[chunk_singleton]
+            eta2_for_min[rows, global_j[chunk_singleton]] = float("inf")
+        z_min_in = torch.minimum(z_min_in, eta2_for_min.min(0).values)
+
+    z_min_in = z_min_in.clamp(min=_Z_G_CLAMP)
+    nz_out = s_out > 0
+    if nz_out.any():
+        z_min_in = torch.minimum(z_min_in, eta_out_new[nz_out].min() + eta_in)
+
+    H_k_in2 = H_k_in2.clamp(min=1e-15)
+    H_s_in2 = H_s_in2.clamp(min=1e-15)
+
+    # ------- Update θ_in -------
+    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
+    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_in_new = torch.where(
+        zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
+    )
+
+    # ------- Update η_in (with z-floor line-search) -------
+    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
+    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
+    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
+    alpha_in = torch.where(
+        delta_eta_in < 0,
+        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
+        torch.ones(M, dtype=torch.float64),
+    )
+    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
+    eta_in_new = torch.where(
+        zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
+    )
+
+    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
+    return theta_new, F_current
+
+
 # -------------------------------------------------------------------------
 # Hub bisection helper (DECM)
 # -------------------------------------------------------------------------
@@ -818,6 +1049,82 @@ def _bisect_hub_eta_decm(
     return 0.5 * (eta_lo + eta_hi)
 
 
+def _bisect_hub_eta_decm_batch(
+    hub_indices: "list[int]",
+    theta_self_all: "np.ndarray",
+    theta_other: "np.ndarray",
+    eta_other: "np.ndarray",
+    s_target_all: "np.ndarray",
+    n_bisect: int = 60,
+    mult: "np.ndarray | None" = None,
+) -> "np.ndarray":
+    """Vectorized batch version of :func:`_bisect_hub_eta_decm`: solves η for
+    every node in ``hub_indices`` simultaneously (each bisection step is one
+    ``(k, N)`` vectorized array op instead of ``k`` separate per-node Python
+    calls), against the *same* snapshot of ``theta_other``/``eta_other``.
+
+    Same equation, same monotonicity, same bracket as the per-node version;
+    see its docstring for the derivation. Only the "unreachable" edge case
+    at the low end (``f(eta_lo) <= 0``) is checked, matching the per-node
+    version -- ``f(eta_hi) < 0`` always holds for a positive ``s_target``.
+
+    Args:
+        hub_indices:    Indices (into the full length-N arrays) of the hub
+                         nodes to solve for, length k.
+        theta_self_all: Full θ array for this side (θ_out for an out-hub
+                         batch), length N -- indexed internally by
+                         ``hub_indices``.
+        theta_other:    θ parameters of the opposing side, length N.
+        eta_other:      η parameters of the opposing side, length N.
+        s_target_all:   Full strength-target array for this side, length N
+                         -- indexed internally by ``hub_indices``.
+        n_bisect:       Number of bisection steps.
+        mult:           Optional group multiplicities, length N (see
+                         :func:`_bisect_hub_eta_decm`).
+
+    Returns:
+        Array of shape ``(k,)``: η* for each node in ``hub_indices``, in the
+        same order.
+    """
+    import numpy as _np
+
+    idx = _np.asarray(hub_indices, dtype=_np.int64)
+    k = idx.shape[0]
+    rows = _np.arange(k)
+    theta_self = theta_self_all[idx]        # (k,)
+    s_target = s_target_all[idx]            # (k,)
+    theta_other_row = theta_other[None, :]  # (1, N), broadcasts over rows
+
+    def _f(eta_val: "_np.ndarray") -> "_np.ndarray":
+        z = eta_val[:, None] + eta_other[None, :]       # (k, N)
+        z = _np.maximum(z, _Z_G_CLAMP)
+        G = -1.0 / _np.expm1(-z)
+        log_q = -_np.log(_np.expm1(z))
+        logit_p = -theta_self[:, None] - theta_other_row + log_q
+        p = 1.0 / (1.0 + _np.exp(-logit_p))
+        W = p * G
+        if mult is not None:
+            total = (W * mult[None, :]).sum(axis=1) - W[rows, idx]
+        else:
+            W = W.copy()
+            W[rows, idx] = 0.0
+            total = W.sum(axis=1)
+        return total - s_target
+
+    eta_lo = _np.full(k, _ETA_MIN)
+    eta_hi = _np.full(k, _ETA_MAX)
+    unreachable = _f(eta_lo) <= 0.0
+
+    for _ in range(n_bisect):
+        eta_mid = 0.5 * (eta_lo + eta_hi)
+        go_lo = _f(eta_mid) > 0.0
+        eta_lo = _np.where(go_lo, eta_mid, eta_lo)
+        eta_hi = _np.where(go_lo, eta_hi, eta_mid)
+
+    result = 0.5 * (eta_lo + eta_hi)
+    return _np.where(unreachable, _ETA_MIN, result)
+
+
 # -------------------------------------------------------------------------
 # Main solver
 # -------------------------------------------------------------------------
@@ -843,6 +1150,7 @@ def solve_fixed_point_decm(
     topo_weig: bool = False,
     hub_sk_threshold: float = 0.0,
     backtracking_gamma: float = 0.0,
+    z_clamp: float = 1e-8,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
     init_best_theta: torch.Tensor | None = None,
@@ -915,13 +1223,44 @@ def solve_fixed_point_decm(
                         until the condition is met.  Typical value: ``2.0``.
                         Default 0 (disabled).  Anderson history is cleared
                         whenever a dampened step is accepted.
+        z_clamp:        Floor applied to the raw z=eta_out+eta_in sum in two
+                        places, both of which govern the same trade-off
+                        between damping near-degenerate-hub curvature
+                        blowups and preserving the solver's gradual
+                        z-approach self-escape: (1) it floors ``eta`` before
+                        computing ``G = -1/expm1(-z)`` in every objective/
+                        step evaluation, which damps the curvature blowup
+                        as z -> 0 for near-degenerate hub pairs; (2) it is
+                        also the hard floor of the per-step trust-region
+                        limiter (``z_floor = max(z_min * 0.5, z_clamp)``)
+                        that governs how far eta can approach z=0 in ONE
+                        iteration -- raising it too far can wall off pairs
+                        whose true z* sits below the new floor, creating an
+                        artificial plateau (confirmed via a controlled A/B
+                        on ita_election_dico3: decoupling this into two
+                        independent module constants was tried and made
+                        things *worse*, not better, so both roles are kept
+                        tied to a single value here by design). Default
+                        1e-8 (the long-standing value, originally tuned for
+                        a different solver's z->0 deadlock and reused here
+                        without re-derivation) leaves existing behaviour
+                        unchanged. Raising it (e.g. to 1e-6) resolved a
+                        real stagnation on a hub-heavy N=28156 network
+                        (ita_election_dico3) that would not converge at the
+                        default; there is currently no general rule for
+                        picking a value beyond "try raising it if the
+                        solver stagnates on a network with extreme s/k
+                        hubs" -- see the DECM z-clamp investigation notes
+                        for the full experimental history.
         mult:           Internal use by :func:`solve_fixed_point_decm_degenerate`.
                         When provided (shape (M,)), ``k_out``/``k_in``/``s_out``/
                         ``s_in``/``theta0`` are interpreted as *group-level*
                         quantities (one entry per unique (k_out,s_out,k_in,s_in)
                         4-tuple) and the step uses :func:`_decm_step_dense_weighted`
                         instead of the per-node dense/chunked/Numba paths.
-                        Not compatible with ``hub_sk_threshold`` or
+                        ``hub_sk_threshold`` operates at group granularity
+                        when ``mult`` is given (the bisection helper accepts
+                        it). Not compatible with
                         ``backtracking_gamma`` (not yet implemented for the
                         reduced case) or ``backend="numba"``.  Default None
                         (standard per-node behaviour, unaffected).
@@ -959,23 +1298,34 @@ def solve_fixed_point_decm(
                         wasted exploration of bad regions. A float here
                         replaces the N-adaptive formula outright, applied as
                         given regardless of N.
-        patience:       Perturbed-restart trigger, in iterations. If
+        patience:       Stagnation-recovery trigger, in iterations. If
                         ``best_theta_res`` has not improved for ``patience``
-                        consecutive iterations, the solver restarts from
-                        ``best_theta`` plus Gaussian noise instead of
-                        continuing from the (stuck) current iterate --
+                        consecutive iterations, the solver no longer just
+                        continues from the (stuck) current iterate. The
+                        FIRST such stall since the last record gets the same
+                        cheap, noise-free fix as an isolated blowup (clear
+                        Anderson history, plain Newton step from
+                        ``best_theta``) -- a stagnant Anderson mix can look
+                        identical to a genuine attracting fixed point, and
+                        this is free to try before assuming the latter. Only
+                        if that ALSO fails to beat the record within another
+                        ``patience`` window does the solver escalate to
+                        restarting from ``best_theta`` plus Gaussian noise --
                         this is what actually resolves the quasi-fixed-point
                         traps that plain Anderson/Newton alone cannot escape
-                        on hard hub-heavy instances. The same recovery also
-                        fires when the Anderson blowup guard (see
-                        ``blowup_factor`` above) trips *repeatedly* with no
-                        record improvement in between -- an isolated,
-                        self-recovering blowup is left alone (existing plain
-                        rollback, no noise). Set ``patience <= 0`` to disable
-                        and restore the old behaviour (stop immediately
-                        instead of retrying). Default 750, the value
-                        validated end-to-end on a hard N=15168 instance (see
-                        README "Checkpointed multi-chunk runs").
+                        on hard hub-heavy instances. The same escalation path
+                        is shared with the Anderson blowup guard (see
+                        ``blowup_factor`` above): it also starts with the
+                        cheap no-noise rollback, and only escalates to a
+                        perturbed restart if the blowup trips *repeatedly*
+                        with no record improvement in between. Set
+                        ``patience <= 0`` to disable and restore the old
+                        behaviour (stop immediately instead of retrying).
+                        Default 750, the value validated end-to-end on a hard
+                        N=15168 instance (see README "Checkpointed
+                        multi-chunk runs") -- validated before the soft-reset
+                        first attempt was added, so a stall may now resolve
+                        without ever reaching a perturbed restart at all.
         noise_base:     Scale of the *multiplicative* (log-scale) Gaussian
                         noise applied to ``best_theta`` on the *first*
                         perturbed restart: every component of
@@ -1041,6 +1391,11 @@ def solve_fixed_point_decm(
         )
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+
+    global _Z_G_CLAMP, _Z_NEWTON_FLOOR
+    _Z_G_CLAMP = z_clamp
+    _Z_NEWTON_FLOOR = z_clamp
+
     if mult is not None:
         if backtracking_gamma > 0.0:
             raise NotImplementedError(
@@ -1106,12 +1461,20 @@ def solve_fixed_point_decm(
 
     # Step function with bound arguments
     if mult is not None:
-        def _step(th):
-            return _decm_step_dense_weighted(
-                th, k_out, k_in, s_out, s_in,
-                zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                max_step, mult,
-            )
+        if effective_chunk > 0:
+            def _step(th):
+                return _decm_step_chunked_weighted(
+                    th, k_out, k_in, s_out, s_in,
+                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
+                    effective_chunk, max_step, mult,
+                )
+        else:
+            def _step(th):
+                return _decm_step_dense_weighted(
+                    th, k_out, k_in, s_out, s_in,
+                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
+                    max_step, mult,
+                )
     elif _use_numba and variant == "theta-newton":
         def _step(th):
             to_ = th[:N].numpy()
@@ -1213,6 +1576,14 @@ def solve_fixed_point_decm(
     restarts = 0
     stalls_at_cap = 0
     iters_since_improve = 0
+    # True until a patience stall has already been given one no-noise
+    # Anderson-reset attempt since the last genuine improvement. Mirrors
+    # the isolated-vs-repeated blowup escalation: the first stall gets the
+    # cheap fix (clear Anderson history, plain Newton step from
+    # best_theta, no noise); only if that ALSO fails to beat the record
+    # within another `patience` window do we escalate to a perturbed
+    # (noisy) restart.
+    _soft_stall_reset_tried = False
     # True until the first blowup/stagnation intervention; reset back to
     # True by a genuine record improvement *or* by a restart that actually
     # fires (a restart is itself a fresh start -- see the two call sites of
@@ -1301,6 +1672,10 @@ def solve_fixed_point_decm(
     # Group multiplicities as numpy, for the weighted hub-bisection sum
     # (degeneracy-reduced path only; None reproduces the per-node behaviour).
     _mult_np = mult.numpy() if mult is not None else None
+    # Precomputed once: target arrays as numpy, reused by every hub-bisection
+    # call each iteration.
+    _s_out_np = s_out.numpy()
+    _s_in_np = s_in.numpy()
 
     if _hub_active:
         # k_hat ≈ k_out (use observed degrees as proxy; also, a node with
@@ -1314,6 +1689,8 @@ def solve_fixed_point_decm(
 
         _hub_out_indices = _hub_out_mask.nonzero(as_tuple=True)[0].tolist()
         _hub_in_indices = _hub_in_mask.nonzero(as_tuple=True)[0].tolist()
+        _hub_out_idx_arr = _np_hub.array(_hub_out_indices, dtype=_np_hub.int64)
+        _hub_in_idx_arr = _np_hub.array(_hub_in_indices, dtype=_np_hub.int64)
 
         # Build hub masks for the 4N Anderson exclusion vector
         _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
@@ -1334,45 +1711,45 @@ def solve_fixed_point_decm(
         _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
 
     def _apply_hub_bisection(theta_fp: torch.Tensor) -> torch.Tensor:
-        """Exact 1D-bisection correction of hub eta components (see the
-        module-level hub-bisection block in the main loop for details).
-        Factored out so the isolated-blowup rollback (below) can apply the
-        same correction its theta_rb -- without it, a hub node's eta right
-        after a rollback is only as good as one global Newton step, exactly
-        the instability hub_sk_threshold exists to avoid, at precisely the
-        moment recovery needs it most (observed on crisi_dico2, 2026-07-24:
-        the rollback's omission of hub-bisection was a likely contributor to
-        why recovery after an isolated blowup sometimes fails to find a new
-        record before the next blowup escalates)."""
+        """Exact 1D-bisection correction of hub eta components, vectorized
+        across all hub nodes at once (see :func:`_bisect_hub_eta_decm_batch`).
+        Applied to the *final* ``theta_next`` for this iteration (after
+        Anderson mixing, restarts, or rollback have all already settled on
+        it -- see the single call site near the end of the main loop) so
+        the bisection is always against the opposing values that actually
+        carry forward, not a pre-mixing snapshot that then drifts."""
         if not (_hub_active and (_hub_out_indices or _hub_in_indices)):
             return theta_fp
         _th_fp_np = theta_fp.numpy()
         for _sweep in range(3):
-            for _i in _hub_out_indices:
-                _eta_in_cur = _th_fp_np[3 * N:]
-                _tho_cur = _th_fp_np[N:2 * N]
-                _eta_out_new = _bisect_hub_eta_decm(
-                    theta_self=float(_th_fp_np[_i]),
-                    theta_other=_tho_cur,
-                    eta_other=_eta_in_cur,
-                    s_target=float(s_out[_i].item()),
-                    self_idx=_i,
+            if _hub_out_indices:
+                _new_eta_out = _bisect_hub_eta_decm_batch(
+                    hub_indices=_hub_out_indices,
+                    theta_self_all=_th_fp_np[:N],
+                    theta_other=_th_fp_np[N:2 * N],
+                    eta_other=_th_fp_np[3 * N:],
+                    s_target_all=_s_out_np,
                     mult=_mult_np,
                 )
-                _th_fp_np[2 * N + _i] = _eta_out_new
-            for _j in _hub_in_indices:
-                _eta_out_cur = _th_fp_np[2 * N:3 * N]
-                _tho_cur = _th_fp_np[:N]
-                _eta_in_new = _bisect_hub_eta_decm(
-                    theta_self=float(_th_fp_np[N + _j]),
-                    theta_other=_tho_cur,
-                    eta_other=_eta_out_cur,
-                    s_target=float(s_in[_j].item()),
-                    self_idx=_j,
+                _th_fp_np[2 * N + _hub_out_idx_arr] = _new_eta_out
+            if _hub_in_indices:
+                _new_eta_in = _bisect_hub_eta_decm_batch(
+                    hub_indices=_hub_in_indices,
+                    theta_self_all=_th_fp_np[N:2 * N],
+                    theta_other=_th_fp_np[:N],
+                    eta_other=_th_fp_np[2 * N:3 * N],
+                    s_target_all=_s_in_np,
                     mult=_mult_np,
                 )
-                _th_fp_np[3 * N + _j] = _eta_in_new
+                _th_fp_np[3 * N + _hub_in_idx_arr] = _new_eta_in
         return torch.from_numpy(_th_fp_np)
+
+    # Anderson exclusion mask: hub nodes get a component solved exactly by
+    # bisection *after* mixing (see the main loop), so their raw (unstable,
+    # unbisected) Newton-step contribution must not feed into the
+    # least-squares mixing fit used for everyone else -- excluded here,
+    # corrected properly by bisection afterward.
+    _exclude_4N_mask = _hub_4N_mask
 
     try:
         for _ in range(max_iter):
@@ -1394,21 +1771,14 @@ def solve_fixed_point_decm(
             )
             theta_fp = torch.cat([theta_fp[:2 * N], eta_part_new])
 
-            # ------------------------------------------------------------------
-            # Hub bisection: for nodes with s/k > threshold, find η exactly
-            # via 1D bisection (3 GS sweeps for consistency between out/in).
-            # ------------------------------------------------------------------
-            if _hub_active and (_hub_out_indices or _hub_in_indices):
-                theta_fp = _apply_hub_bisection(theta_fp)
-
-                # Zero out F_current for hub nodes (their strength equation is
-                # exactly satisfied after bisection; keep residual for bookkeeping)
-                for _i in _hub_out_indices:
-                    F_current[2 * N + _i] = 0.0
-                for _j in _hub_in_indices:
-                    F_current[3 * N + _j] = 0.0
-
-
+            # Hub bisection is applied once, at the very end of the loop
+            # (to theta_next, after Anderson mixing/restart/rollback have
+            # settled it) -- not here. F_current below is therefore the
+            # genuine residual of the *input* theta, honest bookkeeping: it
+            # already reflects last iteration's bisection (theta was bisected
+            # before becoming this iteration's input), with no artificial
+            # zeroing. See the single bisection call site near the end of
+            # this loop for why (moving-target self-consistency fix).
             res_norm = (
                 (F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
                 if _v_nonzero.any() else 0.0
@@ -1500,6 +1870,7 @@ def solve_fixed_point_decm(
                 stalls_at_cap = 0
                 iters_since_improve = 0
                 progressed_since_restart = True
+                _soft_stall_reset_tried = False
             else:
                 iters_since_improve += 1
 
@@ -1509,39 +1880,72 @@ def solve_fixed_point_decm(
                 break
 
             # Stagnation detection: no record improvement for `patience`
-            # iterations straight -> perturbed restart around best_theta
-            # (see `patience` docstring for why, and for the shared
+            # iterations straight. Mirrors the isolated-vs-repeated blowup
+            # escalation below: the FIRST stall since the last improvement
+            # gets the same cheap fix as an isolated blowup (clear Anderson
+            # history, plain Newton step from best_theta, no noise) instead
+            # of jumping straight to a perturbed restart -- a stagnant
+            # Anderson mix (ill-conditioned mixing weights reproducing the
+            # same near-best point) can look identical to a genuine
+            # attracting fixed point, and the cheap fix is free to try
+            # first. Only if that ALSO fails to beat the record within
+            # another `patience` window do we escalate to a perturbed
+            # (noisy) restart (see `patience` docstring, and the shared
             # escalation counter with the repeated-blowup path below).
             _patience_restart_theta: torch.Tensor | None = None
             if patience > 0 and iters_since_improve >= patience:
-                _patience_restart_theta, _give_up = _perturbed_restart()
-                iters_since_improve = 0
-                # A restart is itself a fresh start: give the resulting
-                # trajectory its own first-blowup grace (see
-                # `progressed_since_restart`'s declaration above) instead of
-                # inheriting "no progress" from whatever triggered this
-                # restart. The escalation counter (`restarts`, inside
-                # `_perturbed_restart`) still only resets on a genuine
-                # record improvement, so this doesn't weaken the
-                # loop-prevention guarantee -- it just stops every single
-                # post-restart blowup, however far downstream and however
-                # much clean progress happened first, from being misread as
-                # "still the same trap" and escalating immediately.
-                progressed_since_restart = True
-                # Stale pre-stagnation Anderson history is irrelevant (and
-                # potentially harmful) once we jump to a discontinuous new
-                # point; also arm the post-restart blowup-guard grace (see
-                # `_post_restart_reset` above).
-                _and_g.clear()
-                _and_r.clear()
-                _post_restart_reset = True
-                if _give_up:
-                    message = (
-                        f"Stagnation recovery exhausted: {max_stalls} restarts at "
-                        f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
-                        f"improving best={best_theta_res:.3e}. Stopping at iter {n_iter}."
+                if not _soft_stall_reset_tried:
+                    if verbose:
+                        print(
+                            f"[patience] stalled {patience} iters with no "
+                            f"improvement -- soft reset (Anderson clear, no "
+                            f"noise) at iter {n_iter}."
+                        )
+                    theta_rb, _ = _step(best_theta)
+                    eta_old_rb = best_theta[2 * N :]
+                    eta_new_rb = theta_rb[2 * N :]
+                    _eta_floor_rb = (eta_old_rb * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
+                    eta_new_rb = torch.where(
+                        eta_new_rb > 0,
+                        torch.maximum(eta_new_rb, _eta_floor_rb),
+                        eta_new_rb,
                     )
-                    break
+                    theta_rb = torch.cat([theta_rb[:2 * N], eta_new_rb])
+                    _patience_restart_theta = theta_rb
+                    _soft_stall_reset_tried = True
+                    iters_since_improve = 0
+                    _and_g.clear()
+                    _and_r.clear()
+                else:
+                    _patience_restart_theta, _give_up = _perturbed_restart()
+                    iters_since_improve = 0
+                    # A restart is itself a fresh start: give the resulting
+                    # trajectory its own first-blowup grace (see
+                    # `progressed_since_restart`'s declaration above) instead of
+                    # inheriting "no progress" from whatever triggered this
+                    # restart. The escalation counter (`restarts`, inside
+                    # `_perturbed_restart`) still only resets on a genuine
+                    # record improvement, so this doesn't weaken the
+                    # loop-prevention guarantee -- it just stops every single
+                    # post-restart blowup, however far downstream and however
+                    # much clean progress happened first, from being misread as
+                    # "still the same trap" and escalating immediately.
+                    progressed_since_restart = True
+                    # Stale pre-stagnation Anderson history is irrelevant (and
+                    # potentially harmful) once we jump to a discontinuous new
+                    # point; also arm the post-restart blowup-guard grace (see
+                    # `_post_restart_reset` above).
+                    _and_g.clear()
+                    _and_r.clear()
+                    _post_restart_reset = True
+                    _soft_stall_reset_tried = False
+                    if _give_up:
+                        message = (
+                            f"Stagnation recovery exhausted: {max_stalls} restarts at "
+                            f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
+                            f"improving best={best_theta_res:.3e}. Stopping at iter {n_iter}."
+                        )
+                        break
 
             # Anderson acceleration
             if _patience_restart_theta is not None:
@@ -1633,22 +2037,17 @@ def solve_fixed_point_decm(
                         eta_new_rb,
                     )
                     theta_rb = torch.cat([theta_rb[:2 * N], eta_new_rb])
-                    # Apply the same exact hub-eta correction a normal step
-                    # would get (see `_apply_hub_bisection`'s docstring) --
-                    # without it, hub nodes come out of the rollback only as
-                    # accurate as one global Newton step, exactly the
-                    # instability hub_sk_threshold exists to prevent, right
-                    # when recovery needs it most.
-                    theta_next = _apply_hub_bisection(theta_rb)
+                    theta_next = theta_rb
                     # Mark the baseline so a blowup that recurs before any
                     # further improvement is treated as "repeated" above.
                     progressed_since_restart = False
                 else:
                     r_k = theta_fp - theta
-                    # Hub exclusion: zero hub components in r_k so Anderson
-                    # mixing weights focus on non-hub convergence
+                    # Hub exclusion: zero their components in r_k so
+                    # Anderson mixing weights focus on convergence of the
+                    # rest of the network.
                     if _hub_active:
-                        r_k[_hub_4N_mask] = 0.0
+                        r_k[_exclude_4N_mask] = 0.0
                     r_k_norm = r_k.abs().max().item()
                     if math.isfinite(r_k_norm) and r_k_norm < _ANDERSON_MAX_NORM:
                         _and_g.append(theta_fp.clone())
@@ -1680,14 +2079,22 @@ def solve_fixed_point_decm(
                             theta_next = theta_fp
                             _and_g.clear()
                             _and_r.clear()
-
-                        # Anderson freeze: restore hub η to bisection values
-                        if _hub_active:
-                            theta_next[_hub_4N_mask] = theta_fp[_hub_4N_mask]
                     else:
                         theta_next = theta_fp
             else:
                 theta_next = theta_fp
+
+            # Hub bisection: applied once here, to the *final*
+            # theta_next for this iteration -- whichever branch produced it
+            # (normal Anderson mix, no-history-yet, isolated-blowup
+            # rollback, or a patience/blowup-escalation perturbed restart).
+            # Solving against theta_next's own opposing values (not a
+            # pre-mixing snapshot) is what makes this self-consistent: the
+            # exact fit is against the values that actually carry forward
+            # into the next iteration, not ones that then drift during
+            # mixing. See _apply_hub_bisection.
+            if _hub_active:
+                theta_next = _apply_hub_bisection(theta_next)
 
             theta = theta_next
 
@@ -1730,6 +2137,7 @@ def solve_fixed_point_decm_degenerate(
     topo_weig: bool = False,
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
+    z_clamp: float = 1e-8,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
     blowup_factor: float | None = None,
@@ -1751,11 +2159,13 @@ def solve_fixed_point_decm_degenerate(
     expanded back to the original per-node shape (4N,) so it is a drop-in
     replacement for :func:`solve_fixed_point_decm` at the call site.
 
-    ``hub_sk_threshold`` IS supported: hub identification and the exact 1D
-    bisection both operate at group granularity, with the bisection's
-    strength sum weighted by group multiplicity (see
-    :func:`_bisect_hub_eta_decm`'s ``mult`` parameter). Does not (yet)
-    support ``backtracking_gamma`` (unavailable in this reduced path -- see
+    ``hub_sk_threshold`` IS supported: hub identification and its exact 1D
+    bisection operate at group granularity, with the bisection sum weighted
+    by group multiplicity (see :func:`_bisect_hub_eta_decm`'s ``mult``
+    parameter). A group's degree/strength is shared by every member node
+    by construction, so hub membership at group granularity is exactly
+    equivalent to per-node membership. Does not (yet) support
+    ``backtracking_gamma`` (unavailable in this reduced path -- see
     :func:`solve_fixed_point_decm`'s ``mult`` parameter docs) or
     ``backend="numba"``.
 
@@ -1766,6 +2176,10 @@ def solve_fixed_point_decm_degenerate(
             guess); if not, one representative member's value is used for
             the whole group.
         k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        z_clamp: Forwarded to :func:`solve_fixed_point_decm` unchanged
+            (operates at group/M granularity here, since the reduced eta
+            values are already one entry per degeneracy group). See its
+            docstring for the full explanation.
         (all other args): see :func:`solve_fixed_point_decm`.
         init_best_theta: Optional externally-supplied record theta, same
             expanded per-node shape (4N,) as ``theta0``/``best_theta``
@@ -1871,6 +2285,7 @@ def solve_fixed_point_decm_degenerate(
         mult=mult,
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
+        z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,
         blowup_factor=blowup_factor,

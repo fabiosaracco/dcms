@@ -61,6 +61,12 @@ _Z_G_CLAMP: float = 1e-8
 _Z_NEWTON_FLOOR: float = _Z_G_CLAMP
 _Z_NEWTON_FRAC: float = 0.5
 
+# Max relative growth of G(z) per call allowed for a hub node using the
+# negative-eta relaxation (decm-negative-eta-gauge / decm-damped-negative-eta
+# branches) -- see _damp_hub_step. Only ever active for a node already
+# flagged unreachable under the old eta>=0-only rule.
+_G_DAMP_FRAC: float = 0.05
+
 _THETA_MAX: float = 50.0
 _ANDERSON_THETA_FLOOR: float = 0.1
 
@@ -1057,16 +1063,32 @@ def _bisect_hub_eta_decm_batch(
     s_target_all: "np.ndarray",
     n_bisect: int = 60,
     mult: "np.ndarray | None" = None,
+    negative_eta_scope: str = "unreachable_only",
 ) -> "np.ndarray":
     """Vectorized batch version of :func:`_bisect_hub_eta_decm`: solves η for
     every node in ``hub_indices`` simultaneously (each bisection step is one
     ``(k, N)`` vectorized array op instead of ``k`` separate per-node Python
     calls), against the *same* snapshot of ``theta_other``/``eta_other``.
 
-    Same equation, same monotonicity, same bracket as the per-node version;
-    see its docstring for the derivation. Only the "unreachable" edge case
-    at the low end (``f(eta_lo) <= 0``) is checked, matching the per-node
-    version -- ``f(eta_hi) < 0`` always holds for a positive ``s_target``.
+    Same equation, same monotonicity as the per-node version; see its
+    docstring for the derivation. Only the "unreachable" edge case at the
+    low end (``f(eta_lo) <= 0``) is checked, matching the per-node version
+    -- ``f(eta_hi) < 0`` always holds for a positive ``s_target``.
+
+    ``eta_lo`` is NOT pinned at ``_ETA_MIN`` (>=0): the model's actual
+    requirement is z_ij = eta_val + eta_other_j > 0 for every partner j,
+    not eta_val >= 0 in isolation -- eta is a Lagrange multiplier for an
+    *equality* constraint, so nothing in the MaxEnt derivation requires its
+    sign. eta_val >= 0 was only ever a sufficient (not necessary) way to
+    guarantee every pairwise z > 0 without checking per-pair. The true
+    per-node floor is the eta_val where z first touches the numerical
+    floor for the SINGLE tightest partner (min eta_other): more negative
+    than that and MORE than one pairwise z would clamp simultaneously,
+    which is a qualitatively different (undesirable) regime. See branch
+    decm-negative-eta-gauge. This is a strict relaxation: for any node
+    whose old positive-only search already found an interior root, the
+    root is unchanged (monotonic f, wider bracket, same crossing) -- only
+    genuinely eta>=0-unreachable nodes behave differently.
 
     Args:
         hub_indices:    Indices (into the full length-N arrays) of the hub
@@ -1081,6 +1103,13 @@ def _bisect_hub_eta_decm_batch(
         n_bisect:       Number of bisection steps.
         mult:           Optional group multiplicities, length N (see
                          :func:`_bisect_hub_eta_decm`).
+        negative_eta_scope: ``"unreachable_only"`` (default, conservative):
+                         only nodes whose OLD eta>=0-only equation is
+                         already unreachable get the negative bracket,
+                         everything else is byte-identical to before.
+                         ``"all"``: every hub node in this batch gets the
+                         negative bracket (broader, empirically noisier --
+                         see decm-negative-eta-gauge branch notes).
 
     Returns:
         Array of shape ``(k,)``: η* for each node in ``hub_indices``, in the
@@ -1111,7 +1140,36 @@ def _bisect_hub_eta_decm_batch(
             total = W.sum(axis=1)
         return total - s_target
 
-    eta_lo = _np.full(k, _ETA_MIN)
+    # Per-hub-node min(eta_other) EXCLUDING the node's own position -- a hub
+    # node's own eta_other[idx] (its "self" entry on the opposing side) is
+    # itself near the floor for exactly these pathological nodes, so a
+    # naive global min would wrongly use the node's own value and barely
+    # move the bracket. Use the smallest-excluding-self via 2nd-smallest
+    # fallback (O(N log N) once, not O(k*N)).
+    _order = _np.argsort(eta_other)
+    _min1_pos, _min1_val = _order[0], eta_other[_order[0]]
+    _min2_val = eta_other[_order[1]] if eta_other.shape[0] > 1 else _min1_val
+    _min_other_excl_self = _np.where(idx == _min1_pos, _min2_val, _min1_val)
+    eta_lo_negative = _np.maximum(_Z_G_CLAMP - _min_other_excl_self, -_ETA_MAX)
+
+    if negative_eta_scope == "all":
+        eta_lo_init = eta_lo_negative
+    elif negative_eta_scope == "unreachable_only":
+        # Auto-scoped (the conservative default): only nodes that the OLD
+        # eta>=0-only bracket would already flag unreachable get the
+        # negative floor; every other hub node's bracket -- and therefore
+        # its bisection result -- is byte-identical to the pre-relaxation
+        # behaviour. On q4/e1 this selects exactly the single pathological
+        # node out of 21-582 hub-flagged nodes per side (verified
+        # empirically 2026-09-01: every other hub node has >1800x slack,
+        # there is no natural intermediate tier to size a threshold on).
+        eta_lo_old = _np.full(k, _ETA_MIN)
+        unreachable_old = _f(eta_lo_old) <= 0.0
+        eta_lo_init = _np.where(unreachable_old, eta_lo_negative, eta_lo_old)
+    else:
+        raise ValueError(f"unknown negative_eta_scope: {negative_eta_scope!r}")
+
+    eta_lo = eta_lo_init.copy()
     eta_hi = _np.full(k, _ETA_MAX)
     unreachable = _f(eta_lo) <= 0.0
 
@@ -1122,7 +1180,7 @@ def _bisect_hub_eta_decm_batch(
         eta_hi = _np.where(go_lo, eta_hi, eta_mid)
 
     result = 0.5 * (eta_lo + eta_hi)
-    return _np.where(unreachable, _ETA_MIN, result)
+    return _np.where(unreachable, eta_lo_init, result)
 
 
 # -------------------------------------------------------------------------
@@ -1710,6 +1768,54 @@ def solve_fixed_point_decm(
         _hub_in_indices = []
         _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
 
+    def _damp_hub_step(
+        cur_eta: "np.ndarray",
+        target_eta: "np.ndarray",
+        eta_other: "np.ndarray",
+        idx: "np.ndarray",
+    ) -> "np.ndarray":
+        """Limit a bisected hub-eta update that dips below the old eta>=0
+        floor (i.e. one now using the negative-eta relaxation).
+
+        v1 of this damping (kept in decm-negative-eta-gauge history) capped
+        the per-call SHRINKAGE OF z_min at 50% (reusing _Z_NEWTON_FRAC) --
+        empirically that had ZERO effect (the real jump only needed ~35% of
+        z_min) and the network destabilized identically to no damping at
+        all. Root cause: G(z) = 1/(1-e^-z) ~ 1/z near small z, so its
+        *relative* sensitivity to a z change is what actually perturbs a
+        neighbouring node's ordinary (undamped) Newton step -- a 35% drop
+        in z_min already produces a ~54% jump in G, i.e. the neighbour's
+        expected weight from this hub jumps by more than half in one call.
+        v2 (this one) directly bounds the relative growth of G at the
+        single tightest partner to _G_DAMP_FRAC per call, converting that
+        back to an eta floor via G's exact inverse -- not a z-space proxy.
+        Targets that stay at or above the old floor (the overwhelming
+        majority of hub nodes) are completely untouched, so this cannot
+        change behaviour on any network that has no unreachable node under
+        the old eta>=0-only rule (see decm_project_convergence_bar memory:
+        already-converging networks must not regress).
+        """
+        import numpy as _np
+
+        needs_damp = target_eta < _ETA_MIN
+        if not needs_damp.any():
+            return target_eta
+        _order = _np.argsort(eta_other)
+        _min1_pos, _min1_val = _order[0], eta_other[_order[0]]
+        _min2_val = eta_other[_order[1]] if eta_other.shape[0] > 1 else _min1_val
+        _min_other_excl_self = _np.where(idx == _min1_pos, _min2_val, _min1_val)
+
+        z_min_cur = _np.maximum(cur_eta + _min_other_excl_self, _Z_G_CLAMP)
+        G_cur = -1.0 / _np.expm1(-z_min_cur)
+        G_max_allowed = G_cur * (1.0 + _G_DAMP_FRAC)
+        # Inverse of G(z) = 1/(1-e^-z):  z = -log(1 - 1/G), valid for G>1
+        # (always true here since G_cur >= 1/z_min_cur and z_min_cur is
+        # small). G_max_allowed > G_cur > 1 always holds by construction.
+        z_floor_allowed = -_np.log1p(-1.0 / G_max_allowed)
+        eta_floor_allowed = z_floor_allowed - _min_other_excl_self
+
+        return _np.where(needs_damp, _np.maximum(target_eta, eta_floor_allowed), target_eta)
+
     def _apply_hub_bisection(theta_fp: torch.Tensor) -> torch.Tensor:
         """Exact 1D-bisection correction of hub eta components, vectorized
         across all hub nodes at once (see :func:`_bisect_hub_eta_decm_batch`).
@@ -1717,13 +1823,17 @@ def solve_fixed_point_decm(
         Anderson mixing, restarts, or rollback have all already settled on
         it -- see the single call site near the end of the main loop) so
         the bisection is always against the opposing values that actually
-        carry forward, not a pre-mixing snapshot that then drifts."""
+        carry forward, not a pre-mixing snapshot that then drifts.
+
+        Targets below the old eta>=0 floor (the negative-eta relaxation,
+        see _bisect_hub_eta_decm_batch) are damped via _damp_hub_step
+        instead of applied instantly -- see its docstring."""
         if not (_hub_active and (_hub_out_indices or _hub_in_indices)):
             return theta_fp
         _th_fp_np = theta_fp.numpy()
         for _sweep in range(3):
             if _hub_out_indices:
-                _new_eta_out = _bisect_hub_eta_decm_batch(
+                _target_eta_out = _bisect_hub_eta_decm_batch(
                     hub_indices=_hub_out_indices,
                     theta_self_all=_th_fp_np[:N],
                     theta_other=_th_fp_np[N:2 * N],
@@ -1731,15 +1841,23 @@ def solve_fixed_point_decm(
                     s_target_all=_s_out_np,
                     mult=_mult_np,
                 )
+                _cur_eta_out = _th_fp_np[2 * N + _hub_out_idx_arr]
+                _new_eta_out = _damp_hub_step(
+                    _cur_eta_out, _target_eta_out, _th_fp_np[3 * N:], _hub_out_idx_arr
+                )
                 _th_fp_np[2 * N + _hub_out_idx_arr] = _new_eta_out
             if _hub_in_indices:
-                _new_eta_in = _bisect_hub_eta_decm_batch(
+                _target_eta_in = _bisect_hub_eta_decm_batch(
                     hub_indices=_hub_in_indices,
                     theta_self_all=_th_fp_np[N:2 * N],
                     theta_other=_th_fp_np[:N],
                     eta_other=_th_fp_np[2 * N:3 * N],
                     s_target_all=_s_in_np,
                     mult=_mult_np,
+                )
+                _cur_eta_in = _th_fp_np[3 * N + _hub_in_idx_arr]
+                _new_eta_in = _damp_hub_step(
+                    _cur_eta_in, _target_eta_in, _th_fp_np[2 * N:3 * N], _hub_in_idx_arr
                 )
                 _th_fp_np[3 * N + _hub_in_idx_arr] = _new_eta_in
         return torch.from_numpy(_th_fp_np)

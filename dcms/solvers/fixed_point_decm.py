@@ -1768,6 +1768,46 @@ def solve_fixed_point_decm(
         _hub_in_indices = []
         _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
 
+    # η-only view of the hub mask (2N-length, matches theta[2*N:]) -- used
+    # to exempt hub-relaxed components (negative-eta relaxation, see
+    # _bisect_hub_eta_decm_batch) from the post-Anderson-mixing η≥_ETA_MIN
+    # floors below. Those floors predate the relaxation and are a safety
+    # net for the rest of the network; for hub components they must not
+    # run, since _apply_hub_bisection (called right after, unconditionally
+    # for every hub node) is what actually establishes the correct η --
+    # flooring here first would silently discard whatever negative-eta
+    # progress the previous iteration's damped bisection made, forcing it
+    # to re-climb from _ETA_MIN every single iteration (see
+    # decm_hub_eta_floor_reset_bug memory for the empirical trace that
+    # found this).
+    _hub_eta_mask = _hub_4N_mask[2 * N :]
+
+    if _hub_active and (_hub_out_indices or _hub_in_indices):
+        # The raw per-node Newton step (whichever _decm_step_* variant is
+        # bound above -- dense/chunked/weighted, all share the same
+        # `eta_*_new = (...).clamp(_ETA_MIN, _ETA_MAX)` pattern) floors
+        # EVERY node's η to _ETA_MIN internally, predating the negative-eta
+        # relaxation. For hub-flagged nodes that floor silently overwrites
+        # whatever negative η the previous iteration's damped bisection
+        # established, forcing _apply_hub_bisection to re-climb from
+        # _ETA_MIN every single iteration regardless of the Anderson-mixing
+        # exemption above (verified empirically: cur_eta reset to exactly
+        # 1e-10 every iteration even with that exemption in place -- see
+        # decm_hub_eta_floor_reset_bug memory). Hub-flagged η components are
+        # exclusively owned by _apply_hub_bisection; wrap _step so the raw
+        # map never touches them -- pass the input's own value straight
+        # through instead of whatever the generic Newton/floor logic
+        # proposes.
+        _step_raw = _step
+
+        def _step(th, _step_raw=_step_raw):
+            theta_new, F_current = _step_raw(th)
+            theta_new = torch.cat([
+                theta_new[: 2 * N],
+                torch.where(_hub_eta_mask, th[2 * N :], theta_new[2 * N :]),
+            ])
+            return theta_new, F_current
+
     def _damp_hub_step(
         cur_eta: "np.ndarray",
         target_eta: "np.ndarray",
@@ -2178,15 +2218,27 @@ def solve_fixed_point_decm(
                     if len(_and_g) >= 2:
                         theta_next = _anderson_mixing(_and_g, _and_r, weights=_anderson_weights)
 
-                        # Enforce η ≥ _ETA_MIN after mixing
-                        theta_next[2 * N :] = theta_next[2 * N :].clamp(min=_ETA_MIN)
+                        # Enforce η ≥ _ETA_MIN after mixing -- hub-relaxed
+                        # components exempted, see _hub_eta_mask above.
+                        _eta_slice = theta_next[2 * N :]
+                        _eta_floored = torch.where(
+                            _hub_eta_mask, _eta_slice, _eta_slice.clamp(min=_ETA_MIN)
+                        )
+                        theta_next[2 * N :] = _eta_floored
                         theta_next = theta_next.clamp(-_THETA_MAX, _THETA_MAX)
-                        # Restore η part clamp
-                        theta_next[2 * N :] = theta_next[2 * N :].clamp(min=_ETA_MIN, max=_ETA_MAX)
+                        # Restore η part clamp (same hub exemption)
+                        _eta_slice = theta_next[2 * N :]
+                        theta_next[2 * N :] = torch.where(
+                            _hub_eta_mask, _eta_slice, _eta_slice.clamp(min=_ETA_MIN, max=_ETA_MAX)
+                        )
 
-                        # Geometric floor on η: don't go below fraction of theta_fp's η
+                        # Geometric floor on η: don't go below fraction of
+                        # theta_fp's η (same hub exemption)
                         eta_floor_mix = (theta_fp[2 * N :] * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
-                        theta_next_eta = torch.maximum(theta_next[2 * N :], eta_floor_mix)
+                        _eta_slice = theta_next[2 * N :]
+                        theta_next_eta = torch.where(
+                            _hub_eta_mask, _eta_slice, torch.maximum(_eta_slice, eta_floor_mix)
+                        )
                         theta_next = torch.cat([theta_next[:2 * N], theta_next_eta])
 
                         # Feasibility guard: if min(η_out) + min(η_in) < floor → reject mix

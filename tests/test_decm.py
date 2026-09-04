@@ -605,6 +605,43 @@ class TestDECMBisectionCoordinate:
         assert len(result.residuals) == result.iterations
         assert result.best_mre is not None
 
+    def test_patience_noisy_restart_still_converges(self) -> None:
+        """Forcing the patience/noisy-restart mechanism to fire repeatedly
+        (small patience) on an ordinary synthetic network must not corrupt
+        correctness -- regression test for
+        decm_bisection_degenerate_benchmark memory: a BARE (noiseless)
+        reset-to-best_theta was found to reproduce the exact same failing
+        trajectory forever on a real stuck network (this solver's dynamics
+        are fully deterministic, so a noiseless retry explores nothing
+        new) -- only escalating multiplicative-noise perturbation
+        (mirroring solve_fixed_point_decm's _perturbed_restart) actually
+        unsticks it. patience=20 here fires the restart 5 times over the
+        course of an otherwise-ordinary convergent run."""
+        model, _ = make_decm_model(N=6, seed=0)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-9, max_iter=5000, n_bisect=60, anderson_depth=10,
+            patience=20, seed=0,
+        )
+        assert result.converged, result.message
+        mre = model.max_relative_error(result.best_theta)
+        assert mre < CONV_TOL, f"mre={mre:.3e}"
+
+    def test_patience_disabled_by_nonpositive_value(self) -> None:
+        """patience<=0 must reproduce the pre-patience plain fixed-point
+        behaviour exactly (no restart machinery engaged)."""
+        model, _ = make_decm_model(N=4, seed=0)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-9, max_iter=3000, n_bisect=60, anderson_depth=10,
+            patience=0,
+        )
+        assert result.converged, result.message
+        mre = model.max_relative_error(result.best_theta)
+        assert mre < CONV_TOL, f"mre={mre:.3e}"
+
 
 # ---------------------------------------------------------------------------
 # TestDECMBisectionDegenerate

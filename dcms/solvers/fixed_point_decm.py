@@ -2864,6 +2864,12 @@ def solve_fixed_point_decm_bisection(
     anderson_depth: int = 10,
     mult: "ArrayLike | None" = None,  # type: ignore[name-defined]
     weight_anderson: bool = True,
+    patience: int = 300,
+    noise_base: float = 1e-4,
+    noise_cap_mult: float = 16.0,
+    noise_growth: float = 2.0,
+    max_stalls: int = 5,
+    seed: int | None = None,
     verbose: bool = False,
     monitor: bool = False,
 ) -> SolverResult:
@@ -2931,6 +2937,63 @@ def solve_fixed_point_decm_bisection(
                   :func:`_anderson_mixing`'s ``weights`` docs) so a group of
                   many identical nodes isn't underweighted relative to a
                   singleton group. Ignored when ``mult`` is None.
+        patience: Stagnation-recovery trigger, in iterations. If ``best_res``
+                  has not improved for ``patience`` consecutive iterations,
+                  restart from a perturbed copy of ``best_theta`` (see
+                  ``noise_base``) and clear the Anderson history.
+                  ``patience <= 0`` disables this (plain fixed-point
+                  behaviour). Needed because the raw (un-mixed) Gauss-Seidel
+                  bisection sweep is provably well-behaved on its own
+                  (verified empirically: a control run with
+                  ``anderson_depth=0`` on a real stuck network converged
+                  smoothly and monotonically, never oscillating) but
+                  Anderson mixing can still drive the iterate into a
+                  self-reinforcing worse quasi-fixed-point near a good
+                  solution -- observed as ~10x-magnitude oscillations
+                  between consecutive iterations that stay under the
+                  ``_ANDERSON_BLOWUP_FACTOR`` (50x) blowup guard (which is
+                  calibrated for catastrophic ~1e10-scale divergence, not
+                  these smaller but still-destructive swings) yet still
+                  permanently derail the run away from a point it had
+                  briefly, exactly reached.
+
+                  IMPORTANT: a bare (noiseless) reset to ``best_theta`` with
+                  cleared Anderson history does NOT work here, unlike what
+                  this solver's determinism might suggest should be
+                  harmless to retry -- verified empirically (real stuck
+                  network) to reproduce the EXACT SAME failing trajectory
+                  on every single restart (16 consecutive resets, all
+                  reporting the identical best_res, a perfect infinite
+                  loop), because every input to the iteration (theta,
+                  cleared history) is byte-identical across restarts and
+                  nothing in the bisection+Anderson map is stochastic.
+                  Noise injection (mirroring
+                  :func:`solve_fixed_point_decm`'s ``_perturbed_restart``
+                  mechanism, see its docstring/comments) is therefore not
+                  optional polish here -- it is required for this recovery
+                  path to do anything at all.
+                  Default 300 (looser than the Newton solver's default 750:
+                  this solver's oscillations were observed to develop and
+                  settle within ~70 iterations on a real stuck network, see
+                  decm_bisection_degenerate_benchmark memory).
+        noise_base: Scale of the multiplicative (log-scale) Gaussian
+                  perturbation applied to ``best_theta`` on each
+                  patience-triggered restart: ``theta_i *= exp(N(0,
+                  noise_base))``, identical formula and rationale to
+                  :func:`solve_fixed_point_decm`'s ``noise_base`` (see its
+                  docstring for why multiplicative/relative noise is used
+                  instead of fixed-scale additive noise -- boundary nodes
+                  near ``_THETA_MAX``/``_ETA_MIN`` need proportionally
+                  different kicks than interior ones).
+        noise_cap_mult: Each consecutive restart that fails to beat the
+                  record grows the noise scale by ``noise_growth``, capped
+                  at ``noise_base * noise_cap_mult`` -- see
+                  :func:`solve_fixed_point_decm`'s docstring.
+        noise_growth: Per-restart multiplicative growth rate of the noise
+                  scale (see ``noise_cap_mult``).
+        max_stalls: Give up (``converged=False``) after this many restarts
+                  at the noise cap without a record improvement.
+        seed:     RNG seed for the perturbed-restart noise (reproducibility).
         verbose:  Print progress every iteration.
         monitor:  Overwrite the same terminal line each iteration.
 
@@ -2974,6 +3037,39 @@ def solve_fixed_point_decm_bisection(
         if (mult_t is not None and weight_anderson) else None
     )
 
+    import numpy as _np
+    _restart_rng = _np.random.default_rng(seed)
+    _restarts = 0
+    _stalls_at_cap = 0
+
+    def _perturbed_restart(best_theta_vec: torch.Tensor, best_theta_res: float) -> tuple[torch.Tensor, bool]:
+        """Noisy restart around best_theta -- see `patience` docstring for
+        why a bare (noiseless) reset does not work here (this solver's
+        dynamics are fully deterministic, so a noiseless reset just
+        replays the identical failing trajectory). Mirrors
+        :func:`solve_fixed_point_decm`'s `_perturbed_restart`."""
+        nonlocal _restarts, _stalls_at_cap
+        _restarts += 1
+        noise_mult = min(noise_growth ** (_restarts - 1), noise_cap_mult)
+        give_up = False
+        if noise_mult >= noise_cap_mult:
+            _stalls_at_cap += 1
+            give_up = _stalls_at_cap >= max_stalls
+        noise_scale = noise_base * noise_mult
+        noise = torch.from_numpy(
+            _restart_rng.normal(scale=noise_scale, size=tuple(best_theta_vec.shape))
+        )
+        theta_restart = best_theta_vec * torch.exp(noise)
+        theta_restart[: 2 * N] = theta_restart[: 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
+        theta_restart[2 * N :] = theta_restart[2 * N :].clamp(_ETA_MIN, _ETA_MAX)
+        if verbose:
+            print(
+                f"[perturbed-restart] restart #{_restarts} (noise_scale={noise_scale:.1e}) "
+                f"around best={best_theta_res:.3e}.",
+                flush=True,
+            )
+        return theta_restart, give_up
+
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
     t0 = time.perf_counter()
@@ -2989,6 +3085,7 @@ def solve_fixed_point_decm_bisection(
 
     _and_g: list[torch.Tensor] = []
     _and_r: list[torch.Tensor] = []
+    _iters_since_improve = 0
 
     try:
         for _ in range(max_iter):
@@ -3112,11 +3209,30 @@ def solve_fixed_point_decm_bisection(
             if res_norm < best_res:
                 best_res = res_norm
                 best_theta = theta_next.clone()
+                _iters_since_improve = 0
+                _restarts = 0
+                _stalls_at_cap = 0
+            else:
+                _iters_since_improve += 1
 
             if res_norm < tol:
                 converged = True
                 message = f"Converged in {n_iter} iteration(s)."
                 break
+
+            if patience > 0 and _iters_since_improve >= patience:
+                theta_next, _give_up = _perturbed_restart(best_theta, best_res)
+                _and_g.clear()
+                _and_r.clear()
+                _iters_since_improve = 0
+                if _give_up:
+                    message = (
+                        f"Stagnation recovery exhausted: {max_stalls} restarts at "
+                        f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
+                        f"improving on best_res={best_res:.3e}."
+                    )
+                    theta = theta_next
+                    break
 
             theta = theta_next
     finally:
@@ -3149,6 +3265,12 @@ def solve_fixed_point_decm_bisection_degenerate(
     n_bisect: int = 60,
     anderson_depth: int = 10,
     weight_anderson: bool = True,
+    patience: int = 300,
+    noise_base: float = 1e-4,
+    noise_cap_mult: float = 16.0,
+    noise_growth: float = 2.0,
+    max_stalls: int = 5,
+    seed: int | None = None,
     verbose: bool = False,
     monitor: bool = False,
 ) -> SolverResult:
@@ -3226,6 +3348,12 @@ def solve_fixed_point_decm_bisection_degenerate(
         anderson_depth=anderson_depth,
         mult=mult,
         weight_anderson=weight_anderson,
+        patience=patience,
+        noise_base=noise_base,
+        noise_cap_mult=noise_cap_mult,
+        noise_growth=noise_growth,
+        max_stalls=max_stalls,
+        seed=seed,
         verbose=verbose,
         monitor=monitor,
     )

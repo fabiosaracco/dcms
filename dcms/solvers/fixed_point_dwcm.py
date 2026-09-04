@@ -719,8 +719,24 @@ def solve_fixed_point_dwcm(
             # The firing flag drives a post-Anderson override (see below) that
             # replaces theta_next unconditionally, so blowup recovery cannot
             # silently discard the Newton correction.
+            #
+            # Originally gated to `variant != "theta-newton"` only, on the
+            # assumption (stated in the module docstring) that theta-newton
+            # is immune to this kind of stagnation. Empirically false for the
+            # degeneracy-reduced (`mult`) path: solve_fixed_point_dwcm_degenerate
+            # always calls with variant="theta-newton" (enforced above), which
+            # made this escape hatch structurally unreachable for that path --
+            # confirmed on 4 real networks (crisi_dico3/4, ita_elections_dico1,
+            # quirinale_dico1) stuck in an exact repeating cycle (crisi_dico3:
+            # period 6, bit-identical every cycle) for the full run, correctly
+            # detected by the stagnation check above but never escaped. `mult
+            # is not None` always implies variant=="theta-newton" (validated at
+            # entry), so this condition specifically re-enables the escape for
+            # that case without touching the plain (non-degenerate) theta-newton
+            # path, which has no evidence of needing it. See
+            # decm_dwcm_degenerate_stagnation_bug memory.
             _fpgs_newton_fired = False
-            if variant != "theta-newton" and anderson_depth > 1:
+            if (variant != "theta-newton" or mult is not None) and anderson_depth > 1:
                 if res_norm < _fpgs_best_local * 0.99:
                     _fpgs_best_local = res_norm
                     _fpgs_stagnation_count = 0
@@ -820,7 +836,15 @@ def solve_fixed_point_dwcm(
                 _nt_and_g: list[torch.Tensor] = []
                 _nt_and_r: list[torch.Tensor] = []
                 for _ in range(_FPGS_NEWTON_STEPS):
-                    if _use_numba:
+                    if mult is not None:
+                        # Degeneracy-reduced path: use the mult-weighted step
+                        # (same one the main loop uses), never the plain
+                        # per-group formula -- that would silently drop each
+                        # group's multiplicity and solve the wrong equations.
+                        theta_nt_fp, F_nt = _dwcm_step_dense_weighted(
+                            theta_nt, s_out, s_in, max_step, mult, eta_lo=_ETA_MIN
+                        )
+                    elif _use_numba:
                         to = theta_nt[:N].numpy()
                         ti = theta_nt[N:].numpy()
                         to_new, ti_new, fo, fi = _dwcm_theta_newton_numba(
@@ -858,7 +882,9 @@ def solve_fixed_point_dwcm(
                         _nt_and_g.pop(0)
                         _nt_and_r.pop(0)
                     if len(_nt_and_g) >= 2:
-                        theta_nt_next = _anderson_mixing(_nt_and_g, _nt_and_r)
+                        theta_nt_next = _anderson_mixing(
+                            _nt_and_g, _nt_and_r, weights=_anderson_weights
+                        )
                         eff_floor = torch.minimum(
                             _nt_floor, theta_nt_fp
                         )

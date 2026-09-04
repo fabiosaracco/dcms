@@ -607,7 +607,7 @@ class DECMModel:
         reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
         patience: int = 750,
-        noise_base: float = 1e-2,
+        noise_base: float = 1e-4,
         noise_cap_mult: float = 16.0,
         noise_growth: float = 2.0,
         max_stalls: int = 5,
@@ -739,7 +739,10 @@ class DECMModel:
                            theta is scaled as ``x_i *= exp(N(0, noise_base))``.
                            See :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`
                            for why this is multiplicative rather than
-                           additive. Default 1e-2.
+                           additive. Default 1e-4 (lowered from 1e-2,
+                           2026-09-04 -- see
+                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`
+                           for the empirical basis).
             noise_cap_mult: Noise scale grows by ``noise_growth`` on each
                            consecutive restart that fails to improve the
                            record, capped at ``noise_base * noise_cap_mult``;

@@ -1215,7 +1215,7 @@ def solve_fixed_point_decm(
     init_best_res: float = float("inf"),
     blowup_factor: float | None = None,
     patience: int = 750,
-    noise_base: float = 1e-2,
+    noise_base: float = 1e-4,
     noise_cap_mult: float = 16.0,
     noise_growth: float = 2.0,
     max_stalls: int = 5,
@@ -1402,7 +1402,14 @@ def solve_fixed_point_decm(
                         observed on crisi_dico2/ita_election_dico3
                         (2026-07-24): MRE_weights jumping to ~1e5 on the very
                         first post-restart step under additive noise.
-                        Default 1e-2.
+                        Default 1e-4 (lowered from the original 1e-2 --
+                        2026-09-04: on crisi_dico1, already sitting at its
+                        genuine best_theta, 1e-2 wasted 69-148x-of-best
+                        recovery excursions per restart with no restart
+                        ever finding anything better; 1e-4 recovers to
+                        ~4-10x-of-best in the same 5-iteration window,
+                        same outcome otherwise -- see
+                        decm_patience_restart_instability memory).
         noise_cap_mult: Each consecutive restart that fails to improve the
                         record grows the noise scale by ``noise_growth``
                         (``noise_base * min(noise_growth**(restarts-1),
@@ -2312,7 +2319,7 @@ def solve_fixed_point_decm_degenerate(
     init_best_res: float = float("inf"),
     blowup_factor: float | None = None,
     patience: int = 750,
-    noise_base: float = 1e-2,
+    noise_base: float = 1e-4,
     noise_cap_mult: float = 16.0,
     noise_growth: float = 2.0,
     max_stalls: int = 5,

@@ -2494,3 +2494,419 @@ def solve_fixed_point_decm_degenerate(
         message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
         best_mre=result_g.best_mre,
     )
+
+
+# -------------------------------------------------------------------------
+# Coordinate/bisection solver (wbnm-style): exact 1D bisection for every
+# node on every one of the 4 parameter groups, every iteration -- an
+# alternative to the coordinate-Newton method used throughout this module.
+# See decm_wbnm_solver_comparison memory: wbnm's own "coordinate" method
+# does the analogous thing (exact bisection for literally every node, not
+# just hub/leaf-flagged subsets) and doesn't hit the low-degree-node
+# relative-error floor DECM's Newton+Anderson approach does (see
+# decm_low_degree_precision_floor memory: k=1, k=0, k=3-6 nodes dominate
+# the residual on q4/c1/e0). This is a first, deliberately simple
+# implementation (dense only, no chunking, no degeneracy reduction, no
+# Anderson mixing) meant to validate correctness on small synthetic
+# networks before attempting to scale it to real large-N instances.
+# -------------------------------------------------------------------------
+
+def _bisect_theta_out_decm_all(
+    theta_in: torch.Tensor,
+    eta_out: torch.Tensor,
+    eta_in: torch.Tensor,
+    k_out_target: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Exact bisection for θ_out_i, for every node i simultaneously, holding
+    θ_in/η_out/η_in fixed.
+
+    F_i(θ_out_i) = Σ_{j≠i} sigmoid(-θ_out_i - θ_in_j + log_q_ij) - k_out_i,
+    with log_q_ij computed from the FIXED z_ij = η_out_i + η_in_j. Strictly
+    decreasing in θ_out_i (sigmoid decreasing in its argument), so a plain
+    bisection on [-_THETA_MAX, _THETA_MAX] is exact and needs no line
+    search or damping.
+    """
+    N = theta_in.shape[0]
+    eta = eta_out[:, None] + eta_in[None, :]
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    log_q = -torch.log(torch.expm1(eta_safe))
+
+    def f(theta_out_cand: torch.Tensor) -> torch.Tensor:
+        logit_p = -theta_out_cand[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        P.fill_diagonal_(0.0)
+        return P.sum(1) - k_out_target
+
+    lo = torch.full((N,), -_THETA_MAX, dtype=torch.float64)
+    hi = torch.full((N,), _THETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _bisect_theta_in_decm_all(
+    theta_out: torch.Tensor,
+    eta_out: torch.Tensor,
+    eta_in: torch.Tensor,
+    k_in_target: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Column-sum analogue of :func:`_bisect_theta_out_decm_all` for θ_in."""
+    N = theta_out.shape[0]
+    eta = eta_out[:, None] + eta_in[None, :]
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    log_q = -torch.log(torch.expm1(eta_safe))
+
+    def f(theta_in_cand: torch.Tensor) -> torch.Tensor:
+        logit_p = -theta_out[:, None] - theta_in_cand[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        P.fill_diagonal_(0.0)
+        return P.sum(0) - k_in_target
+
+    lo = torch.full((N,), -_THETA_MAX, dtype=torch.float64)
+    hi = torch.full((N,), _THETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _bisect_eta_out_decm_all(
+    theta_out: torch.Tensor,
+    theta_in: torch.Tensor,
+    eta_in: torch.Tensor,
+    s_out_target: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Exact bisection for η_out_i, for every node i simultaneously, holding
+    θ_out/θ_in/η_in fixed.
+
+    F_i(η_out_i) = Σ_{j≠i} p_ij(η_out_i)·G_ij(η_out_i) - s_out_i. Both p_ij
+    and G_ij are decreasing in z_ij = η_out_i + η_in_j (hence in η_out_i
+    alone), so their product is decreasing too -- bisection on
+    [_ETA_MIN, _ETA_MAX] is exact.
+    """
+    N = theta_out.shape[0]
+
+    def f(eta_out_cand: torch.Tensor) -> torch.Tensor:
+        z = eta_out_cand[:, None] + eta_in[None, :]
+        z_safe = z.clamp(min=_Z_G_CLAMP)
+        G = -1.0 / torch.expm1(-z_safe)
+        log_q = -torch.log(torch.expm1(z_safe))
+        logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        W = P * G
+        W.fill_diagonal_(0.0)
+        return W.sum(1) - s_out_target
+
+    lo = torch.full((N,), _ETA_MIN, dtype=torch.float64)
+    hi = torch.full((N,), _ETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _bisect_eta_in_decm_all(
+    theta_out: torch.Tensor,
+    theta_in: torch.Tensor,
+    eta_out: torch.Tensor,
+    s_in_target: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Column-sum analogue of :func:`_bisect_eta_out_decm_all` for η_in."""
+    N = theta_out.shape[0]
+
+    def f(eta_in_cand: torch.Tensor) -> torch.Tensor:
+        z = eta_out[:, None] + eta_in_cand[None, :]
+        z_safe = z.clamp(min=_Z_G_CLAMP)
+        G = -1.0 / torch.expm1(-z_safe)
+        log_q = -torch.log(torch.expm1(z_safe))
+        logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        W = P * G
+        W.fill_diagonal_(0.0)
+        return W.sum(0) - s_in_target
+
+    lo = torch.full((N,), _ETA_MIN, dtype=torch.float64)
+    hi = torch.full((N,), _ETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _decm_residual_dense(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+) -> torch.Tensor:
+    """4N residual F(θ) = [k_out_hat-k_out | k_in_hat-k_in | s_out_hat-s_out |
+    s_in_hat-s_in], dense N×N. Lightweight standalone version (no Hessian/
+    Newton-step byproducts) for use by the bisection-coordinate solver."""
+    N = k_out.shape[0]
+    theta_out = theta[:N]
+    theta_in = theta[N : 2 * N]
+    eta_out = theta[2 * N : 3 * N]
+    eta_in = theta[3 * N :]
+
+    eta = eta_out[:, None] + eta_in[None, :]
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    G = -1.0 / torch.expm1(-eta_safe)
+    log_q = -torch.log(torch.expm1(eta_safe))
+    logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+    P = torch.sigmoid(logit_p)
+    P.fill_diagonal_(0.0)
+    G.fill_diagonal_(0.0)
+    W = P * G
+
+    k_out_hat = P.sum(1)
+    k_in_hat = P.sum(0)
+    s_out_hat = W.sum(1)
+    s_in_hat = W.sum(0)
+
+    return torch.cat(
+        [k_out_hat - k_out, k_in_hat - k_in, s_out_hat - s_out, s_in_hat - s_in]
+    )
+
+
+def solve_fixed_point_decm_bisection(
+    theta0: "ArrayLike",  # type: ignore[name-defined]
+    k_out: "ArrayLike",  # type: ignore[name-defined]
+    k_in: "ArrayLike",  # type: ignore[name-defined]
+    s_out: "ArrayLike",  # type: ignore[name-defined]
+    s_in: "ArrayLike",  # type: ignore[name-defined]
+    tol: float = 1e-8,
+    max_iter: int = 1000,
+    max_time: float = 0.0,
+    n_bisect: int = 60,
+    anderson_depth: int = 10,
+    verbose: bool = False,
+    monitor: bool = False,
+) -> SolverResult:
+    """DECM solver via exact coordinate bisection -- an alternative to the
+    coordinate-Newton method used by :func:`solve_fixed_point_decm`.
+
+    Every iteration solves all 4 parameter groups EXACTLY (60-step
+    bisection, for literally every node, not just hub/leaf-flagged
+    subsets), in Gauss-Seidel order -- each stage uses the freshest values
+    from the stage before it, mirroring how the Newton solver already
+    sequences out-before-in, extended one level deeper to θ-before-η
+    within each side too::
+
+        θ_out (η_out, θ_in, η_in fixed)
+        -> η_out (θ_out just-updated; θ_in, η_in fixed)
+        -> θ_in (θ_out, η_out just-updated; η_in fixed)
+        -> η_in (θ_out, η_out, θ_in all just-updated)
+
+    See the module-level comment above this function for the motivation
+    (the low-degree-node relative-error floor observed under the ordinary
+    Newton+Anderson approach) and decm_wbnm_solver_comparison memory.
+
+    First implementation: dense-only (no chunking, no degeneracy
+    reduction, no Anderson mixing) -- meant for validating correctness on
+    small synthetic networks before attempting real large-N instances.
+
+    Args:
+        theta0:   Initial [θ_out|θ_in|η_out|η_in], shape (4N,).
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        tol:      Convergence tolerance on MRE = max|F_i|/target_i.
+        max_iter: Maximum number of outer (Gauss-Seidel) iterations.
+        max_time: Wall-clock time limit in seconds (0 = no limit).
+        n_bisect: Bisection steps per node per parameter group per
+                  iteration. 60 (matching this module's own hub-bisection,
+                  and wbnm's coordinate method) resolves to ~2^-60 relative
+                  precision in the search interval -- effectively exact in
+                  float64.
+        anderson_depth: Depth of Anderson acceleration applied to the outer
+                  Gauss-Seidel loop (0 or 1 disables it -- plain fixed-point
+                  iteration). Each outer sweep is already an EXACT solve of
+                  all 4N per-node equations given the other groups' current
+                  values, so unlike the Newton solver's Anderson mixing
+                  (which stabilizes an otherwise-unstable/oscillatory raw
+                  step), here it's pure acceleration of an already-bounded,
+                  self-correcting iteration -- a bad mix can only waste an
+                  iteration, not diverge, since the next sweep re-solves
+                  exactly from wherever θ currently sits. Default 10,
+                  matching the rest of this module.
+        verbose:  Print progress every iteration.
+        monitor:  Overwrite the same terminal line each iteration.
+
+    Returns:
+        :class:`~dcms.solvers.base.SolverResult`.
+    """
+    k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
+    k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
+    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
+    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
+    theta = (
+        theta0 if isinstance(theta0, torch.Tensor) else torch.tensor(theta0, dtype=torch.float64)
+    ).clone().to(dtype=torch.float64)
+
+    N = k_out.shape[0]
+    zero_k_out = k_out == 0
+    zero_k_in = k_in == 0
+    zero_s_out = s_out == 0
+    zero_s_in = s_in == 0
+
+    theta[:N] = theta[:N].clamp(-_THETA_MAX, _THETA_MAX)
+    theta[N : 2 * N] = theta[N : 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
+    theta[2 * N : 3 * N] = theta[2 * N : 3 * N].clamp(_ETA_MIN, _ETA_MAX)
+    theta[3 * N :] = theta[3 * N :].clamp(_ETA_MIN, _ETA_MAX)
+
+    _v_targets = torch.cat([k_out, k_in, s_out, s_in])
+    _v_nonzero = _v_targets > 0
+
+    _peak_ram_monitor = _PeakRAMMonitor()
+    _peak_ram_monitor.__enter__()
+    t0 = time.perf_counter()
+
+    n_iter = 0
+    residuals: list[float] = []
+    converged = False
+    message = "Maximum iterations reached without convergence."
+    best_theta = theta.clone()
+    best_res = float("inf")
+    elapsed = 0.0
+    peak_ram = 0
+
+    _and_g: list[torch.Tensor] = []
+    _and_r: list[torch.Tensor] = []
+
+    try:
+        for _ in range(max_iter):
+            if max_time > 0 and (time.perf_counter() - t0) > max_time:
+                message = f"Time limit ({max_time:.0f}s) reached at iteration {n_iter}."
+                break
+
+            theta_out = theta[:N]
+            theta_in = theta[N : 2 * N]
+            eta_out = theta[2 * N : 3 * N]
+            eta_in = theta[3 * N :]
+
+            theta_out_new = _bisect_theta_out_decm_all(theta_in, eta_out, eta_in, k_out, n_bisect)
+            theta_out_new = torch.where(
+                zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
+            )
+
+            eta_out_new = _bisect_eta_out_decm_all(theta_out_new, theta_in, eta_in, s_out, n_bisect)
+            eta_out_new = torch.where(
+                zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
+            )
+
+            theta_in_new = _bisect_theta_in_decm_all(theta_out_new, eta_out_new, eta_in, k_in, n_bisect)
+            theta_in_new = torch.where(
+                zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
+            )
+
+            eta_in_new = _bisect_eta_in_decm_all(theta_out_new, theta_in_new, eta_out_new, s_in, n_bisect)
+            eta_in_new = torch.where(
+                zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
+            )
+
+            theta_raw = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
+            theta_next = theta_raw
+
+            if anderson_depth > 1:
+                r_k = theta_raw - theta
+                _and_g.append(theta_raw.clone())
+                _and_r.append(r_k.clone())
+                if len(_and_g) > anderson_depth:
+                    _and_g.pop(0)
+                    _and_r.pop(0)
+                if len(_and_g) >= 2:
+                    theta_mixed = _anderson_mixing(_and_g, _and_r)
+                    theta_mixed[:N] = theta_mixed[:N].clamp(-_THETA_MAX, _THETA_MAX)
+                    theta_mixed[N : 2 * N] = theta_mixed[N : 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
+                    theta_mixed[2 * N : 3 * N] = theta_mixed[2 * N : 3 * N].clamp(_ETA_MIN, _ETA_MAX)
+                    theta_mixed[3 * N :] = theta_mixed[3 * N :].clamp(_ETA_MIN, _ETA_MAX)
+
+                    # Blowup guard: unlike the Newton solver, a bad linear
+                    # Anderson extrapolation here genuinely CAN destabilize
+                    # the iteration (verified empirically: MRE spiking to
+                    # 1e10 on some synthetic seeds without this check) --
+                    # the "each sweep re-solves exactly, so a bad mix can
+                    # only waste an iteration" reasoning in this function's
+                    # docstring is incomplete: the mixed θ feeds into the
+                    # NEXT sweep's fixed "other side" values, so an extreme
+                    # mix can push those into a regime where the following
+                    # exact bisection also lands somewhere bad, and a
+                    # contaminated history compounds the effect. theta_raw
+                    # itself is never the source of instability (always
+                    # bounded/exact), so on rejection we fall back to it
+                    # directly rather than needing a full best_theta
+                    # rollback like the Newton solver's blowup recovery.
+                    F_mixed = _decm_residual_dense(theta_mixed, k_out, k_in, s_out, s_in)
+                    res_mixed = (
+                        (F_mixed.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                        if _v_nonzero.any() else 0.0
+                    )
+                    if math.isfinite(res_mixed) and res_mixed <= _ANDERSON_BLOWUP_FACTOR * max(best_res, 1e-30):
+                        theta_next = theta_mixed
+                    else:
+                        _and_g.clear()
+                        _and_r.clear()
+                        theta_next = theta_raw
+
+            F = _decm_residual_dense(theta_next, k_out, k_in, s_out, s_in)
+            res_norm = (
+                (F.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                if _v_nonzero.any() else 0.0
+            )
+
+            if not math.isfinite(res_norm):
+                message = f"NaN/Inf detected at iteration {n_iter}."
+                break
+
+            n_iter += 1
+            residuals.append(res_norm)
+
+            if verbose:
+                _elapsed = time.perf_counter() - t0
+                print(
+                    f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
+                    f"iteration={n_iter:5d}, "
+                    f"elapsed time={int(_elapsed // 3600):4d}:{int((_elapsed % 3600) // 60):02d}:{int(_elapsed % 60):02d}, "
+                    f"MRE={res_norm:.5e}",
+                    end="\r" if monitor else "\n",
+                )
+                sys.stdout.flush()
+
+            if res_norm < best_res:
+                best_res = res_norm
+                best_theta = theta_next.clone()
+
+            if res_norm < tol:
+                converged = True
+                message = f"Converged in {n_iter} iteration(s)."
+                break
+
+            theta = theta_next
+    finally:
+        elapsed = time.perf_counter() - t0
+        _peak_ram_monitor.__exit__(None, None, None)
+        peak_ram = _peak_ram_monitor.peak_bytes
+
+    return SolverResult(
+        theta=theta.detach().numpy(),
+        best_theta=best_theta.detach().numpy(),
+        converged=converged,
+        iterations=n_iter,
+        residuals=residuals,
+        elapsed_time=elapsed,
+        peak_ram_bytes=peak_ram,
+        message=message,
+        best_mre=best_res,
+    )

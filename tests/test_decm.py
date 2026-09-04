@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dcms.models.decm import DECMModel, _ETA_MAX, _ETA_MIN, _THETA_MAX
 from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
+from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_bisection
 
 # ---------------------------------------------------------------------------
 # Tolerance
@@ -456,3 +457,94 @@ class TestDECMSolverConvergence:
         m = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
         conv = m.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10, backtracking_gamma=1.2)
         assert conv
+
+
+# ---------------------------------------------------------------------------
+# TestDECMBisectionCoordinate
+# ---------------------------------------------------------------------------
+
+class TestDECMBisectionCoordinate:
+    """Tests for solve_fixed_point_decm_bisection -- the wbnm-style
+    coordinate/bisection solver (exact bisection for every node on every
+    one of the 4 parameter groups, Gauss-Seidel sequenced), an alternative
+    to the coordinate-Newton method tested above. See
+    decm_wbnm_solver_comparison / decm_low_degree_precision_floor memory
+    for the motivation."""
+
+    @pytest.mark.parametrize("N,seed", [(4, 0), (6, 0), (10, 1), (10, 3)])
+    def test_converges(self, N: int, seed: int) -> None:
+        """Must converge on small systems with a known exact solution.
+
+        Needs a generous max_iter: unlike the Newton solver, this method's
+        outer Gauss-Seidel loop has no acceleration beyond plain Anderson
+        mixing (each sweep itself is exact but the coupling across the 4
+        groups still takes many outer sweeps) -- observed up to ~2200
+        iterations on some seeds during development, all converging
+        cleanly to ~1e-10 given enough budget.
+        """
+        model, _ = make_decm_model(N=N, seed=seed)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-9, max_iter=5000, n_bisect=60, anderson_depth=10,
+        )
+        assert result.converged, f"N={N} seed={seed}: {result.message}"
+        mre = model.max_relative_error(result.best_theta)
+        assert mre < CONV_TOL, f"N={N} seed={seed}: mre={mre:.3e}"
+
+    def test_converges_without_anderson(self) -> None:
+        """Plain fixed-point iteration (no acceleration) must still
+        converge, just in more iterations -- confirms Anderson is a speed
+        optimization here, not a stability requirement (each sweep is
+        already an exact, bounded solve, unlike the Newton solver)."""
+        model, _ = make_decm_model(N=4, seed=0)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-9, max_iter=3000, n_bisect=60, anderson_depth=0,
+        )
+        assert result.converged, result.message
+        mre = model.max_relative_error(result.best_theta)
+        assert mre < CONV_TOL, f"mre={mre:.3e}"
+
+    def test_zero_degree_and_strength_nodes_pinned(self) -> None:
+        """Zero-k_out/k_in/s_out/s_in nodes must be pinned to _THETA_MAX/
+        _ETA_MAX exactly, matching solve_fixed_point_decm's convention."""
+        model, _ = make_decm_model(N=6, seed=7)
+        k_out = model.k_out.clone()
+        k_in = model.k_in.clone()
+        s_out = model.s_out.clone()
+        s_in = model.s_in.clone()
+        k_out[0] = 0.0
+        s_out[0] = 0.0
+        k_in[5] = 0.0
+        s_in[5] = 0.0
+        m = DECMModel(k_out.numpy(), k_in.numpy(), s_out.numpy(), s_in.numpy())
+        theta0 = m.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection(
+            theta0, m.k_out, m.k_in, m.s_out, m.s_in,
+            tol=1e-8, max_iter=500, n_bisect=60, anderson_depth=10,
+        )
+        theta = result.best_theta
+        N = 6
+        assert theta[0] == pytest.approx(_THETA_MAX, abs=1e-9), \
+            f"zero k_out/s_out node θ_out[0] should be _THETA_MAX, got {theta[0]}"
+        assert theta[2 * N] == pytest.approx(_ETA_MAX, abs=1e-9), \
+            f"zero s_out node η_out[0] should be _ETA_MAX, got {theta[2 * N]}"
+        assert theta[N + 5] == pytest.approx(_THETA_MAX, abs=1e-9), \
+            f"zero k_in/s_in node θ_in[5] should be _THETA_MAX, got {theta[N + 5]}"
+        assert theta[3 * N + 5] == pytest.approx(_ETA_MAX, abs=1e-9), \
+            f"zero s_in node η_in[5] should be _ETA_MAX, got {theta[3 * N + 5]}"
+
+    def test_result_fields(self) -> None:
+        """SolverResult attributes should have sensible fields after a run."""
+        model, _ = make_decm_model(N=4, seed=0)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-9, max_iter=20, n_bisect=60, anderson_depth=10,
+        )
+        assert result.elapsed_time > 0
+        assert result.peak_ram_bytes >= 0
+        assert len(result.residuals) == result.iterations
+        assert result.best_mre is not None

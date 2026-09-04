@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dcms.models.decm import DECMModel, _ETA_MAX, _ETA_MIN, _THETA_MAX
 from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_bisection
+from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_bisection_degenerate
 
 # ---------------------------------------------------------------------------
 # Tolerance
@@ -80,6 +81,61 @@ def make_decm_model(N: int = 6, seed: int = 0):
 
     theta_true = np.concatenate([theta_out, theta_in, eta_out, eta_in])
     model = DECMModel(k_out_obs, k_in_obs, s_out_obs, s_in_obs)
+    return model, theta_true
+
+
+def make_decm_model_degenerate(N0: int = 4, r: int = 3, seed: int = 0):
+    """Return a genuinely degeneracy-reducible DECMModel with a known exact
+    solution, by construction rather than coincidence.
+
+    Draws N0 base (theta_out, theta_in, eta_out, eta_in) values as in
+    :func:`make_decm_model`, then builds an N = N0*r network of ``r`` exact
+    physical copies of each base node. The group-level target sequences use
+    the same "weighted sum minus one diagonal term" identity that
+    :func:`_decm_step_dense_weighted`/the weighted bisection helpers rely on
+    (module ``dcms.solvers.fixed_point_decm``) -- i.e. the base theta values
+    are constructed to already be the *exact* fixed point of the reduced
+    (group-level) system, not merely a plausible target. This makes
+    ``model.max_relative_error`` against the tiled ``theta_true`` a genuine
+    correctness check, not just a convergence check.
+
+    Args:
+        N0:   Number of distinct degeneracy groups (base nodes).
+        r:    Physical copies per group (group multiplicity).
+        seed: RNG seed.
+
+    Returns:
+        ``(model, theta_true)`` where ``model.N == N0 * r`` and
+        ``theta_true`` is a numpy array of shape (4*N0*r,).
+    """
+    rng = np.random.default_rng(seed)
+
+    theta_out = rng.uniform(0.5, 3.0, N0)
+    theta_in = rng.uniform(0.5, 3.0, N0)
+    eta_out = rng.uniform(0.5, 2.0, N0)
+    eta_in = rng.uniform(0.5, 2.0, N0)
+
+    eta_g = eta_out[:, None] + eta_in[None, :]
+    log_q_g = -np.log(np.expm1(eta_g))
+    logit_p_g = -theta_out[:, None] - theta_in[None, :] + log_q_g
+    P_g = 1.0 / (1.0 + np.exp(-logit_p_g))         # diagonal NOT zeroed here
+    G_g = 1.0 / (1.0 - np.exp(-eta_g))
+    W_g = P_g * G_g
+
+    mult = np.full(N0, float(r))
+    k_out_g = (P_g * mult[None, :]).sum(1) - np.diagonal(P_g)
+    k_in_g = (P_g * mult[:, None]).sum(0) - np.diagonal(P_g)
+    s_out_g = (W_g * mult[None, :]).sum(1) - np.diagonal(W_g)
+    s_in_g = (W_g * mult[:, None]).sum(0) - np.diagonal(W_g)
+
+    k_out = np.repeat(k_out_g, r)
+    k_in = np.repeat(k_in_g, r)
+    s_out = np.repeat(s_out_g, r)
+    s_in = np.repeat(s_in_g, r)
+    theta_true = np.concatenate(
+        [np.repeat(theta_out, r), np.repeat(theta_in, r), np.repeat(eta_out, r), np.repeat(eta_in, r)]
+    )
+    model = DECMModel(k_out, k_in, s_out, s_in)
     return model, theta_true
 
 
@@ -548,3 +604,50 @@ class TestDECMBisectionCoordinate:
         assert result.peak_ram_bytes >= 0
         assert len(result.residuals) == result.iterations
         assert result.best_mre is not None
+
+
+# ---------------------------------------------------------------------------
+# TestDECMBisectionDegenerate
+# ---------------------------------------------------------------------------
+
+class TestDECMBisectionDegenerate:
+    """Tests for solve_fixed_point_decm_bisection_degenerate: the
+    degeneracy-reduced wrapper around the coordinate/bisection solver, see
+    decm_wbnm_solver_comparison memory for the motivation (real bowtie2
+    networks reduce enormously, e.g. N=15168 -> M=3003, so the dense-only
+    bisection solver benchmarked far slower than the Newton solver until
+    this reduction was added)."""
+
+    def test_identity_when_no_degeneracy(self) -> None:
+        """With continuous (non-duplicate) targets M == N -- the reduction
+        is a no-op -- and the result must still match the known exact
+        solution, confirming the wrapper doesn't break the ordinary case."""
+        model, _ = make_decm_model(N=4, seed=0)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-9, max_iter=3000, n_bisect=60, anderson_depth=10,
+        )
+        assert result.converged, result.message
+        assert "N=4 -> M=4" in result.message
+        mre = model.max_relative_error(result.best_theta)
+        assert mre < CONV_TOL, f"mre={mre:.3e}"
+
+    def test_genuine_degeneracy_converges_to_known_solution(self) -> None:
+        """A network built from N0=4 groups of r=3 exact physical copies
+        (see make_decm_model_degenerate) must reduce to M=4 and converge to
+        the known tiled true solution -- the real correctness property:
+        the weighted "sum with multiplicity minus one diagonal term"
+        bisection stages must reproduce the same equations the network was
+        constructed to exactly satisfy at group granularity."""
+        model, theta_true = make_decm_model_degenerate(N0=4, r=3, seed=2)
+        assert model.N == 12
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_bisection_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-8, max_iter=3000, n_bisect=60, anderson_depth=10,
+        )
+        assert result.converged, result.message
+        assert "N=12 -> M=4" in result.message
+        mre = model.max_relative_error(result.best_theta)
+        assert mre < CONV_TOL, f"mre={mre:.3e}"

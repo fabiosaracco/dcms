@@ -2646,6 +2646,137 @@ def _bisect_eta_in_decm_all(
     return 0.5 * (lo + hi)
 
 
+def _bisect_theta_out_decm_all_weighted(
+    theta_in: torch.Tensor,
+    eta_out: torch.Tensor,
+    eta_in: torch.Tensor,
+    k_out_target: torch.Tensor,
+    mult: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Degeneracy-reduced analogue of :func:`_bisect_theta_out_decm_all`: one
+    bisection per GROUP g (not per node), where the per-member target
+    equation sums ``mult[h] * P[g,h]`` over every h (diagonal included) and
+    then subtracts exactly one diagonal term -- the exact group-level
+    generalisation of the per-node self-loop exclusion, see
+    :func:`_decm_step_dense_weighted`'s docstring. Monotonicity is
+    preserved: d/dtheta_out[g] of the target sum is
+    ``sum_{h!=g} mult[h]*P'[g,h] + (mult[g]-1)*P'[g,g]``, a sum of
+    non-positive terms (P' < 0 everywhere, mult[g]-1 >= 0), so bisection
+    stays exact.
+    """
+    M = theta_in.shape[0]
+    eta = eta_out[:, None] + eta_in[None, :]
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    log_q = -torch.log(torch.expm1(eta_safe))
+
+    def f(theta_out_cand: torch.Tensor) -> torch.Tensor:
+        logit_p = -theta_out_cand[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        return (P * mult[None, :]).sum(1) - P.diagonal() - k_out_target
+
+    lo = torch.full((M,), -_THETA_MAX, dtype=torch.float64)
+    hi = torch.full((M,), _THETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _bisect_theta_in_decm_all_weighted(
+    theta_out: torch.Tensor,
+    eta_out: torch.Tensor,
+    eta_in: torch.Tensor,
+    k_in_target: torch.Tensor,
+    mult: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Column-sum analogue of :func:`_bisect_theta_out_decm_all_weighted`."""
+    M = theta_out.shape[0]
+    eta = eta_out[:, None] + eta_in[None, :]
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    log_q = -torch.log(torch.expm1(eta_safe))
+
+    def f(theta_in_cand: torch.Tensor) -> torch.Tensor:
+        logit_p = -theta_out[:, None] - theta_in_cand[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        return (P * mult[:, None]).sum(0) - P.diagonal() - k_in_target
+
+    lo = torch.full((M,), -_THETA_MAX, dtype=torch.float64)
+    hi = torch.full((M,), _THETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _bisect_eta_out_decm_all_weighted(
+    theta_out: torch.Tensor,
+    theta_in: torch.Tensor,
+    eta_in: torch.Tensor,
+    s_out_target: torch.Tensor,
+    mult: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Degeneracy-reduced analogue of :func:`_bisect_eta_out_decm_all`, same
+    weighted-sum-minus-one-diagonal-term pattern applied to W = P*G."""
+    M = theta_out.shape[0]
+
+    def f(eta_out_cand: torch.Tensor) -> torch.Tensor:
+        z = eta_out_cand[:, None] + eta_in[None, :]
+        z_safe = z.clamp(min=_Z_G_CLAMP)
+        G = -1.0 / torch.expm1(-z_safe)
+        log_q = -torch.log(torch.expm1(z_safe))
+        logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        W = P * G
+        return (W * mult[None, :]).sum(1) - W.diagonal() - s_out_target
+
+    lo = torch.full((M,), _ETA_MIN, dtype=torch.float64)
+    hi = torch.full((M,), _ETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def _bisect_eta_in_decm_all_weighted(
+    theta_out: torch.Tensor,
+    theta_in: torch.Tensor,
+    eta_out: torch.Tensor,
+    s_in_target: torch.Tensor,
+    mult: torch.Tensor,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Column-sum analogue of :func:`_bisect_eta_out_decm_all_weighted`."""
+    M = theta_out.shape[0]
+
+    def f(eta_in_cand: torch.Tensor) -> torch.Tensor:
+        z = eta_out[:, None] + eta_in_cand[None, :]
+        z_safe = z.clamp(min=_Z_G_CLAMP)
+        G = -1.0 / torch.expm1(-z_safe)
+        log_q = -torch.log(torch.expm1(z_safe))
+        logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        W = P * G
+        return (W * mult[:, None]).sum(0) - W.diagonal() - s_in_target
+
+    lo = torch.full((M,), _ETA_MIN, dtype=torch.float64)
+    hi = torch.full((M,), _ETA_MAX, dtype=torch.float64)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        go_lo = f(mid) > 0.0
+        lo = torch.where(go_lo, mid, lo)
+        hi = torch.where(go_lo, hi, mid)
+    return 0.5 * (lo + hi)
+
+
 def _decm_residual_dense(
     theta: torch.Tensor,
     k_out: torch.Tensor,
@@ -2682,6 +2813,44 @@ def _decm_residual_dense(
     )
 
 
+def _decm_residual_dense_weighted(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    mult: torch.Tensor,
+) -> torch.Tensor:
+    """Degeneracy-reduced analogue of :func:`_decm_residual_dense`: 4M
+    per-member residual, same weighted-sum-minus-one-diagonal-term pattern
+    as :func:`_decm_step_dense_weighted`."""
+    M = k_out.shape[0]
+    theta_out = theta[:M]
+    theta_in = theta[M : 2 * M]
+    eta_out = theta[2 * M : 3 * M]
+    eta_in = theta[3 * M :]
+
+    eta = eta_out[:, None] + eta_in[None, :]
+    eta_safe = eta.clamp(min=_Z_G_CLAMP)
+    G = -1.0 / torch.expm1(-eta_safe)
+    log_q = -torch.log(torch.expm1(eta_safe))
+    logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+    P = torch.sigmoid(logit_p)
+    W = P * G
+
+    P_diag = P.diagonal()
+    W_diag = W.diagonal()
+
+    k_out_hat = (P * mult[None, :]).sum(1) - P_diag
+    k_in_hat = (P * mult[:, None]).sum(0) - P_diag
+    s_out_hat = (W * mult[None, :]).sum(1) - W_diag
+    s_in_hat = (W * mult[:, None]).sum(0) - W_diag
+
+    return torch.cat(
+        [k_out_hat - k_out, k_in_hat - k_in, s_out_hat - s_out, s_in_hat - s_in]
+    )
+
+
 def solve_fixed_point_decm_bisection(
     theta0: "ArrayLike",  # type: ignore[name-defined]
     k_out: "ArrayLike",  # type: ignore[name-defined]
@@ -2693,6 +2862,8 @@ def solve_fixed_point_decm_bisection(
     max_time: float = 0.0,
     n_bisect: int = 60,
     anderson_depth: int = 10,
+    mult: "ArrayLike | None" = None,  # type: ignore[name-defined]
+    weight_anderson: bool = True,
     verbose: bool = False,
     monitor: bool = False,
 ) -> SolverResult:
@@ -2715,13 +2886,19 @@ def solve_fixed_point_decm_bisection(
     (the low-degree-node relative-error floor observed under the ordinary
     Newton+Anderson approach) and decm_wbnm_solver_comparison memory.
 
-    First implementation: dense-only (no chunking, no degeneracy
-    reduction, no Anderson mixing) -- meant for validating correctness on
+    First implementation: dense-only (no chunking, no Anderson-free variant
+    beyond ``anderson_depth<=1``) -- meant for validating correctness on
     small synthetic networks before attempting real large-N instances.
+    Degeneracy reduction (see :func:`solve_fixed_point_decm_bisection_degenerate`
+    for the group-reducing wrapper) is supported here via the optional
+    ``mult`` parameter, mirroring how :func:`solve_fixed_point_decm` accepts
+    it for the Newton solver.
 
     Args:
-        theta0:   Initial [θ_out|θ_in|η_out|η_in], shape (4N,).
-        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        theta0:   Initial [θ_out|θ_in|η_out|η_in], shape (4N,) (or (4M,) if
+                  ``mult`` is given -- one entry per degeneracy group).
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,) (or
+                  (M,) group-level sequences if ``mult`` is given).
         tol:      Convergence tolerance on MRE = max|F_i|/target_i.
         max_iter: Maximum number of outer (Gauss-Seidel) iterations.
         max_time: Wall-clock time limit in seconds (0 = no limit).
@@ -2741,6 +2918,19 @@ def solve_fixed_point_decm_bisection(
                   iteration, not diverge, since the next sweep re-solves
                   exactly from wherever θ currently sits. Default 10,
                   matching the rest of this module.
+        mult:     Optional group multiplicities, shape (M,) (M = number of
+                  degeneracy groups). When given, every bisection stage and
+                  the residual use the weighted "sum with multiplicity minus
+                  one diagonal term" pattern (see
+                  :func:`_decm_step_dense_weighted`'s docstring) instead of
+                  the plain per-node one -- exact at group granularity, not
+                  an approximation. None (default) reproduces the original
+                  per-node behaviour exactly.
+        weight_anderson: When ``mult`` is given, weight the Anderson mixing
+                  least-squares fit by group multiplicity (see
+                  :func:`_anderson_mixing`'s ``weights`` docs) so a group of
+                  many identical nodes isn't underweighted relative to a
+                  singleton group. Ignored when ``mult`` is None.
         verbose:  Print progress every iteration.
         monitor:  Overwrite the same terminal line each iteration.
 
@@ -2754,6 +2944,11 @@ def solve_fixed_point_decm_bisection(
     theta = (
         theta0 if isinstance(theta0, torch.Tensor) else torch.tensor(theta0, dtype=torch.float64)
     ).clone().to(dtype=torch.float64)
+    mult_t: torch.Tensor | None = None
+    if mult is not None:
+        mult_t = (
+            mult if isinstance(mult, torch.Tensor) else torch.tensor(mult, dtype=torch.float64)
+        ).to(dtype=torch.float64)
 
     N = k_out.shape[0]
     zero_k_out = k_out == 0
@@ -2768,6 +2963,16 @@ def solve_fixed_point_decm_bisection(
 
     _v_targets = torch.cat([k_out, k_in, s_out, s_in])
     _v_nonzero = _v_targets > 0
+
+    def _residual(theta_vec: torch.Tensor) -> torch.Tensor:
+        if mult_t is None:
+            return _decm_residual_dense(theta_vec, k_out, k_in, s_out, s_in)
+        return _decm_residual_dense_weighted(theta_vec, k_out, k_in, s_out, s_in, mult_t)
+
+    _anderson_weights = (
+        torch.cat([mult_t, mult_t, mult_t, mult_t])
+        if (mult_t is not None and weight_anderson) else None
+    )
 
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
@@ -2796,22 +3001,42 @@ def solve_fixed_point_decm_bisection(
             eta_out = theta[2 * N : 3 * N]
             eta_in = theta[3 * N :]
 
-            theta_out_new = _bisect_theta_out_decm_all(theta_in, eta_out, eta_in, k_out, n_bisect)
+            if mult_t is None:
+                theta_out_new = _bisect_theta_out_decm_all(theta_in, eta_out, eta_in, k_out, n_bisect)
+            else:
+                theta_out_new = _bisect_theta_out_decm_all_weighted(
+                    theta_in, eta_out, eta_in, k_out, mult_t, n_bisect
+                )
             theta_out_new = torch.where(
                 zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
             )
 
-            eta_out_new = _bisect_eta_out_decm_all(theta_out_new, theta_in, eta_in, s_out, n_bisect)
+            if mult_t is None:
+                eta_out_new = _bisect_eta_out_decm_all(theta_out_new, theta_in, eta_in, s_out, n_bisect)
+            else:
+                eta_out_new = _bisect_eta_out_decm_all_weighted(
+                    theta_out_new, theta_in, eta_in, s_out, mult_t, n_bisect
+                )
             eta_out_new = torch.where(
                 zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
             )
 
-            theta_in_new = _bisect_theta_in_decm_all(theta_out_new, eta_out_new, eta_in, k_in, n_bisect)
+            if mult_t is None:
+                theta_in_new = _bisect_theta_in_decm_all(theta_out_new, eta_out_new, eta_in, k_in, n_bisect)
+            else:
+                theta_in_new = _bisect_theta_in_decm_all_weighted(
+                    theta_out_new, eta_out_new, eta_in, k_in, mult_t, n_bisect
+                )
             theta_in_new = torch.where(
                 zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
             )
 
-            eta_in_new = _bisect_eta_in_decm_all(theta_out_new, theta_in_new, eta_out_new, s_in, n_bisect)
+            if mult_t is None:
+                eta_in_new = _bisect_eta_in_decm_all(theta_out_new, theta_in_new, eta_out_new, s_in, n_bisect)
+            else:
+                eta_in_new = _bisect_eta_in_decm_all_weighted(
+                    theta_out_new, theta_in_new, eta_out_new, s_in, mult_t, n_bisect
+                )
             eta_in_new = torch.where(
                 zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
             )
@@ -2827,7 +3052,7 @@ def solve_fixed_point_decm_bisection(
                     _and_g.pop(0)
                     _and_r.pop(0)
                 if len(_and_g) >= 2:
-                    theta_mixed = _anderson_mixing(_and_g, _and_r)
+                    theta_mixed = _anderson_mixing(_and_g, _and_r, weights=_anderson_weights)
                     theta_mixed[:N] = theta_mixed[:N].clamp(-_THETA_MAX, _THETA_MAX)
                     theta_mixed[N : 2 * N] = theta_mixed[N : 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
                     theta_mixed[2 * N : 3 * N] = theta_mixed[2 * N : 3 * N].clamp(_ETA_MIN, _ETA_MAX)
@@ -2848,7 +3073,7 @@ def solve_fixed_point_decm_bisection(
                     # bounded/exact), so on rejection we fall back to it
                     # directly rather than needing a full best_theta
                     # rollback like the Newton solver's blowup recovery.
-                    F_mixed = _decm_residual_dense(theta_mixed, k_out, k_in, s_out, s_in)
+                    F_mixed = _residual(theta_mixed)
                     res_mixed = (
                         (F_mixed.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
                         if _v_nonzero.any() else 0.0
@@ -2860,7 +3085,7 @@ def solve_fixed_point_decm_bisection(
                         _and_r.clear()
                         theta_next = theta_raw
 
-            F = _decm_residual_dense(theta_next, k_out, k_in, s_out, s_in)
+            F = _residual(theta_next)
             res_norm = (
                 (F.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
                 if _v_nonzero.any() else 0.0
@@ -2909,4 +3134,119 @@ def solve_fixed_point_decm_bisection(
         peak_ram_bytes=peak_ram,
         message=message,
         best_mre=best_res,
+    )
+
+
+def solve_fixed_point_decm_bisection_degenerate(
+    theta0: "ArrayLike",  # type: ignore[name-defined]
+    k_out: "ArrayLike",  # type: ignore[name-defined]
+    k_in: "ArrayLike",  # type: ignore[name-defined]
+    s_out: "ArrayLike",  # type: ignore[name-defined]
+    s_in: "ArrayLike",  # type: ignore[name-defined]
+    tol: float = 1e-8,
+    max_iter: int = 1000,
+    max_time: float = 0.0,
+    n_bisect: int = 60,
+    anderson_depth: int = 10,
+    weight_anderson: bool = True,
+    verbose: bool = False,
+    monitor: bool = False,
+) -> SolverResult:
+    """Degeneracy-reduced coordinate/bisection DECM solver.
+
+    Same group reduction as :func:`solve_fixed_point_decm_degenerate` (see
+    its docstring and the module-level note above
+    :func:`compute_degeneracy_groups`), applied to
+    :func:`solve_fixed_point_decm_bisection` instead of the coordinate-
+    Newton solver: nodes sharing the exact same (k_out, k_in, s_out, s_in)
+    4-tuple are collapsed to M <= N group-level unknowns before bisecting,
+    each stage using the weighted "sum with multiplicity minus one diagonal
+    term" pattern (:func:`_bisect_theta_out_decm_all_weighted` and its 3
+    siblings) -- exact at group granularity, not an approximation, for
+    exactly the reason :func:`_decm_step_dense_weighted`'s docstring gives
+    for the Newton case. The returned ``SolverResult`` is expanded back to
+    the original per-node shape (4N,), a drop-in replacement for
+    :func:`solve_fixed_point_decm_bisection` at the call site.
+
+    Args:
+        theta0: Initial guess [theta_out|theta_in|eta_out|eta_in], shape
+            (4N,). Nodes sharing a 4-tuple should already carry identical
+            values here (true for the standard "degrees"-based initial
+            guess); if not, one representative member's value is used for
+            the whole group (only affects the starting point, not the
+            converged solution).
+        k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
+        (all other args): see :func:`solve_fixed_point_decm_bisection`.
+
+    Returns:
+        :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
+        expanded back to shape (4N,).
+    """
+    k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
+    k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
+    s_out = s_out if isinstance(s_out, torch.Tensor) else torch.tensor(s_out, dtype=torch.float64)
+    s_in = s_in if isinstance(s_in, torch.Tensor) else torch.tensor(s_in, dtype=torch.float64)
+    k_out = k_out.to(dtype=torch.float64)
+    k_in = k_in.to(dtype=torch.float64)
+    s_out = s_out.to(dtype=torch.float64)
+    s_in = s_in.to(dtype=torch.float64)
+    theta0 = (
+        theta0 if isinstance(theta0, torch.Tensor) else torch.tensor(theta0, dtype=torch.float64)
+    ).to(dtype=torch.float64)
+
+    N = k_out.shape[0]
+    group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g = compute_degeneracy_groups(
+        k_out, k_in, s_out, s_in
+    )
+    M = k_out_g.shape[0]
+
+    _first_idx = torch.zeros(M, dtype=torch.long)
+    _seen = torch.zeros(M, dtype=torch.bool)
+    _group_of_list = group_of.tolist()
+    for _i, _g in enumerate(_group_of_list):
+        if not _seen[_g]:
+            _seen[_g] = True
+            _first_idx[_g] = _i
+    theta0_g = torch.cat(
+        [
+            theta0[:N][_first_idx],
+            theta0[N : 2 * N][_first_idx],
+            theta0[2 * N : 3 * N][_first_idx],
+            theta0[3 * N :][_first_idx],
+        ]
+    )
+
+    result_g = solve_fixed_point_decm_bisection(
+        theta0_g,
+        k_out_g, k_in_g, s_out_g, s_in_g,
+        tol=tol,
+        max_iter=max_iter,
+        max_time=max_time,
+        n_bisect=n_bisect,
+        anderson_depth=anderson_depth,
+        mult=mult,
+        weight_anderson=weight_anderson,
+        verbose=verbose,
+        monitor=monitor,
+    )
+
+    def _expand(theta_m):
+        import numpy as np
+        g = group_of.numpy()
+        to_ = theta_m[:M][g]
+        ti_ = theta_m[M : 2 * M][g]
+        eo_ = theta_m[2 * M : 3 * M][g]
+        ei_ = theta_m[3 * M :][g]
+        return np.concatenate([to_, ti_, eo_, ei_])
+
+    return SolverResult(
+        theta=_expand(result_g.theta),
+        best_theta=_expand(result_g.best_theta),
+        converged=result_g.converged,
+        iterations=result_g.iterations,
+        residuals=result_g.residuals,
+        elapsed_time=result_g.elapsed_time,
+        peak_ram_bytes=result_g.peak_ram_bytes,
+        message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
+        best_mre=result_g.best_mre,
     )

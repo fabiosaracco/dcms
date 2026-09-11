@@ -605,24 +605,28 @@ class TestDECMBisectionCoordinate:
         assert len(result.residuals) == result.iterations
         assert result.best_mre is not None
 
-    def test_patience_noisy_restart_still_converges(self) -> None:
-        """Forcing the patience/noisy-restart mechanism to fire repeatedly
-        (small patience) on an ordinary synthetic network must not corrupt
-        correctness -- regression test for
-        decm_bisection_degenerate_benchmark memory: a BARE (noiseless)
-        reset-to-best_theta was found to reproduce the exact same failing
-        trajectory forever on a real stuck network (this solver's dynamics
-        are fully deterministic, so a noiseless retry explores nothing
-        new) -- only escalating multiplicative-noise perturbation
-        (mirroring solve_fixed_point_decm's _perturbed_restart) actually
-        unsticks it. patience=20 here fires the restart 5 times over the
-        course of an otherwise-ordinary convergent run."""
+    def test_patience_frozen_disables_anderson_and_still_converges(self) -> None:
+        """Forcing the patience/frozen-stall mechanism to fire (small
+        patience, loose freeze_ratio so any stall counts as "frozen") on an
+        ordinary synthetic network must not corrupt correctness --
+        regression test for decm_bisection_degenerate_benchmark memory.
+        History: a BARE (noiseless) reset-to-best_theta was found to
+        reproduce the exact same failing trajectory forever on a real stuck
+        network (this solver's dynamics are fully deterministic). A
+        noisy-restart tier (mirroring solve_fixed_point_decm's
+        _perturbed_restart) was tried next, but its unseeded RNG made two
+        nominally-identical runs on a real network land on wildly different
+        outcomes (8.9e-10 vs 1.1e-05) -- removed. The current mechanism
+        disables Anderson mixing directly and deterministically once a
+        stall is classified "frozen" (see `freeze_ratio`). patience=20
+        forces at least one such disable-and-resume cycle over the course
+        of an otherwise-ordinary convergent run."""
         model, _ = make_decm_model(N=6, seed=0)
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_decm_bisection(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=1e-9, max_iter=5000, n_bisect=60, anderson_depth=10,
-            patience=20, seed=0,
+            patience=20, freeze_ratio=100.0,
         )
         assert result.converged, result.message
         mre = model.max_relative_error(result.best_theta)

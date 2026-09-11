@@ -120,8 +120,8 @@ def _anderson_mixing(
         RtR = R_w.T @ (weights[:, None] * R_w)
     else:
         RtR = R_w.T @ R_w
-    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
-    ones = torch.ones(m, dtype=RtR.dtype)
+    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype, device=RtR.device)
+    ones = torch.ones(m, dtype=RtR.dtype, device=RtR.device)
     try:
         c = torch.linalg.solve(RtR, ones)
         c_sum = c.sum().item()
@@ -1220,6 +1220,9 @@ def solve_fixed_point_decm(
     noise_growth: float = 2.0,
     max_stalls: int = 5,
     seed: int | None = None,
+    bisection_kick_iters: int = 0,
+    bisection_kick_n_bisect: int = 30,
+    bisection_kick_device: str = "cpu",
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -1445,6 +1448,49 @@ def solve_fixed_point_decm(
                         actually hit a perturbed restart; well-behaved
                         instances that never stagnate or blow up are
                         unaffected and fully deterministic regardless.
+        bisection_kick_iters: Stagnation recovery now has THREE tiers
+                        instead of two. Tier 1 (unchanged): a single
+                        no-noise soft reset from ``best_theta``. Tier 2
+                        (NEW, this is it): if tier 1 ALSO fails to beat the
+                        record within another ``patience`` window, run
+                        ``bisection_kick_iters`` outer sweeps of exact
+                        coordinate bisection + Anderson mixing (see
+                        :func:`_bisection_kick`) from ``best_theta`` and
+                        resume Newton from wherever that lands -- NOT
+                        expected to itself find a better point (empirically
+                        it usually doesn't, see
+                        decm_bisection_degenerate_benchmark memory,
+                        2026-09-09 section), the point is to displace the
+                        trajectory somewhere Newton's own dynamics can then
+                        make fresh progress from, which is qualitatively
+                        different from a random kick. Tier 3 (unchanged,
+                        was tier 2): the existing noisy ``_perturbed_restart``,
+                        now only reached if tier 2 ALSO fails.
+                        ``bisection_kick_iters=0`` (default) disables tier 2
+                        entirely, falling straight back to the original
+                        two-tier behaviour (soft reset, then noise) --
+                        this is a deliberate default: validated on exactly
+                        one real network so far (crisi_dico1, 2 manual
+                        cycles, real cumulative improvement each time:
+                        4.42e-05 -> 2.99e-05 -> 2.52e-05) and not yet
+                        proven as a general default. Pick a value
+                        empirically per network for now (315 worked for
+                        crisi_dico1 at M=5936).
+        bisection_kick_n_bisect: Bisection steps per stage per kick
+                        iteration (see :func:`_bisection_kick`). Capped at
+                        30 automatically when ``bisection_kick_device`` is
+                        not "cpu" (float32 exhausts its precision before 30
+                        halvings; more steps would just be wasted).
+        bisection_kick_device: ``"cpu"`` (default, float64, exact but
+                        slow -- see decm_bisection_degenerate_benchmark
+                        memory for the O(M^2)-per-step cost analysis) or a
+                        torch device string like ``"mps"``/``"cuda"``
+                        (float32 only, ~10x faster on the one GPU measured
+                        so far, Apple MPS) to run just the kick sub-phase
+                        on GPU while the surrounding Newton iterations stay
+                        on CPU/float64 -- data is moved to/from the kick
+                        device only for the duration of each kick, at
+                        negligible cost relative to the kick itself.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -1641,14 +1687,16 @@ def solve_fixed_point_decm(
     restarts = 0
     stalls_at_cap = 0
     iters_since_improve = 0
-    # True until a patience stall has already been given one no-noise
-    # Anderson-reset attempt since the last genuine improvement. Mirrors
-    # the isolated-vs-repeated blowup escalation: the first stall gets the
-    # cheap fix (clear Anderson history, plain Newton step from
-    # best_theta, no noise); only if that ALSO fails to beat the record
-    # within another `patience` window do we escalate to a perturbed
-    # (noisy) restart.
-    _soft_stall_reset_tried = False
+    # 0/1/2: how far the current stagnation episode has escalated since the
+    # last genuine improvement -- 0 = nothing tried yet (do the cheap
+    # no-noise soft reset next), 1 = soft reset already tried (do the
+    # bisection kick next, if `bisection_kick_iters > 0`; otherwise skip
+    # straight to noise), 2 = kick already tried too (only noise left).
+    # Mirrors the isolated-vs-repeated blowup escalation below, which
+    # still jumps straight from "isolated" to noisy restart on repeat
+    # (the kick tier is patience-stall-specific, not wired into the
+    # blowup path). See `bisection_kick_iters` docstring for the rationale.
+    _stall_tier = 0
     # True until the first blowup/stagnation intervention; reset back to
     # True by a genuine record improvement *or* by a restart that actually
     # fires (a restart is itself a fresh start -- see the two call sites of
@@ -2035,7 +2083,7 @@ def solve_fixed_point_decm(
                 stalls_at_cap = 0
                 iters_since_improve = 0
                 progressed_since_restart = True
-                _soft_stall_reset_tried = False
+                _stall_tier = 0
             else:
                 iters_since_improve += 1
 
@@ -2059,7 +2107,8 @@ def solve_fixed_point_decm(
             # escalation counter with the repeated-blowup path below).
             _patience_restart_theta: torch.Tensor | None = None
             if patience > 0 and iters_since_improve >= patience:
-                if not _soft_stall_reset_tried:
+                if _stall_tier == 0:
+                    # Tier 1 (cheapest): no-noise soft reset.
                     if verbose:
                         print(
                             f"[patience] stalled {patience} iters with no "
@@ -2077,11 +2126,36 @@ def solve_fixed_point_decm(
                     )
                     theta_rb = torch.cat([theta_rb[:2 * N], eta_new_rb])
                     _patience_restart_theta = theta_rb
-                    _soft_stall_reset_tried = True
+                    _stall_tier = 1
+                    iters_since_improve = 0
+                    _and_g.clear()
+                    _and_r.clear()
+                elif _stall_tier == 1 and bisection_kick_iters > 0:
+                    # Tier 2 (NEW): the soft reset ALSO failed to beat the
+                    # record within another `patience` window -- try a
+                    # structured (not random) kick instead of jumping
+                    # straight to noise. See `bisection_kick_iters`
+                    # docstring for why this isn't expected to itself find
+                    # a better point.
+                    if verbose:
+                        print(
+                            f"[patience] soft reset also failed -- bisection "
+                            f"kick ({bisection_kick_iters} iters, device="
+                            f"{bisection_kick_device!r}) from "
+                            f"best={best_theta_res:.3e} at iter {n_iter}."
+                        )
+                    _patience_restart_theta = _bisection_kick(
+                        best_theta, k_out, k_in, s_out, s_in, mult, weight_anderson,
+                        n_iters=bisection_kick_iters, n_bisect=bisection_kick_n_bisect,
+                        anderson_depth=anderson_depth, device=bisection_kick_device,
+                    )
+                    _stall_tier = 2
                     iters_since_improve = 0
                     _and_g.clear()
                     _and_r.clear()
                 else:
+                    # Tier 3 (last resort, was tier 2 before the kick):
+                    # escalating noisy restart.
                     _patience_restart_theta, _give_up = _perturbed_restart()
                     iters_since_improve = 0
                     # A restart is itself a fresh start: give the resulting
@@ -2103,7 +2177,7 @@ def solve_fixed_point_decm(
                     _and_g.clear()
                     _and_r.clear()
                     _post_restart_reset = True
-                    _soft_stall_reset_tried = False
+                    _stall_tier = 0
                     if _give_up:
                         message = (
                             f"Stagnation recovery exhausted: {max_stalls} restarts at "
@@ -2324,6 +2398,9 @@ def solve_fixed_point_decm_degenerate(
     noise_growth: float = 2.0,
     max_stalls: int = 5,
     seed: int | None = None,
+    bisection_kick_iters: int = 0,
+    bisection_kick_n_bisect: int = 30,
+    bisection_kick_device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced alternating GS-Newton solver for the DECM.
 
@@ -2472,6 +2549,9 @@ def solve_fixed_point_decm_degenerate(
         noise_growth=noise_growth,
         max_stalls=max_stalls,
         seed=seed,
+        bisection_kick_iters=bisection_kick_iters,
+        bisection_kick_n_bisect=bisection_kick_n_bisect,
+        bisection_kick_device=bisection_kick_device,
     )
 
     def _expand(theta_m):
@@ -2851,6 +2931,249 @@ def _decm_residual_dense_weighted(
     )
 
 
+def _bisection_kick(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    mult: torch.Tensor | None,
+    weight_anderson: bool,
+    n_iters: int,
+    n_bisect: int = 30,
+    anderson_depth: int = 10,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """Run ``n_iters`` outer sweeps of exact coordinate bisection (+ Anderson
+    mixing), self-contained and GPU-capable, as a structured "kick" for
+    :func:`solve_fixed_point_decm`'s stall recovery (see its ``patience``
+    docstring's Tier 2) -- NOT the same code path as
+    :func:`solve_fixed_point_decm_bisection`, deliberately: reusing that
+    solver's own private helpers here would mean threading device support
+    through code the bisection solver itself depends on and that is already
+    tested (269 tests) as CPU-only float64. This is a separate,
+    self-contained implementation so the kick can run on GPU/float32
+    without touching that surface at all.
+
+    On CUDA/MPS this must run in float32 (MPS has no float64 support at
+    all; CUDA float64 is slow enough that float32 is the practical choice
+    here too) and ``n_bisect`` is capped at 30 -- beyond that, float32
+    exhausts its precision and further halvings are wasted (see
+    decm_bisection_degenerate_benchmark memory, GPU-kick section, for the
+    empirical basis: ~10x speedup on MPS measured 2026-09-08).
+
+    Returns the resulting theta on CPU, float64, same length as the input
+    (M or N depending on whether the caller already reduced to
+    degeneracy groups) -- a drop-in replacement for ``best_theta`` at the
+    call site.
+    """
+    M = k_out.shape[0]
+    dev = torch.device(device)
+    kick_dtype = torch.float64 if dev.type == "cpu" else torch.float32
+    if dev.type != "cpu":
+        n_bisect = min(n_bisect, 30)
+
+    theta_d = theta.to(device=dev, dtype=kick_dtype)
+    k_out_d = k_out.to(device=dev, dtype=kick_dtype)
+    k_in_d = k_in.to(device=dev, dtype=kick_dtype)
+    s_out_d = s_out.to(device=dev, dtype=kick_dtype)
+    s_in_d = s_in.to(device=dev, dtype=kick_dtype)
+    mult_d = mult.to(device=dev, dtype=kick_dtype) if mult is not None else None
+    anderson_weights = (
+        torch.cat([mult_d, mult_d, mult_d, mult_d])
+        if (mult_d is not None and weight_anderson) else None
+    )
+    zero_k_out = k_out_d == 0
+    zero_k_in = k_in_d == 0
+    zero_s_out = s_out_d == 0
+    zero_s_in = s_in_d == 0
+    v_targets = torch.cat([k_out_d, k_in_d, s_out_d, s_in_d])
+    v_nonzero = v_targets > 0
+    z_clamp = 1e-8 if kick_dtype == torch.float64 else 1e-6
+    v_safe = v_targets.clamp(min=1e-30 if kick_dtype == torch.float32 else 1e-300)
+
+    # Fully self-contained bisection-stage closures, EVERY tensor creation
+    # explicitly on `dev` -- deliberately NOT calling the module's shared
+    # `_bisect_*_decm_all(_weighted)` helpers, which hardcode
+    # `dtype=torch.float64` with no `device=` and so break immediately on
+    # any non-CPU device (verified 2026-09-09: `RuntimeError: ... at least
+    # two devices, mps:0 and cpu`) -- fixing those in place would touch
+    # code the CPU-only bisection solver depends on and that is already
+    # tested (269 tests); safer to duplicate the (short) bisection loop
+    # here than risk that surface.
+    def _bisect(direction_theta_or_eta, cand_lo, cand_hi, f):
+        lo = torch.full((M,), cand_lo, dtype=kick_dtype, device=dev)
+        hi = torch.full((M,), cand_hi, dtype=kick_dtype, device=dev)
+        for _ in range(n_bisect):
+            mid = 0.5 * (lo + hi)
+            go_lo = f(mid) > 0.0
+            lo = torch.where(go_lo, mid, lo)
+            hi = torch.where(go_lo, hi, mid)
+        return 0.5 * (lo + hi)
+
+    def _bisect_theta_out(theta_in, eta_out, eta_in, target):
+        eta = eta_out[:, None] + eta_in[None, :]
+        eta_safe = eta.clamp(min=z_clamp)
+        log_q = -torch.log(torch.expm1(eta_safe))
+        if mult_d is None:
+            def f(cand):
+                logit_p = -cand[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                P = P.clone(); P.fill_diagonal_(0.0)
+                return P.sum(1) - target
+        else:
+            def f(cand):
+                logit_p = -cand[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                return (P * mult_d[None, :]).sum(1) - P.diagonal() - target
+        return _bisect(None, -_THETA_MAX, _THETA_MAX, f)
+
+    def _bisect_theta_in(theta_out, eta_out, eta_in, target):
+        eta = eta_out[:, None] + eta_in[None, :]
+        eta_safe = eta.clamp(min=z_clamp)
+        log_q = -torch.log(torch.expm1(eta_safe))
+        if mult_d is None:
+            def f(cand):
+                logit_p = -theta_out[:, None] - cand[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                P = P.clone(); P.fill_diagonal_(0.0)
+                return P.sum(0) - target
+        else:
+            def f(cand):
+                logit_p = -theta_out[:, None] - cand[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                return (P * mult_d[:, None]).sum(0) - P.diagonal() - target
+        return _bisect(None, -_THETA_MAX, _THETA_MAX, f)
+
+    def _bisect_eta_out(theta_out, theta_in, eta_in, target):
+        if mult_d is None:
+            def f(cand):
+                z = cand[:, None] + eta_in[None, :]
+                z_safe = z.clamp(min=z_clamp)
+                G = -1.0 / torch.expm1(-z_safe)
+                log_q = -torch.log(torch.expm1(z_safe))
+                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                W = P * G
+                W = W.clone(); W.fill_diagonal_(0.0)
+                return W.sum(1) - target
+        else:
+            def f(cand):
+                z = cand[:, None] + eta_in[None, :]
+                z_safe = z.clamp(min=z_clamp)
+                G = -1.0 / torch.expm1(-z_safe)
+                log_q = -torch.log(torch.expm1(z_safe))
+                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                W = P * G
+                return (W * mult_d[None, :]).sum(1) - W.diagonal() - target
+        return _bisect(None, _ETA_MIN, _ETA_MAX, f)
+
+    def _bisect_eta_in(theta_out, theta_in, eta_out, target):
+        if mult_d is None:
+            def f(cand):
+                z = eta_out[:, None] + cand[None, :]
+                z_safe = z.clamp(min=z_clamp)
+                G = -1.0 / torch.expm1(-z_safe)
+                log_q = -torch.log(torch.expm1(z_safe))
+                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                W = P * G
+                W = W.clone(); W.fill_diagonal_(0.0)
+                return W.sum(0) - target
+        else:
+            def f(cand):
+                z = eta_out[:, None] + cand[None, :]
+                z_safe = z.clamp(min=z_clamp)
+                G = -1.0 / torch.expm1(-z_safe)
+                log_q = -torch.log(torch.expm1(z_safe))
+                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                W = P * G
+                return (W * mult_d[:, None]).sum(0) - W.diagonal() - target
+        return _bisect(None, _ETA_MIN, _ETA_MAX, f)
+
+    def _residual(theta_vec: torch.Tensor) -> torch.Tensor:
+        theta_out = theta_vec[:M]; theta_in = theta_vec[M:2*M]
+        eta_out = theta_vec[2*M:3*M]; eta_in = theta_vec[3*M:]
+        eta = eta_out[:, None] + eta_in[None, :]
+        eta_safe = eta.clamp(min=z_clamp)
+        G = -1.0 / torch.expm1(-eta_safe)
+        log_q = -torch.log(torch.expm1(eta_safe))
+        logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
+        P = torch.sigmoid(logit_p)
+        W = P * G
+        if mult_d is None:
+            P = P.clone(); P.fill_diagonal_(0.0)
+            W = W.clone(); W.fill_diagonal_(0.0)
+            k_out_hat = P.sum(1); k_in_hat = P.sum(0)
+            s_out_hat = W.sum(1); s_in_hat = W.sum(0)
+        else:
+            P_diag = P.diagonal(); W_diag = W.diagonal()
+            k_out_hat = (P * mult_d[None, :]).sum(1) - P_diag
+            k_in_hat = (P * mult_d[:, None]).sum(0) - P_diag
+            s_out_hat = (W * mult_d[None, :]).sum(1) - W_diag
+            s_in_hat = (W * mult_d[:, None]).sum(0) - W_diag
+        return torch.cat([k_out_hat - k_out_d, k_in_hat - k_in_d, s_out_hat - s_out_d, s_in_hat - s_in_d])
+
+    and_g: list[torch.Tensor] = []
+    and_r: list[torch.Tensor] = []
+    best_res = float("inf")
+    best_theta_kick = theta_d.clone()
+
+    for _ in range(n_iters):
+        theta_out = theta_d[:M]; theta_in = theta_d[M:2*M]
+        eta_out = theta_d[2*M:3*M]; eta_in = theta_d[3*M:]
+
+        theta_out_new = _bisect_theta_out(theta_in, eta_out, eta_in, k_out_d)
+        theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
+        eta_out_new = _bisect_eta_out(theta_out_new, theta_in, eta_in, s_out_d)
+        eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
+        theta_in_new = _bisect_theta_in(theta_out_new, eta_out_new, eta_in, k_in_d)
+        theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
+        eta_in_new = _bisect_eta_in(theta_out_new, theta_in_new, eta_out_new, s_in_d)
+        eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
+
+        theta_raw = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
+        theta_next = theta_raw
+
+        if anderson_depth > 1:
+            r_k = theta_raw - theta_d
+            and_g.append(theta_raw.clone())
+            and_r.append(r_k.clone())
+            if len(and_g) > anderson_depth:
+                and_g.pop(0)
+                and_r.pop(0)
+            if len(and_g) >= 2:
+                theta_mixed = _anderson_mixing(and_g, and_r, weights=anderson_weights)
+                theta_mixed[:M] = theta_mixed[:M].clamp(-_THETA_MAX, _THETA_MAX)
+                theta_mixed[M:2*M] = theta_mixed[M:2*M].clamp(-_THETA_MAX, _THETA_MAX)
+                theta_mixed[2*M:3*M] = theta_mixed[2*M:3*M].clamp(_ETA_MIN, _ETA_MAX)
+                theta_mixed[3*M:] = theta_mixed[3*M:].clamp(_ETA_MIN, _ETA_MAX)
+                F_mixed = _residual(theta_mixed)
+                res_mixed = (
+                    (F_mixed.abs()[v_nonzero] / v_safe[v_nonzero]).max().item()
+                    if v_nonzero.any() else 0.0
+                )
+                if math.isfinite(res_mixed) and res_mixed <= _ANDERSON_BLOWUP_FACTOR * max(best_res, 1e-30):
+                    theta_next = theta_mixed
+                else:
+                    and_g.clear()
+                    and_r.clear()
+                    theta_next = theta_raw
+
+        F = _residual(theta_next)
+        rel = F.abs() / v_safe
+        rel = torch.where(v_nonzero, rel, torch.zeros_like(rel))
+        res_norm = rel.max().item()
+        if res_norm < best_res:
+            best_res = res_norm
+            best_theta_kick = theta_next.clone()
+        theta_d = theta_next
+
+    return best_theta_kick.to(device="cpu").to(dtype=torch.float64)
+
+
 def solve_fixed_point_decm_bisection(
     theta0: "ArrayLike",  # type: ignore[name-defined]
     k_out: "ArrayLike",  # type: ignore[name-defined]
@@ -2864,12 +3187,8 @@ def solve_fixed_point_decm_bisection(
     anderson_depth: int = 10,
     mult: "ArrayLike | None" = None,  # type: ignore[name-defined]
     weight_anderson: bool = True,
-    patience: int = 300,
-    noise_base: float = 1e-4,
-    noise_cap_mult: float = 16.0,
-    noise_growth: float = 2.0,
-    max_stalls: int = 5,
-    seed: int | None = None,
+    patience: int = 0,
+    freeze_ratio: float = 1.2,
     verbose: bool = False,
     monitor: bool = False,
 ) -> SolverResult:
@@ -2938,62 +3257,110 @@ def solve_fixed_point_decm_bisection(
                   many identical nodes isn't underweighted relative to a
                   singleton group. Ignored when ``mult`` is None.
         patience: Stagnation-recovery trigger, in iterations. If ``best_res``
-                  has not improved for ``patience`` consecutive iterations,
-                  restart from a perturbed copy of ``best_theta`` (see
-                  ``noise_base``) and clear the Anderson history.
-                  ``patience <= 0`` disables this (plain fixed-point
-                  behaviour). Needed because the raw (un-mixed) Gauss-Seidel
-                  bisection sweep is provably well-behaved on its own
-                  (verified empirically: a control run with
-                  ``anderson_depth=0`` on a real stuck network converged
-                  smoothly and monotonically, never oscillating) but
-                  Anderson mixing can still drive the iterate into a
-                  self-reinforcing worse quasi-fixed-point near a good
-                  solution -- observed as ~10x-magnitude oscillations
-                  between consecutive iterations that stay under the
-                  ``_ANDERSON_BLOWUP_FACTOR`` (50x) blowup guard (which is
-                  calibrated for catastrophic ~1e10-scale divergence, not
-                  these smaller but still-destructive swings) yet still
-                  permanently derail the run away from a point it had
-                  briefly, exactly reached.
+                  has not improved for ``patience`` consecutive iterations
+                  AND the recent residual window is classified "frozen" (see
+                  ``freeze_ratio``), permanently disable Anderson mixing and
+                  resume plain bisection from ``best_theta``. ``patience <=
+                  0`` disables this entirely (plain fixed-point behaviour).
 
-                  IMPORTANT: a bare (noiseless) reset to ``best_theta`` with
-                  cleared Anderson history does NOT work here, unlike what
-                  this solver's determinism might suggest should be
-                  harmless to retry -- verified empirically (real stuck
-                  network) to reproduce the EXACT SAME failing trajectory
-                  on every single restart (16 consecutive resets, all
-                  reporting the identical best_res, a perfect infinite
-                  loop), because every input to the iteration (theta,
-                  cleared history) is byte-identical across restarts and
-                  nothing in the bisection+Anderson map is stochastic.
-                  Noise injection (mirroring
-                  :func:`solve_fixed_point_decm`'s ``_perturbed_restart``
-                  mechanism, see its docstring/comments) is therefore not
-                  optional polish here -- it is required for this recovery
-                  path to do anything at all.
-                  Default 300 (looser than the Newton solver's default 750:
-                  this solver's oscillations were observed to develop and
-                  settle within ~70 iterations on a real stuck network, see
-                  decm_bisection_degenerate_benchmark memory).
-        noise_base: Scale of the multiplicative (log-scale) Gaussian
-                  perturbation applied to ``best_theta`` on each
-                  patience-triggered restart: ``theta_i *= exp(N(0,
-                  noise_base))``, identical formula and rationale to
-                  :func:`solve_fixed_point_decm`'s ``noise_base`` (see its
-                  docstring for why multiplicative/relative noise is used
-                  instead of fixed-scale additive noise -- boundary nodes
-                  near ``_THETA_MAX``/``_ETA_MIN`` need proportionally
-                  different kicks than interior ones).
-        noise_cap_mult: Each consecutive restart that fails to beat the
-                  record grows the noise scale by ``noise_growth``, capped
-                  at ``noise_base * noise_cap_mult`` -- see
-                  :func:`solve_fixed_point_decm`'s docstring.
-        noise_growth: Per-restart multiplicative growth rate of the noise
-                  scale (see ``noise_cap_mult``).
-        max_stalls: Give up (``converged=False``) after this many restarts
-                  at the noise cap without a record improvement.
-        seed:     RNG seed for the perturbed-restart noise (reproducibility).
+                  Background: the raw (un-mixed) Gauss-Seidel bisection
+                  sweep is empirically well-behaved on its own (a control
+                  run with ``anderson_depth=0`` on a real stuck network
+                  converged smoothly and monotonically, never oscillating),
+                  but Anderson mixing can drive the iterate into a
+                  self-reinforcing worse quasi-fixed-point near a good
+                  solution. Two qualitatively different things can then
+                  happen, and telling them apart is the whole point of
+                  ``freeze_ratio``:
+
+                  - A CHAOTIC stall (e.g. dico5's: the residual swung ~20x
+                    within a `patience`-sized window) has a real chance of
+                    self-resolving on its own given enough iterations --
+                    verified: dico5 broke out and fully converged to
+                    7.0e-10 after ~11144 such iterations with ZERO
+                    intervention. Disabling Anderson here would remove the
+                    very mechanism that eventually finds the fix (confirmed
+                    empirically to make things worse, not better: forcing
+                    the disable regardless of frozen/chaotic gave 1.1e-04
+                    after the full 1800s budget). So a chaotic stall is
+                    left alone entirely, however long ``patience`` demands.
+                  - A FROZEN stall (e.g. dico6's: only ~6% residual swing
+                    over 25000+ iterations, i.e. parked at a near-fixed-
+                    point of the mixed map with no ongoing chaos to
+                    exploit) has no such prospect and is exactly the case
+                    disabling Anderson was shown to fix cleanly (dico6:
+                    full convergence to 8.9e-10).
+
+                  An EARLIER version of this mechanism also tried an
+                  escalating noisy-restart tier (mirroring
+                  :func:`solve_fixed_point_decm`'s ``_perturbed_restart``)
+                  before disabling Anderson, on the theory that a bare
+                  (noiseless) reset can't work here (verified separately:
+                  it reproduces the exact same failing trajectory every
+                  time, since nothing in the bisection+Anderson map is
+                  stochastic -- 16 consecutive noiseless resets all
+                  reported the identical best_res). That noisy tier is
+                  GONE, deliberately: even restricted to stalls this gate
+                  classifies as frozen, its unseeded RNG made two nominally
+                  identical `patience=1000` runs on dico6 land on 8.9e-10
+                  vs 1.1e-05 purely because the random noise nudged
+                  `best_theta` to a different pre-disable checkpoint each
+                  time. Going straight from "frozen" to "Anderson off" is
+                  fully deterministic and targets the diagnosed root cause
+                  directly (Anderson mixing itself, not a missing kick) --
+                  see decm_bisection_degenerate_benchmark memory,
+                  2026-09-07 section, for the full experimental log
+                  (including this abandoned noisy-tier design).
+
+                  If plain bisection ALSO goes ``patience`` iterations with
+                  no record improvement after Anderson is disabled, give up
+                  for real (``converged=False``) -- expected to be rare
+                  given the disabled-Anderson path's proven monotonicity.
+
+                  DEFAULT IS 0 (DISABLED). Even with the frozen/chaotic
+                  gate, this has only been validated on two real networks
+                  (dico5, dico6) -- enable deliberately, and re-validate
+                  end-to-end on your specific network(s) at the real time
+                  budget you intend to use, not just short/synthetic runs.
+        freeze_ratio: Classifies a `patience`-length stall as "frozen"
+                  (eligible for the Anderson-disable recovery above) versus
+                  "chaotic" (left alone -- see ``patience``): over the last
+                  ``patience`` residual values, ``max(window) <=
+                  min(window) * freeze_ratio`` must hold for "frozen".
+
+                  KNOWN NOT RELIABLE -- both values tried so far (3.0, then
+                  a tightened 1.2) were end-to-end tested on both real
+                  networks at the full 1800s budget and BOTH FAILED on
+                  BOTH networks:
+                  - ratio=3.0: dico5 -> 3.4e-05 (worse than doing nothing).
+                  - ratio=1.2: dico6 -> gave up at 1.2e-05 after
+                    misclassifying an early, temporary lull as "frozen"
+                    well before its true, much-better settling point
+                    (iteration ~3000 vs the genuine plateau at ~4327);
+                    dico5 -> ran the full 1800s and landed at 9.995e-05
+                    (worse than doing nothing), i.e. it ALSO got
+                    misclassified "frozen" at some point during its
+                    scattered periodic dips (dico5 has brief narrow
+                    sub-windows recurring throughout its entire ~11144
+                    -iteration stall, not confined to an early "obviously
+                    chaotic" phase or a late "calming down" phase) and lost
+                    its own spontaneous-recovery mechanism as a result.
+                  A single trailing-window amplitude-ratio check is
+                  therefore NOT a reliable way to distinguish "genuinely
+                  stuck forever" from "temporarily calm, will move again"
+                  on these networks, at ANY threshold tried -- both
+                  directions of error (too loose, too tight) have been
+                  observed to actively hurt a network that would have done
+                  fine left alone. Default kept at 1.2, but treat this
+                  whole gate as unproven/experimental, not a validated
+                  fix -- see decm_bisection_degenerate_benchmark memory,
+                  2026-09-07 section, for the full comparison table. A
+                  future attempt would need either a fundamentally
+                  different signal (e.g. persistence across multiple
+                  independent windows, not one snapshot; or tracking
+                  theta-space displacement instead of residual amplitude)
+                  or should be abandoned in favor of `patience=0` (the only
+                  strategy with zero observed negative surprises so far).
         verbose:  Print progress every iteration.
         monitor:  Overwrite the same terminal line each iteration.
 
@@ -3037,38 +3404,7 @@ def solve_fixed_point_decm_bisection(
         if (mult_t is not None and weight_anderson) else None
     )
 
-    import numpy as _np
-    _restart_rng = _np.random.default_rng(seed)
-    _restarts = 0
-    _stalls_at_cap = 0
-
-    def _perturbed_restart(best_theta_vec: torch.Tensor, best_theta_res: float) -> tuple[torch.Tensor, bool]:
-        """Noisy restart around best_theta -- see `patience` docstring for
-        why a bare (noiseless) reset does not work here (this solver's
-        dynamics are fully deterministic, so a noiseless reset just
-        replays the identical failing trajectory). Mirrors
-        :func:`solve_fixed_point_decm`'s `_perturbed_restart`."""
-        nonlocal _restarts, _stalls_at_cap
-        _restarts += 1
-        noise_mult = min(noise_growth ** (_restarts - 1), noise_cap_mult)
-        give_up = False
-        if noise_mult >= noise_cap_mult:
-            _stalls_at_cap += 1
-            give_up = _stalls_at_cap >= max_stalls
-        noise_scale = noise_base * noise_mult
-        noise = torch.from_numpy(
-            _restart_rng.normal(scale=noise_scale, size=tuple(best_theta_vec.shape))
-        )
-        theta_restart = best_theta_vec * torch.exp(noise)
-        theta_restart[: 2 * N] = theta_restart[: 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
-        theta_restart[2 * N :] = theta_restart[2 * N :].clamp(_ETA_MIN, _ETA_MAX)
-        if verbose:
-            print(
-                f"[perturbed-restart] restart #{_restarts} (noise_scale={noise_scale:.1e}) "
-                f"around best={best_theta_res:.3e}.",
-                flush=True,
-            )
-        return theta_restart, give_up
+    _anderson_disabled = False
 
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
@@ -3141,7 +3477,7 @@ def solve_fixed_point_decm_bisection(
             theta_raw = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
             theta_next = theta_raw
 
-            if anderson_depth > 1:
+            if anderson_depth > 1 and not _anderson_disabled:
                 r_k = theta_raw - theta
                 _and_g.append(theta_raw.clone())
                 _and_r.append(r_k.clone())
@@ -3210,8 +3546,6 @@ def solve_fixed_point_decm_bisection(
                 best_res = res_norm
                 best_theta = theta_next.clone()
                 _iters_since_improve = 0
-                _restarts = 0
-                _stalls_at_cap = 0
             else:
                 _iters_since_improve += 1
 
@@ -3220,19 +3554,66 @@ def solve_fixed_point_decm_bisection(
                 message = f"Converged in {n_iter} iteration(s)."
                 break
 
-            if patience > 0 and _iters_since_improve >= patience:
-                theta_next, _give_up = _perturbed_restart(best_theta, best_res)
+            _stalled = patience > 0 and _iters_since_improve >= patience
+            if _stalled:
+                _window = residuals[-patience:]
+                _frozen = max(_window) <= min(_window) * freeze_ratio
+            else:
+                _frozen = False
+
+            if _stalled and not _frozen:
+                # Stalled for a full `patience` window, but the residual is
+                # still wandering over a wide range (not settled near a
+                # fixed value) -- per the 2026-09-07 diagnosis this is the
+                # "chaotic" case (e.g. dico5's plateau, which oscillated
+                # ~20x within a comparable window), and chaotic stalls have
+                # a real chance of self-resolving on their own given more
+                # iterations (verified: dico5 broke out and fully converged
+                # after ~11144 such iterations with NO intervention at
+                # all). Disabling Anderson here would wipe exactly the
+                # accumulated Anderson history that self-resolution
+                # depends on -- confirmed empirically
+                # to make things worse, not better (see
+                # decm_bisection_degenerate_benchmark memory). So: don't
+                # intervene, just keep going, and re-check next iteration.
+                pass
+            elif _stalled:
+                if _anderson_disabled:
+                    # Anderson is already off (plain bisection from
+                    # best_theta) and THIS has also stalled for a full
+                    # `patience` window. Per the root-cause diagnosis (see
+                    # `patience` docstring) plain bisection was expected to
+                    # be monotonic/well-behaved, so this should be rare --
+                    # treat it as a genuine, unrecoverable stall.
+                    message = (
+                        f"Stagnation persists for {patience} iterations even "
+                        f"with Anderson mixing disabled (best_res={best_res:.3e}); "
+                        "giving up."
+                    )
+                    break
+                # FROZEN stall (see `freeze_ratio`): disable Anderson mixing
+                # and resume from best_theta. Deliberately NOT preceded by
+                # a noisy-restart attempt -- an earlier version tried that
+                # first and its unseeded RNG made two nominally-identical
+                # `patience=1000` runs on dico6 (both hitting this same
+                # frozen stall) land on 8.9e-10 vs 1.1e-05, purely because
+                # the random noise nudged `best_theta` to a different
+                # pre-disable checkpoint each time (see `patience`
+                # docstring). Disabling Anderson directly is fully
+                # deterministic and targets the diagnosed root cause
+                # (Anderson mixing itself, not a missing kick).
+                if verbose:
+                    print(
+                        f"[patience] frozen stall detected (best_res={best_res:.3e}); "
+                        "disabling Anderson mixing and resuming plain "
+                        "bisection from best_theta (no noisy restart).",
+                        flush=True,
+                    )
+                _anderson_disabled = True
+                theta_next = best_theta.clone()
                 _and_g.clear()
                 _and_r.clear()
                 _iters_since_improve = 0
-                if _give_up:
-                    message = (
-                        f"Stagnation recovery exhausted: {max_stalls} restarts at "
-                        f"max noise (scale={noise_base * noise_cap_mult:.1e}) without "
-                        f"improving on best_res={best_res:.3e}."
-                    )
-                    theta = theta_next
-                    break
 
             theta = theta_next
     finally:
@@ -3265,12 +3646,8 @@ def solve_fixed_point_decm_bisection_degenerate(
     n_bisect: int = 60,
     anderson_depth: int = 10,
     weight_anderson: bool = True,
-    patience: int = 300,
-    noise_base: float = 1e-4,
-    noise_cap_mult: float = 16.0,
-    noise_growth: float = 2.0,
-    max_stalls: int = 5,
-    seed: int | None = None,
+    patience: int = 0,
+    freeze_ratio: float = 1.2,
     verbose: bool = False,
     monitor: bool = False,
 ) -> SolverResult:
@@ -3349,11 +3726,7 @@ def solve_fixed_point_decm_bisection_degenerate(
         mult=mult,
         weight_anderson=weight_anderson,
         patience=patience,
-        noise_base=noise_base,
-        noise_cap_mult=noise_cap_mult,
-        noise_growth=noise_growth,
-        max_stalls=max_stalls,
-        seed=seed,
+        freeze_ratio=freeze_ratio,
         verbose=verbose,
         monitor=monitor,
     )

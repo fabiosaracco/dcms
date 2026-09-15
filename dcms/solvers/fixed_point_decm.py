@@ -1223,6 +1223,11 @@ def solve_fixed_point_decm(
     bisection_kick_iters: int = 0,
     bisection_kick_n_bisect: int = 30,
     bisection_kick_device: str = "cpu",
+    diag_callback: Callable[[int, int, float], None] | None = None,
+    diag_every: int = 1,
+    streak_fix_threshold: int = 0,
+    streak_fix_n_bisect: int = 60,
+    streak_fix_n_sweeps: int = 5,
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -1491,6 +1496,73 @@ def solve_fixed_point_decm(
                         on CPU/float64 -- data is moved to/from the kick
                         device only for the duration of each kick, at
                         negligible cost relative to the kick itself.
+        diag_callback:  Read-only diagnostic hook, ``None`` by default (no
+                        behaviour change whatsoever when omitted -- not
+                        even an extra branch cost worth mentioning). If
+                        given, called as ``diag_callback(n_iter,
+                        argmax_idx, res_norm)`` every ``diag_every``
+                        iterations, where ``argmax_idx`` indexes into the
+                        4G-length concatenated ``[k_out|k_in|s_out|s_in]``
+                        layout (G = len(k_out), i.e. N or M depending on
+                        whether this is called directly or via
+                        :func:`solve_fixed_point_decm_degenerate`) --
+                        decode with ``block, node = divmod(argmax_idx, G)``
+                        (block 0..3 = k_out/k_in/s_out/s_in). Built to
+                        answer the node-population-persistence question in
+                        decm_low_degree_precision_floor memory (2026-09-10
+                        update) without the earlier session's mistake of
+                        reimplementing the Newton step in a bespoke loop
+                        (which blew up memory/was inexplicably slow) --
+                        this reuses the already-correct, already-computed
+                        ``F_current``/``_v_targets`` from the real loop, at
+                        the cost of one extra ``argmax`` per sampled
+                        iteration.
+        diag_every:     Call ``diag_callback`` every this many iterations
+                        (default 1 = every iteration). Irrelevant if
+                        ``diag_callback`` is ``None``.
+        streak_fix_threshold: PROTOTYPE, experimental (2026-09-11,
+                        corrected 2026-09-14) -- ``0`` (default) disables
+                        entirely, zero behaviour change. If positive,
+                        tracks how many CONSECUTIVE iterations the SAME
+                        single (block, node) has been the argmax of the
+                        relative residual -- a categorical signal, found
+                        empirically (see decm_low_degree_precision_floor
+                        memory) to separate genuinely-frozen stretches
+                        (streaks of 150+ iterations, <0.15% residual
+                        movement) from healthy multi-node-alternating
+                        dynamics (streaks under ~30 iterations, large
+                        residual movement) far more cleanly than
+                        record-based ``patience`` or the (separately,
+                        already found unreliable) amplitude-ratio
+                        ``freeze_ratio`` gate. Once the streak reaches
+                        this threshold, applies
+                        :func:`_targeted_bisection_fix` to JUST that one
+                        monopolizing group AND JUST the side (out/in) the
+                        argmax actually flagged -- e.g. a `k_out`/`s_out`
+                        monopoly only touches that group's theta_out/
+                        eta_out, never its theta_in/eta_in, since no
+                        equation couples both sides of the same node (see
+                        2026-09-14 correction in decm_low_degree_
+                        precision_floor memory: fixing both sides
+                        unconditionally, the original 2026-09-11 design,
+                        triggered a persistent post-fix blowup cascade on
+                        c1 -- most likely explained by that overreach, not
+                        by anything specific to the node tested). O(M) not
+                        O(M^2) -- cheap enough to fire often, unlike the
+                        whole-network ``bisection_kick_iters``. Clears
+                        Anderson history and resets the streak counter
+                        after firing. Does NOT replace ``patience``/
+                        ``bisection_kick_iters`` -- runs alongside them,
+                        since it targets a different, finer-grained
+                        trigger. Untested end-to-end as of this writing
+                        (prototype for a live experiment).
+        streak_fix_n_bisect: Bisection halvings per stage in
+                        :func:`_targeted_bisection_fix` (default 60,
+                        CPU/float64, cheap since only ``streak_fix_
+                        threshold``-triggered single-group subsets are
+                        touched -- no GPU/precision tradeoff needed here
+                        unlike ``bisection_kick_n_bisect``).
+        streak_fix_n_sweeps: Gauss-Seidel sweeps per fix (default 5).
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -1697,6 +1769,14 @@ def solve_fixed_point_decm(
     # (the kick tier is patience-stall-specific, not wired into the
     # blowup path). See `bisection_kick_iters` docstring for the rationale.
     _stall_tier = 0
+    # Argmax-identity streak tracking for `streak_fix_threshold` (see its
+    # docstring) -- independent of `_stall_tier`/`iters_since_improve`,
+    # since it tracks a different, finer-grained signal (which single
+    # equation has been worst, consecutively) rather than lack of a global
+    # record. `None` sentinel so the very first iteration never counts as
+    # a streak of length 1 against nothing.
+    _streak_id: int | None = None
+    _streak_len = 0
     # True until the first blowup/stagnation intervention; reset back to
     # True by a genuine record improvement *or* by a restart that actually
     # fires (a restart is itself a fresh start -- see the two call sites of
@@ -2000,6 +2080,26 @@ def solve_fixed_point_decm(
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
                 break
+
+            _need_argmax = (
+                (diag_callback is not None and n_iter % diag_every == 0)
+                or streak_fix_threshold > 0
+            )
+            _argmax_idx = -1
+            if _need_argmax:
+                _rel_diag = torch.full_like(_v_targets, -1.0)
+                _rel_diag[_v_nonzero] = F_current.abs()[_v_nonzero] / _v_targets[_v_nonzero]
+                _argmax_idx = int(_rel_diag.argmax().item())
+
+            if diag_callback is not None and n_iter % diag_every == 0:
+                diag_callback(n_iter, _argmax_idx, res_norm)
+
+            if streak_fix_threshold > 0:
+                if _argmax_idx == _streak_id:
+                    _streak_len += 1
+                else:
+                    _streak_id = _argmax_idx
+                    _streak_len = 1
 
             # --- Backtracking line search (PyTorch path only) ---
             # Evaluate residual at the proposed theta_fp; if it exceeds
@@ -2347,6 +2447,34 @@ def solve_fixed_point_decm(
             if _hub_active:
                 theta_next = _apply_hub_bisection(theta_next)
 
+            if streak_fix_threshold > 0 and _streak_len >= streak_fix_threshold:
+                _fix_group = torch.tensor([_streak_id % N], dtype=torch.long)
+                _fix_block_idx = _streak_id // N
+                _fix_block = ["k_out", "k_in", "s_out", "s_in"][_fix_block_idx]
+                # A node's own theta_out/eta_out appear ONLY in its own
+                # k_out/s_out equations, and theta_in/eta_in ONLY in
+                # k_in/s_in -- no equation couples both sides of the same
+                # node, so only fix the side the argmax actually flagged
+                # (2026-09-14 correction: fixing both sides unconditionally
+                # was the likely cause of the post-fix blowup cascade
+                # documented in decm_low_degree_precision_floor memory).
+                _fix_side = "out" if _fix_block_idx in (0, 2) else "in"
+                if verbose:
+                    print(
+                        f"[streak-fix] group {_fix_group.item()} ({_fix_block}) monopolized "
+                        f"the argmax for {_streak_len} consecutive iters -- targeted bisection "
+                        f"fix (side={_fix_side!r}) at iter {n_iter}.",
+                        flush=True,
+                    )
+                theta_next = _targeted_bisection_fix(
+                    theta_next, k_out, k_in, s_out, s_in, mult, _fix_group, _fix_side,
+                    n_sweeps=streak_fix_n_sweeps, n_bisect=streak_fix_n_bisect,
+                )
+                _streak_len = 0
+                _streak_id = None
+                _and_g.clear()
+                _and_r.clear()
+
             theta = theta_next
 
     finally:
@@ -2401,6 +2529,11 @@ def solve_fixed_point_decm_degenerate(
     bisection_kick_iters: int = 0,
     bisection_kick_n_bisect: int = 30,
     bisection_kick_device: str = "cpu",
+    diag_callback: Callable[[int, int, float], None] | None = None,
+    diag_every: int = 1,
+    streak_fix_threshold: int = 0,
+    streak_fix_n_bisect: int = 60,
+    streak_fix_n_sweeps: int = 5,
 ) -> SolverResult:
     """Degeneracy-reduced alternating GS-Newton solver for the DECM.
 
@@ -2552,6 +2685,11 @@ def solve_fixed_point_decm_degenerate(
         bisection_kick_iters=bisection_kick_iters,
         bisection_kick_n_bisect=bisection_kick_n_bisect,
         bisection_kick_device=bisection_kick_device,
+        diag_callback=diag_callback,
+        diag_every=diag_every,
+        streak_fix_threshold=streak_fix_threshold,
+        streak_fix_n_bisect=streak_fix_n_bisect,
+        streak_fix_n_sweeps=streak_fix_n_sweeps,
     )
 
     def _expand(theta_m):
@@ -3172,6 +3310,164 @@ def _bisection_kick(
         theta_d = theta_next
 
     return best_theta_kick.to(device="cpu").to(dtype=torch.float64)
+
+
+def _targeted_bisection_fix(
+    theta: torch.Tensor,
+    k_out: torch.Tensor,
+    k_in: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    mult: torch.Tensor | None,
+    target_idx: torch.Tensor,
+    side: str,
+    n_sweeps: int = 5,
+    n_bisect: int = 60,
+) -> torch.Tensor:
+    """Exact coordinate bisection restricted to ``target_idx`` groups AND
+    to only the ``side`` ("out" or "in") that the triggering argmax
+    actually flagged -- surgical, cheap (O(K*M) not O(M^2), K =
+    len(target_idx)) alternative to :func:`_bisection_kick`'s
+    whole-network sweep, for the prototype case where one (or a few)
+    node(s) have been identified (via the argmax-streak diagnostic, see
+    decm_low_degree_precision_floor memory) as monopolizing the
+    worst-violated equation for many consecutive iterations while the
+    rest of the network is free to keep moving on its own. CPU/float64
+    only -- K is expected to be tiny (single digits), so there is no
+    GPU/chunking benefit here unlike :func:`_bisection_kick`.
+
+    ``side="out"`` solves ONLY ``target_idx``'s (theta_out, eta_out) pair
+    (the k_out/s_out equations) against the CURRENT (frozen) theta_in/
+    eta_in of every group, including the target's own; ``side="in"``
+    solves ONLY (theta_in, eta_in) (the k_in/s_in equations) against the
+    current theta_out/eta_out. The two sides are never touched together:
+    a node's own theta_out/eta_out appear ONLY in its own k_out/s_out
+    equations and a node's own theta_in/eta_in ONLY in its own k_in/s_in
+    equations -- there is no equation coupling both sides of the SAME
+    node, so fixing the side the argmax did NOT flag is unmotivated
+    (2026-09-14 correction, see decm_low_degree_precision_floor memory:
+    the first version of this function fixed both sides unconditionally,
+    which triggered a persistent post-fix blowup cascade on c1 -- most
+    likely explained by this exact overreach, not by anything specific to
+    the particular node tested).
+
+    Does NOT claim to fix the rest of the network (it doesn't touch
+    it, nor the untriggered side of the target itself), only that
+    ``target_idx``'s flagged-side equations become locally consistent
+    with the network's current state, which a plain Newton step has
+    apparently failed to do for many consecutive iterations.
+    """
+    if side not in ("out", "in"):
+        raise ValueError(f"side must be 'out' or 'in', got {side!r}")
+    M = k_out.shape[0]
+    K = target_idx.shape[0]
+    rows = torch.arange(K)
+
+    theta_out = theta[:M].clone()
+    theta_in = theta[M : 2 * M].clone()
+    eta_out = theta[2 * M : 3 * M].clone()
+    eta_in = theta[3 * M :].clone()
+
+    z_clamp = 1e-8
+
+    def _bisect(cand_lo: float, cand_hi: float, f: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+        lo = torch.full((K,), cand_lo, dtype=torch.float64)
+        hi = torch.full((K,), cand_hi, dtype=torch.float64)
+        for _ in range(n_bisect):
+            mid = 0.5 * (lo + hi)
+            go_lo = f(mid) > 0.0
+            lo = torch.where(go_lo, mid, lo)
+            hi = torch.where(go_lo, hi, mid)
+        return 0.5 * (lo + hi)
+
+    for _ in range(n_sweeps):
+        if side == "out":
+            # theta_out[target]: target rows vs. ALL columns (current, untouched theta_in/eta_in).
+            eta_row = eta_out[target_idx][:, None] + eta_in[None, :]  # (K, M)
+            log_q = -torch.log(torch.expm1(eta_row.clamp(min=z_clamp)))
+
+            def f_theta_out(cand: torch.Tensor) -> torch.Tensor:
+                logit_p = -cand[:, None] - theta_in[None, :] + log_q
+                P = torch.sigmoid(logit_p)
+                P_self = P[rows, target_idx]
+                if mult is None:
+                    P = P.clone()
+                    P[rows, target_idx] = 0.0
+                    return P.sum(1) - k_out[target_idx]
+                return (P * mult[None, :]).sum(1) - P_self - k_out[target_idx]
+
+            theta_out[target_idx] = torch.where(
+                k_out[target_idx] == 0,
+                torch.full((K,), _THETA_MAX, dtype=torch.float64),
+                _bisect(-_THETA_MAX, _THETA_MAX, f_theta_out),
+            )
+
+            # eta_out[target]: target rows vs. ALL columns (updated theta_out, current eta_in).
+            def f_eta_out(cand: torch.Tensor) -> torch.Tensor:
+                z = cand[:, None] + eta_in[None, :]
+                z_safe = z.clamp(min=z_clamp)
+                G = -1.0 / torch.expm1(-z_safe)
+                log_q2 = -torch.log(torch.expm1(z_safe))
+                logit_p = -theta_out[target_idx][:, None] - theta_in[None, :] + log_q2
+                P = torch.sigmoid(logit_p)
+                W = P * G
+                W_self = W[rows, target_idx]
+                if mult is None:
+                    W = W.clone()
+                    W[rows, target_idx] = 0.0
+                    return W.sum(1) - s_out[target_idx]
+                return (W * mult[None, :]).sum(1) - W_self - s_out[target_idx]
+
+            eta_out[target_idx] = torch.where(
+                s_out[target_idx] == 0,
+                torch.full((K,), _ETA_MAX, dtype=torch.float64),
+                _bisect(_ETA_MIN, _ETA_MAX, f_eta_out),
+            )
+
+        else:  # side == "in"
+            # theta_in[target]: ALL rows (current, untouched theta_out/eta_out) vs. target columns.
+            eta_col = eta_out[:, None] + eta_in[target_idx][None, :]  # (M, K)
+            log_q3 = -torch.log(torch.expm1(eta_col.clamp(min=z_clamp)))
+
+            def f_theta_in(cand: torch.Tensor) -> torch.Tensor:
+                logit_p = -theta_out[:, None] - cand[None, :] + log_q3
+                P = torch.sigmoid(logit_p)
+                P_self = P[target_idx, rows]
+                if mult is None:
+                    P = P.clone()
+                    P[target_idx, rows] = 0.0
+                    return P.sum(0) - k_in[target_idx]
+                return (P * mult[:, None]).sum(0) - P_self - k_in[target_idx]
+
+            theta_in[target_idx] = torch.where(
+                k_in[target_idx] == 0,
+                torch.full((K,), _THETA_MAX, dtype=torch.float64),
+                _bisect(-_THETA_MAX, _THETA_MAX, f_theta_in),
+            )
+
+            # eta_in[target]: ALL rows (current theta_out/eta_out, updated theta_in) vs. target columns.
+            def f_eta_in(cand: torch.Tensor) -> torch.Tensor:
+                z = eta_out[:, None] + cand[None, :]
+                z_safe = z.clamp(min=z_clamp)
+                G = -1.0 / torch.expm1(-z_safe)
+                log_q4 = -torch.log(torch.expm1(z_safe))
+                logit_p = -theta_out[:, None] - theta_in[target_idx][None, :] + log_q4
+                P = torch.sigmoid(logit_p)
+                W = P * G
+                W_self = W[target_idx, rows]
+                if mult is None:
+                    W = W.clone()
+                    W[target_idx, rows] = 0.0
+                    return W.sum(0) - s_in[target_idx]
+                return (W * mult[:, None]).sum(0) - W_self - s_in[target_idx]
+
+            eta_in[target_idx] = torch.where(
+                s_in[target_idx] == 0,
+                torch.full((K,), _ETA_MAX, dtype=torch.float64),
+                _bisect(_ETA_MIN, _ETA_MAX, f_eta_in),
+            )
+
+    return torch.cat([theta_out, theta_in, eta_out, eta_in])
 
 
 def solve_fixed_point_decm_bisection(

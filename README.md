@@ -39,7 +39,7 @@ To include optional [Numba](https://numba.pydata.org/) support (only beneficial 
 pip install "dcms[numba] @ git+https://github.com/fabiosaracco/dcms.git"
 ```
 
-**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, NumPy ≥ 1.24, SciPy ≥ 1.10.
+**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, NumPy ≥ 1.24, SciPy ≥ 1.10. GPU acceleration (optional, §2.7) uses whatever PyTorch backend is already installed — Apple Silicon MPS or an NVIDIA CUDA GPU — no extra package.
 
 ---
 
@@ -358,7 +358,7 @@ On real-world networks with heavy-tailed degree/strength distributions, most of 
 | qDECM (weight step) | online social network B | 20914 → 4070 | 23.5× |
 | DECM | online social network C | 15168 → 3003 | ~10–25× |
 
-**Status:** on by default. Every model's `solve_tool()` accepts `reduce_degeneracy: bool = True` (§3.1-3.4) — set it to `False` to force the full (unreduced) solver. It's automatically bypassed (with a printed note) when the requested options aren't supported by the reduced path: `variant != "theta-newton"`, `backend == "numba"`, or (qDECM/DECM only) `backtracking_gamma > 0`.
+**Status:** on by default. Every model's `solve_tool()` accepts `reduce_degeneracy: bool = True` (§3.1-3.4) — set it to `False` to force the full (unreduced) solver. It's automatically bypassed (with a printed note) when the requested options aren't supported by the reduced path: `variant != "theta-newton"`, `backend == "numba"`, or (qDECM/DECM only) `backtracking_gamma > 0`. This is also the path GPU acceleration (§2.7) requires — `device != "cpu"` needs `reduce_degeneracy=True`.
 
 ```python
 model = DCMModel(k_out, k_in)
@@ -439,6 +439,29 @@ model.solve_tool(
 
 ---
 
+### 2.7 GPU acceleration — the `device` parameter
+
+Every model's `solve_tool()` (and the underlying `solve_fixed_point_*_degenerate` functions, §3.8) accepts `device: str = "cpu"`. Passing a torch device string (`"mps"` on Apple Silicon, `"cuda"` on an NVIDIA GPU) runs the entire Newton/Anderson iteration — dense **and** chunked (§2.1's crossover) — on that device instead of the CPU.
+
+**Precision:** CPU always uses float64 (unchanged, exact). Non-CPU devices use **float32**: MPS has no float64 support at all (a hard PyTorch limitation, not a choice made here), and CUDA float64 throughput is slow enough that float32 is the practical choice there too. `SolverResult` (`self.sol`) is always converted back to CPU/float64 before being returned, regardless of `device` — the float32 arithmetic is purely an internal, iteration-time detail.
+
+**What this means in practice:** GPU runs will not reach the same `tol` as CPU — float32 has roughly 7 significant decimal digits, so expect convergence to plateau somewhere in the `1e-6`–`1e-7` MRE range even on an easy network, rather than continuing down to `1e-9`/`1e-10`. This is normal, not a bug. GPU is a speed trade for networks large enough that the O(M²) (dense) or O(chunk×M) (chunked) per-iteration cost dominates — for small/medium `M` the fixed overhead of moving data to the device usually outweighs any benefit, and CPU is both faster and more precise.
+
+**Requirements:** only `reduce_degeneracy=True` (§2.5) is supported with a non-CPU `device` — the raw per-node dense/chunked paths, and the Numba backend, remain CPU-only. Requesting `device != "cpu"` together with `reduce_degeneracy=False`, `backend="numba"`, or (qDECM/DECM) `backtracking_gamma > 0` raises `NotImplementedError` rather than silently falling back, since silently running on CPU would defeat the point of asking for a GPU.
+
+```python
+model = DECMModel(k_out, k_in, s_out, s_in)
+model.solve_tool(
+    tol=1e-6,             # loosen vs. the CPU default -- float32 won't reach 1e-9
+    device="mps",         # or "cuda"; default "cpu"
+    reduce_degeneracy=True,  # required for device != "cpu" (already the default)
+)
+```
+
+**Status:** available on all four models (DCM, DWCM, qDECM, DECM), including DECM's chunked degeneracy-reduced step (used automatically once `M` exceeds `qDECM_LARGE_N_THRESHOLD=2000` — i.e. every large real network). DECM's stagnation-recovery mechanisms (hub bisection, perturbed restart, §2.6) remain internally CPU-only by design and interoperate transparently with a non-CPU main-loop `device` — theta is moved to/from the right device automatically at each boundary, with no action needed from the caller.
+
+---
+
 ## 3. API Reference
 
 All three models expose a unified `solve_tool()` method.  Instantiate with the observed sequences, call `solve_tool()`, and inspect the stored result.
@@ -460,8 +483,9 @@ converged = model.solve_tool(
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in) into groups (see §2.5); default True
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
 )
-theta = model.sol.theta     # converged parameters, shape (2N,)
+theta = model.sol.theta     # converged parameters, shape (2N,) -- always CPU/float64 regardless of device
 ```
 
 Additional model methods:
@@ -494,8 +518,9 @@ converged = model.solve_tool(
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     reduce_degeneracy=True, # collapse nodes sharing (s_out,s_in) into groups (see §2.5); default True
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
 )
-theta = model.sol.theta     # converged parameters, shape (2N,)
+theta = model.sol.theta     # converged parameters, shape (2N,) -- always CPU/float64 regardless of device
 ```
 
 Additional model methods:
@@ -543,6 +568,7 @@ converged = model.solve_tool(
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
     reduce_degeneracy=True, # collapse degenerate node groups in both steps (see §2.5); default True
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
 )
 # solve_tool returns True if *both* topology and weight steps converged
 # sol.theta has shape (4N,): [θ_out_topo, θ_in_topo, θ_β_out, θ_β_in]
@@ -601,6 +627,8 @@ converged = model.solve_tool(
     noise_growth=2.0,       # noise growth rate per consecutive failed restart (see §2.6)
     max_stalls=5,           # give up after this many restarts at max noise with no improvement (see §2.6)
     seed=None,              # seed for the restart RNG; irrelevant if no restart ever fires (see §2.6)
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
+                             # covers both the dense and chunked reduced-path steps; stagnation recovery (§2.6) stays CPU-only internally and interoperates transparently
 )
 # solve_tool returns True if converged and stores the full result:
 theta = model.sol.theta     # full 4N parameters [θ_out|θ_in|η_out|η_in]
@@ -810,7 +838,10 @@ Each of the four models also has a **degeneracy-reduced** counterpart —
 that automatically groups nodes with identical sufficient statistics and
 solves the resulting smaller system, expanding the result back to the
 original per-node shape. See §2.5 for the rationale, measured speedups, and
-a usage example.
+a usage example. These four `*_degenerate` functions (and their non-reduced
+counterparts shown above) all accept `device: str = "cpu"` — see §2.7 for
+the GPU-acceleration semantics (float32 off-CPU, requires the reduced path,
+`SolverResult` always comes back CPU/float64).
 
 `solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
 

@@ -672,7 +672,7 @@ class qDECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0, reduce_degeneracy:bool=True)-> SolverResult:
+    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -729,6 +729,15 @@ class qDECMModel:
                 with ``variant="theta-newton"``, ``backend != "numba"``, and
                 ``backtracking_gamma == 0.0``; silently falls back to the
                 full (unreduced) solver otherwise, with a printed note.
+            device (str): ``"cpu"`` (default, float64) or a torch device
+                string like ``"mps"``/``"cuda"`` (float32 -- MPS has no
+                float64 support at all, and CUDA float64 is slow enough
+                that float32 is the practical choice too). Applies to
+                both the topology and weight steps; only supported
+                together with ``reduce_degeneracy=True`` (and the same
+                constraints as that option) -- raises if requested
+                without it. The stored ``self.sol`` is always
+                CPU/float64 regardless of ``device``.
 
         Returns:
             :class:`~dcms.solvers.base.SolverResult` instance.  The combined
@@ -760,7 +769,7 @@ class qDECMModel:
         topo_tol_help=10**-3
         if _use_reduced:
             from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate  # lazy import to avoid circular dependency
-            _sol_topo = solve_fixed_point_dcm_degenerate(self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+            _sol_topo = solve_fixed_point_dcm_degenerate(self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
         else:
             from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
             _sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
@@ -778,7 +787,7 @@ class qDECMModel:
 
         if _use_reduced:
             from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm_weight_degenerate  # lazy import to avoid circular dependency
-            _sol_weights = solve_fixed_point_qdecm_weight_degenerate(_sol_topo.best_theta, self.ic_weig, self.k_out, self.k_in, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold)
+            _sol_weights = solve_fixed_point_qdecm_weight_degenerate(_sol_topo.best_theta, self.ic_weig, self.k_out, self.k_in, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, device=device)
         else:
             # Build the residual function that fixes theta_topo
             res_weight = lambda tb: self.residual_strength(_sol_topo.best_theta, tb)

@@ -442,7 +442,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, reduce_degeneracy:bool=True)-> SolverResult:
+    def solve_tool(self, ic='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -480,6 +480,14 @@ class DWCMModel:
                 Only supported with ``variant="theta-newton"`` and
                 ``backend != "numba"``; silently falls back to the full
                 (unreduced) solver otherwise, with a printed note.
+            device (str): ``"cpu"`` (default, float64) or a torch device
+                string like ``"mps"``/``"cuda"`` (float32 -- MPS has no
+                float64 support at all, and CUDA float64 is slow enough
+                that float32 is the practical choice too). Only supported
+                together with ``reduce_degeneracy=True`` (and the same
+                ``variant``/``backend`` constraints as that option) --
+                raises if requested without it. The stored ``self.sol``
+                is always CPU/float64 regardless of ``device``.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
@@ -498,7 +506,7 @@ class DWCMModel:
 
         if _use_reduced:
             from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm_degenerate  # lazy import to avoid circular dependency
-            self.sol = solve_fixed_point_dwcm_degenerate(self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+            self.sol = solve_fixed_point_dwcm_degenerate(self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
         else:
             from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
             self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)

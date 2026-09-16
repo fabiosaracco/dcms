@@ -612,6 +612,7 @@ class DECMModel:
         noise_growth: float = 2.0,
         max_stalls: int = 5,
         seed: int | None = None,
+        device: str = "cpu",
     ) -> bool:
         """Solve the DECM equations with the alternating GS-Newton solver.
 
@@ -759,6 +760,16 @@ class DECMModel:
                            touch global RNG state). ``None`` (default) is
                            unseeded/non-reproducible -- only relevant for
                            instances that actually hit a perturbed restart.
+            device:        ``"cpu"`` (default, float64) or a torch device
+                           string like ``"mps"``/``"cuda"`` (float32 -- MPS
+                           has no float64 support at all, and CUDA
+                           float64 is slow enough that float32 is the
+                           practical choice too). Only supported together
+                           with ``reduce_degeneracy=True`` (and the same
+                           ``variant``/``backend`` constraints as that
+                           option) -- raises if requested without it. The
+                           stored ``self.sol`` is always CPU/float64
+                           regardless of ``device``.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
@@ -819,6 +830,7 @@ class DECMModel:
                     noise_growth=noise_growth,
                     max_stalls=max_stalls,
                     seed=seed,
+                    device=device,
                 )
             return solve_fixed_point_decm(
                 residual_fn=self.residual,

@@ -460,7 +460,7 @@ def _decm_step_dense_weighted(
     alpha_out = torch.where(
         delta_eta_out < 0,
         (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(M, dtype=torch.float64),
+        torch.ones(M, dtype=delta_eta_out.dtype, device=delta_eta_out.device),
     )
     eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
     eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
@@ -510,7 +510,7 @@ def _decm_step_dense_weighted(
     alpha_in = torch.where(
         delta_eta_in < 0,
         (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(M, dtype=torch.float64),
+        torch.ones(M, dtype=delta_eta_in.dtype, device=delta_eta_in.device),
     )
     eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
     eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
@@ -876,7 +876,7 @@ def _decm_step_chunked_weighted(
     alpha_out = torch.where(
         delta_eta_out < 0,
         (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(M, dtype=torch.float64),
+        torch.ones(M, dtype=delta_eta_out.dtype, device=delta_eta_out.device),
     )
     eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
     eta_out_new = torch.where(
@@ -953,7 +953,7 @@ def _decm_step_chunked_weighted(
     alpha_in = torch.where(
         delta_eta_in < 0,
         (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(M, dtype=torch.float64),
+        torch.ones(M, dtype=delta_eta_in.dtype, device=delta_eta_in.device),
     )
     eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
     eta_in_new = torch.where(
@@ -1228,6 +1228,7 @@ def solve_fixed_point_decm(
     streak_fix_threshold: int = 0,
     streak_fix_n_bisect: int = 60,
     streak_fix_n_sweeps: int = 5,
+    device: str = "cpu",
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -1563,6 +1564,23 @@ def solve_fixed_point_decm(
                         touched -- no GPU/precision tradeoff needed here
                         unlike ``bisection_kick_n_bisect``).
         streak_fix_n_sweeps: Gauss-Seidel sweeps per fix (default 5).
+        device:         ``"cpu"`` (default, float64) or a torch device
+                        string like ``"mps"``/``"cuda"`` (float32 -- MPS
+                        has no float64 support, and CUDA float64 is slow
+                        enough that float32 is the practical choice too,
+                        same precedent as ``_bisection_kick``). Only
+                        supported together with ``mult`` (the degeneracy
+                        -reduced path) and ``backend`` resolving to
+                        ``"pytorch"`` -- the raw per-node
+                        dense/chunked/numba paths stay CPU-only. Covers
+                        the main Newton/Anderson loop and its dense-
+                        weighted step; ``bisection_kick_device`` and the
+                        (CPU-only by design) targeted streak-fix remain
+                        independently configured and safely interoperate
+                        regardless of this setting (their inputs/outputs
+                        are converted at the boundary). The returned
+                        ``SolverResult`` is always CPU/float64 regardless
+                        of ``device``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
@@ -1590,18 +1608,34 @@ def solve_fixed_point_decm(
                 "backend='numba' is not yet supported together with the "
                 "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
             )
+    if device != "cpu" and (mult is None or backend == "numba"):
+        raise NotImplementedError(
+            "device != 'cpu' is only supported together with the "
+            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
+        )
 
-    # Convert inputs
+    _dev = torch.device(device)
+    _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
+
+    # Convert inputs. NOTE: single combined .to(dtype=, device=) call --
+    # unlike the CPU-return conversions elsewhere in this file (which must
+    # be split into two .to() calls to avoid a direct MPS->float64 cast),
+    # the combined form works fine for CPU-float64 -> MPS-float32 (verified
+    # empirically); it's specifically the *chained* `.to(device=X).to(dtype=Y)`
+    # form that fails here, since the intermediate step would try to hold a
+    # float64 tensor on MPS before the dtype conversion ever runs.
     def _t(x):
         if isinstance(x, torch.Tensor):
-            return x.to(dtype=torch.float64)
-        return torch.tensor(x, dtype=torch.float64)
+            return x.to(dtype=_dtype, device=_dev)
+        return torch.tensor(x, dtype=_dtype, device=_dev)
 
     k_out = _t(k_out)
     k_in = _t(k_in)
     s_out = _t(s_out)
     s_in = _t(s_in)
     theta = _t(theta0).clone()
+    if mult is not None:
+        mult = _t(mult)
 
     N = k_out.shape[0]
 
@@ -1611,8 +1645,8 @@ def solve_fixed_point_decm(
     zero_s_in = s_in == 0
 
     # Restore fixed nodes in the initial theta
-    _tmax = torch.full((N,), _THETA_MAX, dtype=torch.float64)
-    _emax = torch.full((N,), _ETA_MAX, dtype=torch.float64)
+    _tmax = torch.full((N,), _THETA_MAX, dtype=_dtype, device=_dev)
+    _emax = torch.full((N,), _ETA_MAX, dtype=_dtype, device=_dev)
     theta[:N] = torch.where(zero_k_out, _tmax, theta[:N])
     theta[N:2*N] = torch.where(zero_k_in, _tmax, theta[N:2*N])
     theta[2*N:3*N] = torch.where(zero_s_out, _emax, theta[2*N:3*N])
@@ -1807,8 +1841,16 @@ def solve_fixed_point_decm(
             stalls_at_cap += 1
             give_up = stalls_at_cap >= max_stalls
         noise_scale = noise_base * noise_mult
+        # torch.from_numpy always gives a CPU tensor -- move it onto
+        # best_theta's own device/dtype before combining. Order depends on
+        # the target device (float64 can never touch MPS, even transiently
+        # -- see _bisection_kick's _to_dev_dtype docstring for why).
         noise = torch.from_numpy(
             _restart_rng.normal(scale=noise_scale, size=tuple(best_theta.shape))
+        )
+        noise = (
+            noise.to(device=_dev).to(dtype=_dtype) if _dev.type == "cpu"
+            else noise.to(dtype=_dtype).to(device=_dev)
         )
         # Both theta and eta get *multiplicative* (log-scale) noise --
         # theta_i *= exp(noise_i) -- rather than fixed-scale additive noise.
@@ -1864,11 +1906,13 @@ def solve_fixed_point_decm(
     _hub_in_mask: torch.Tensor | None = None
     # Group multiplicities as numpy, for the weighted hub-bisection sum
     # (degeneracy-reduced path only; None reproduces the per-node behaviour).
-    _mult_np = mult.numpy() if mult is not None else None
+    # (.cpu() first: these may live on a non-CPU device under `device=...`,
+    # and hub bisection itself always runs via numpy regardless.)
+    _mult_np = mult.detach().to(device="cpu").to(dtype=torch.float64).numpy() if mult is not None else None
     # Precomputed once: target arrays as numpy, reused by every hub-bisection
     # call each iteration.
-    _s_out_np = s_out.numpy()
-    _s_in_np = s_in.numpy()
+    _s_out_np = s_out.detach().to(device="cpu").to(dtype=torch.float64).numpy()
+    _s_in_np = s_in.detach().to(device="cpu").to(dtype=torch.float64).numpy()
 
     if _hub_active:
         # k_hat ≈ k_out (use observed degrees as proxy; also, a node with
@@ -1886,7 +1930,7 @@ def solve_fixed_point_decm(
         _hub_in_idx_arr = _np_hub.array(_hub_in_indices, dtype=_np_hub.int64)
 
         # Build hub masks for the 4N Anderson exclusion vector
-        _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
+        _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool, device=_dev)
         for _idx in _hub_out_indices:
             _hub_4N_mask[2 * N + _idx] = True          # η_out part
         for _idx in _hub_in_indices:
@@ -1901,7 +1945,7 @@ def solve_fixed_point_decm(
     else:
         _hub_out_indices = []
         _hub_in_indices = []
-        _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool)
+        _hub_4N_mask = torch.zeros(4 * N, dtype=torch.bool, device=_dev)
 
     # η-only view of the hub mask (2N-length, matches theta[2*N:]) -- used
     # to exempt hub-relaxed components (negative-eta relaxation, see
@@ -2005,7 +2049,11 @@ def solve_fixed_point_decm(
         instead of applied instantly -- see its docstring."""
         if not (_hub_active and (_hub_out_indices or _hub_in_indices)):
             return theta_fp
-        _th_fp_np = theta_fp.numpy()
+        # This whole function is numpy-based by design (in-place mutation) --
+        # bring theta_fp to CPU/float64 first (safe even if it's already
+        # there; 2-step to avoid the direct MPS->float64 cast failure) and
+        # convert the result back to the caller's own device/dtype at the end.
+        _th_fp_np = theta_fp.detach().to(device="cpu").to(dtype=torch.float64).numpy()
         for _sweep in range(3):
             if _hub_out_indices:
                 _target_eta_out = _bisect_hub_eta_decm_batch(
@@ -2035,7 +2083,17 @@ def solve_fixed_point_decm(
                     _cur_eta_in, _target_eta_in, _th_fp_np[2 * N:3 * N], _hub_in_idx_arr
                 )
                 _th_fp_np[3 * N + _hub_in_idx_arr] = _new_eta_in
-        return torch.from_numpy(_th_fp_np)
+        # See _bisection_kick's _to_dev_dtype for why the order must depend
+        # on the target device (float64 can never touch MPS, even
+        # transiently) -- here the source is always CPU/float64 (from the
+        # numpy round-trip above), so only the "target is non-cpu" direction
+        # (dtype first, then device) can actually be exercised, but both are
+        # handled for robustness.
+        _th_fp_t = torch.from_numpy(_th_fp_np)
+        return (
+            _th_fp_t.to(device=_dev).to(dtype=_dtype) if _dev.type == "cpu"
+            else _th_fp_t.to(dtype=_dtype).to(device=_dev)
+        )
 
     # Anderson exclusion mask: hub nodes get a component solved exactly by
     # bisection *after* mixing (see the main loop), so their raw (unstable,
@@ -2244,10 +2302,18 @@ def solve_fixed_point_decm(
                             f"{bisection_kick_device!r}) from "
                             f"best={best_theta_res:.3e} at iter {n_iter}."
                         )
-                    _patience_restart_theta = _bisection_kick(
+                    # _bisection_kick always returns CPU/float64 -- convert
+                    # back to this loop's own device/dtype (a no-op when
+                    # device="cpu"). Order depends on the target device (see
+                    # _bisection_kick's own _to_dev_dtype docstring).
+                    _kick_result = _bisection_kick(
                         best_theta, k_out, k_in, s_out, s_in, mult, weight_anderson,
                         n_iters=bisection_kick_iters, n_bisect=bisection_kick_n_bisect,
                         anderson_depth=anderson_depth, device=bisection_kick_device,
+                    )
+                    _patience_restart_theta = (
+                        _kick_result.to(device=_dev).to(dtype=_dtype) if _dev.type == "cpu"
+                        else _kick_result.to(dtype=_dtype).to(device=_dev)
                     )
                     _stall_tier = 2
                     iters_since_improve = 0
@@ -2466,9 +2532,20 @@ def solve_fixed_point_decm(
                         f"fix (side={_fix_side!r}) at iter {n_iter}.",
                         flush=True,
                     )
-                theta_next = _targeted_bisection_fix(
+                # _targeted_bisection_fix is CPU/float64-only internally and
+                # always returns CPU/float64 -- convert back to this loop's
+                # own device/dtype (a no-op when device="cpu", the default).
+                # Order depends on the target device -- see _bisection_kick's
+                # _to_dev_dtype docstring (float64 can never touch MPS, even
+                # transiently, so "target is cpu" and "target is non-cpu"
+                # need opposite .to() call orders).
+                _fix_result = _targeted_bisection_fix(
                     theta_next, k_out, k_in, s_out, s_in, mult, _fix_group, _fix_side,
                     n_sweeps=streak_fix_n_sweeps, n_bisect=streak_fix_n_bisect,
+                )
+                theta_next = (
+                    _fix_result.to(device=_dev).to(dtype=_dtype) if _dev.type == "cpu"
+                    else _fix_result.to(dtype=_dtype).to(device=_dev)
                 )
                 _streak_len = 0
                 _streak_id = None
@@ -2486,8 +2563,10 @@ def solve_fixed_point_decm(
             _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
-        theta=theta.detach().numpy(),
-        best_theta=best_theta.detach().numpy(),
+        # NOTE: must split device+dtype into two .to() calls -- combining them
+        # in one call fails when converting FROM MPS to float64 directly.
+        theta=theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
+        best_theta=best_theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
         converged=converged,
         iterations=n_iter,
         residuals=residuals,
@@ -2535,6 +2614,7 @@ def solve_fixed_point_decm_degenerate(
     streak_fix_threshold: int = 0,
     streak_fix_n_bisect: int = 60,
     streak_fix_n_sweeps: int = 5,
+    device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced alternating GS-Newton solver for the DECM.
 
@@ -2556,6 +2636,10 @@ def solve_fixed_point_decm_degenerate(
     ``backtracking_gamma`` (unavailable in this reduced path -- see
     :func:`solve_fixed_point_decm`'s ``mult`` parameter docs) or
     ``backend="numba"``.
+
+    ``device`` IS supported (passthrough to :func:`solve_fixed_point_decm`
+    -- see its docstring) since this wrapper always runs the degeneracy
+    -reduced (``mult``) path.
 
     Args:
         theta0: Initial guess [theta_out|theta_in|eta_out|eta_in], shape
@@ -2692,6 +2776,7 @@ def solve_fixed_point_decm_degenerate(
         streak_fix_threshold=streak_fix_threshold,
         streak_fix_n_bisect=streak_fix_n_bisect,
         streak_fix_n_sweeps=streak_fix_n_sweeps,
+        device=device,
     )
 
     def _expand(theta_m):
@@ -3113,12 +3198,30 @@ def _bisection_kick(
     if dev.type != "cpu":
         n_bisect = min(n_bisect, 30)
 
-    theta_d = theta.to(device=dev, dtype=kick_dtype)
-    k_out_d = k_out.to(device=dev, dtype=kick_dtype)
-    k_in_d = k_in.to(device=dev, dtype=kick_dtype)
-    s_out_d = s_out.to(device=dev, dtype=kick_dtype)
-    s_in_d = s_in.to(device=dev, dtype=kick_dtype)
-    mult_d = mult.to(device=dev, dtype=kick_dtype) if mult is not None else None
+    # NOTE: device and dtype conversions must be split into two .to() calls,
+    # in an order that depends on the TARGET device -- a float64 tensor can
+    # never touch MPS even transiently (not even mid-conversion), so:
+    #   - target device "cpu": device first, then dtype (safe even if the
+    #     source is already on MPS -- e.g. the caller's own main solve loop
+    #     now runs on MPS -- since that only ever leaves MPS while already
+    #     float32, then converts to float64 once safely on CPU).
+    #   - target device non-"cpu" (mps/cuda): dtype first, then device (safe
+    #     even if the source is CPU/float64, since the dtype conversion to
+    #     float32 happens while still on CPU, before ever touching MPS).
+    # Combining both into one .to(device=, dtype=) call is NOT equivalent to
+    # either split order and fails in exactly the cases these two orders are
+    # each designed to avoid.
+    def _to_dev_dtype(x: torch.Tensor) -> torch.Tensor:
+        if dev.type == "cpu":
+            return x.to(device=dev).to(dtype=kick_dtype)
+        return x.to(dtype=kick_dtype).to(device=dev)
+
+    theta_d = _to_dev_dtype(theta)
+    k_out_d = _to_dev_dtype(k_out)
+    k_in_d = _to_dev_dtype(k_in)
+    s_out_d = _to_dev_dtype(s_out)
+    s_in_d = _to_dev_dtype(s_in)
+    mult_d = _to_dev_dtype(mult) if mult is not None else None
     anderson_weights = (
         torch.cat([mult_d, mult_d, mult_d, mult_d])
         if (mult_d is not None and weight_anderson) else None
@@ -3361,6 +3464,21 @@ def _targeted_bisection_fix(
     """
     if side not in ("out", "in"):
         raise ValueError(f"side must be 'out' or 'in', got {side!r}")
+    # This function is CPU/float64-only by design (see docstring) -- force
+    # everything onto CPU/float64 up front so the caller's main loop is free
+    # to run on any device (e.g. MPS) without this function needing its own
+    # device parameter. Split into two .to() calls: combining device+dtype
+    # in one call fails when the source is already on MPS (no direct
+    # MPS->float64 cast).
+    theta = theta.to(device="cpu").to(dtype=torch.float64)
+    k_out = k_out.to(device="cpu").to(dtype=torch.float64)
+    k_in = k_in.to(device="cpu").to(dtype=torch.float64)
+    s_out = s_out.to(device="cpu").to(dtype=torch.float64)
+    s_in = s_in.to(device="cpu").to(dtype=torch.float64)
+    if mult is not None:
+        mult = mult.to(device="cpu").to(dtype=torch.float64)
+    target_idx = target_idx.to(device="cpu")
+
     M = k_out.shape[0]
     K = target_idx.shape[0]
     rows = torch.arange(K)

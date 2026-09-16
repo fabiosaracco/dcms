@@ -154,8 +154,8 @@ def _anderson_mixing(
         RtR = R_w.T @ (weights[:, None] * R_w)
     else:
         RtR = R_w.T @ R_w  # (m, m)
-    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
-    ones = torch.ones(m, dtype=RtR.dtype)
+    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype, device=RtR.device)
+    ones = torch.ones(m, dtype=RtR.dtype, device=RtR.device)
     try:
         c = torch.linalg.solve(RtR, ones)
         c_sum = c.sum().item()
@@ -886,7 +886,7 @@ def _qdecm_step_dense_weighted(
     alpha_out = torch.where(
         delta_out < 0,
         (available_out / needed_out).clamp(max=1.0),
-        torch.ones(M, dtype=theta_b_out.dtype),
+        torch.ones(M, dtype=theta_b_out.dtype, device=theta_b_out.device),
     )
     theta_b_out_new = (theta_b_out + alpha_out * delta_out).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_out_new = torch.where(
@@ -921,7 +921,7 @@ def _qdecm_step_dense_weighted(
     alpha_in = torch.where(
         delta_in < 0,
         (available_in / needed_in).clamp(max=1.0),
-        torch.ones(M, dtype=theta_b_in.dtype),
+        torch.ones(M, dtype=theta_b_in.dtype, device=theta_b_in.device),
     )
     theta_b_in_new = (theta_b_in + alpha_in * delta_in).clamp(-_ETA_MAX, _ETA_MAX)
     theta_b_in_new = torch.where(
@@ -955,6 +955,7 @@ def solve_fixed_point_qdecm(
     backtracking_gamma: float = 0.0,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Fixed-point iteration for the qDECM weight step.
 
@@ -1024,6 +1025,13 @@ def solve_fixed_point_qdecm(
                      reduced (``mult``) path -- see
                      :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
                      parameter of the same name. Default True.
+        device:      ``"cpu"`` (default, float64) or a torch device string
+                     like ``"mps"``/``"cuda"`` (float32 -- see DECM's
+                     ``_bisection_kick`` for the precedent). Only supported
+                     together with ``mult`` (the degeneracy-reduced path)
+                     and ``backend`` resolving to ``"pytorch"``. The
+                     returned ``SolverResult`` is always CPU/float64
+                     regardless of ``device``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -1048,24 +1056,34 @@ def solve_fixed_point_qdecm(
         raise ValueError(f"damping must be in (0, 1], got {damping}")
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+    if device != "cpu" and (mult is None or backend == "numba"):
+        raise NotImplementedError(
+            "device != 'cpu' is only supported together with the "
+            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
+        )
+
+    _dev = torch.device(device)
+    _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
 
     # Convert inputs to tensors
     if not isinstance(s_out, torch.Tensor):
-        s_out = torch.tensor(s_out, dtype=torch.float64)
+        s_out = torch.tensor(s_out, dtype=_dtype, device=_dev)
     else:
-        s_out = s_out.to(dtype=torch.float64)
+        s_out = s_out.to(dtype=_dtype, device=_dev)
     if not isinstance(s_in, torch.Tensor):
-        s_in = torch.tensor(s_in, dtype=torch.float64)
+        s_in = torch.tensor(s_in, dtype=_dtype, device=_dev)
     else:
-        s_in = s_in.to(dtype=torch.float64)
+        s_in = s_in.to(dtype=_dtype, device=_dev)
     if not isinstance(theta_topo, torch.Tensor):
-        theta_topo = torch.tensor(theta_topo, dtype=torch.float64)
+        theta_topo = torch.tensor(theta_topo, dtype=_dtype, device=_dev)
     else:
-        theta_topo = theta_topo.to(dtype=torch.float64)
+        theta_topo = theta_topo.to(dtype=_dtype, device=_dev)
     if not isinstance(theta0, torch.Tensor):
-        theta = torch.tensor(theta0, dtype=torch.float64)
+        theta = torch.tensor(theta0, dtype=_dtype, device=_dev)
     else:
-        theta = theta0.clone().to(dtype=torch.float64)
+        theta = theta0.clone().to(dtype=_dtype, device=_dev)
+    if mult is not None:
+        mult = mult.to(dtype=_dtype, device=_dev)
 
     N = s_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)  # allow β>1 (negative θ)
@@ -1111,9 +1129,9 @@ def solve_fixed_point_qdecm(
             P_mat = torch.sigmoid(log_xy)  # (N, N)
             P_mat.fill_diagonal_(0.0)
         elif not isinstance(P, torch.Tensor):
-            P_mat = torch.tensor(P, dtype=torch.float64)
+            P_mat = torch.tensor(P, dtype=_dtype, device=_dev)
         else:
-            P_mat: torch.Tensor = P.to(dtype=torch.float64)
+            P_mat: torch.Tensor = P.to(dtype=_dtype, device=_dev)
     else:
         theta_topo_out_chunked = theta_topo[:N]
         theta_topo_in_chunked = theta_topo[N:]
@@ -1237,7 +1255,9 @@ def solve_fixed_point_qdecm(
         torch.cat([mult, mult]) if (mult is not None and weight_anderson) else None
     )
     # Group multiplicities as numpy, for the weighted hub-bisection sum.
-    _mult_np = mult.numpy() if mult is not None else None
+    # (.cpu() first: mult may live on a non-CPU device, e.g. under `device="mps"`,
+    # and this small, occasional-use array is only ever consumed via numpy.)
+    _mult_np = mult.detach().to(device="cpu").to(dtype=torch.float64).numpy() if mult is not None else None
 
     try:
         for _ in range(max_iter):
@@ -1696,8 +1716,10 @@ def solve_fixed_point_qdecm(
             _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
-        theta=theta.detach().numpy(),
-        best_theta=best_theta.detach().numpy(),
+        # NOTE: must split device+dtype into two .to() calls -- combining them
+        # in one call fails when converting FROM MPS to float64 directly.
+        theta=theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
+        best_theta=best_theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
         converged=converged,
         iterations=n_iter,
         residuals=residuals,
@@ -1726,6 +1748,7 @@ def solve_fixed_point_qdecm_degenerate(
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced qDECM solver (topology + conditioned-weight step).
 
@@ -1776,6 +1799,7 @@ def solve_fixed_point_qdecm_degenerate(
         tol=tol * _topo_tol_help, max_iter=topo_max_iter, anderson_depth=anderson_depth,
         max_step=max_step, max_time=max_time, backend=backend,
         num_threads=num_threads, verbose=verbose, monitor=monitor,
+        device=device,
     )
     theta_topo = torch.as_tensor(topo_res.best_theta, dtype=torch.float64)
 
@@ -1785,6 +1809,7 @@ def solve_fixed_point_qdecm_degenerate(
         max_step=max_step, max_time=max_time, backend=backend,
         num_threads=num_threads, verbose=verbose, monitor=monitor,
         hub_sk_threshold=hub_sk_threshold, weight_anderson=weight_anderson,
+        device=device,
     )
 
     return SolverResult(
@@ -1817,6 +1842,7 @@ def solve_fixed_point_qdecm_weight_degenerate(
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced qDECM **weight step only**, given an already-solved
     (or otherwise fixed) topology.
@@ -1911,6 +1937,7 @@ def solve_fixed_point_qdecm_weight_degenerate(
         hub_sk_threshold=hub_sk_threshold,
         mult=mult,
         weight_anderson=weight_anderson,
+        device=device,
     )
 
     def _expand(theta_m):

@@ -165,8 +165,8 @@ def _anderson_mixing(
     else:
         RtR = R_w.T @ R_w  # (m, m)
     # Regularise to avoid singularity when recent steps are nearly collinear.
-    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
-    ones = torch.ones(m, dtype=RtR.dtype)
+    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype, device=RtR.device)
+    ones = torch.ones(m, dtype=RtR.dtype, device=RtR.device)
     try:
         c = torch.linalg.solve(RtR, ones)  # (m,): c ∝ (R_w^T R_w)^{-1} 1
         c_sum = c.sum().item()
@@ -299,6 +299,7 @@ def solve_fixed_point_dwcm(
     monitor: bool = False,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -357,6 +358,12 @@ def solve_fixed_point_dwcm(
             reduced (``mult``) path -- see
             :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
             parameter of the same name. Default True.
+        device: ``"cpu"`` (default, float64) or a torch device string like
+            ``"mps"``/``"cuda"`` (float32 -- see DECM's ``_bisection_kick``
+            for the precedent). Only supported together with ``mult`` (the
+            degeneracy-reduced path) and ``backend`` resolving to
+            ``"pytorch"``. The returned ``SolverResult`` is always
+            CPU/float64 regardless of ``device``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -379,20 +386,33 @@ def solve_fixed_point_dwcm(
     if not (0.0 < damping <= 1.0):
         raise ValueError(f"damping must be in (0, 1], got {damping}")
     if chunk_size < 0:
-        s_out = torch.tensor(s_out, dtype=torch.float64)
+        raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
+    if device != "cpu" and (mult is None or backend == "numba"):
+        raise NotImplementedError(
+            "device != 'cpu' is only supported together with the "
+            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
+        )
+
+    _dev = torch.device(device)
+    _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
+
+    if not isinstance(s_out, torch.Tensor):
+        s_out = torch.tensor(s_out, dtype=_dtype, device=_dev)
     else:
-        s_out = s_out.to(dtype=torch.float64)
+        s_out = s_out.to(dtype=_dtype, device=_dev)
     if not isinstance(s_in, torch.Tensor):
-        s_in = torch.tensor(s_in, dtype=torch.float64)
+        s_in = torch.tensor(s_in, dtype=_dtype, device=_dev)
     else:
-        s_in = s_in.to(dtype=torch.float64)
+        s_in = s_in.to(dtype=_dtype, device=_dev)
+    if mult is not None:
+        mult = mult.to(dtype=_dtype, device=_dev)
 
     N = s_out.shape[0]
 
     if not isinstance(theta0, torch.Tensor):
-        theta = torch.tensor(theta0, dtype=torch.float64)
+        theta = torch.tensor(theta0, dtype=_dtype, device=_dev)
     else:
-        theta = theta0.clone().to(dtype=torch.float64)
+        theta = theta0.clone().to(dtype=_dtype, device=_dev)
 
     # Clamp initial theta to feasible range
     _eta_lo = _ETA_MIN
@@ -909,8 +929,10 @@ def solve_fixed_point_dwcm(
             _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
-        theta=theta.detach().numpy(),
-        best_theta=best_theta.detach().numpy(),
+        # NOTE: must split device+dtype into two .to() calls -- combining them
+        # in one call fails when converting FROM MPS to float64 directly.
+        theta=theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
+        best_theta=best_theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
         converged=converged,
         iterations=n_iter,
         residuals=residuals,
@@ -934,6 +956,7 @@ def solve_fixed_point_dwcm_degenerate(
     verbose: bool = False,
     monitor: bool = False,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced theta-Newton solver for the DWCM.
 
@@ -998,6 +1021,7 @@ def solve_fixed_point_dwcm_degenerate(
         monitor=monitor,
         mult=mult,
         weight_anderson=weight_anderson,
+        device=device,
     )
 
     def _expand(theta_m):

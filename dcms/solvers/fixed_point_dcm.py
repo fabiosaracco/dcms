@@ -108,8 +108,8 @@ def _anderson_mixing(
         RtR = R_w.T @ (weights[:, None] * R_w)
     else:
         RtR = R_w.T @ R_w
-    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype)
-    ones = torch.ones(m, dtype=RtR.dtype)
+    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype, device=RtR.device)
+    ones = torch.ones(m, dtype=RtR.dtype, device=RtR.device)
     try:
         c = torch.linalg.solve(RtR, ones)
         c_sum = c.sum().item()
@@ -453,6 +453,7 @@ def solve_fixed_point_dcm(
     monitor: bool = False,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Fixed-point iteration for the DCM binary model.
 
@@ -498,6 +499,16 @@ def solve_fixed_point_dcm(
                     parameter of the same name -- makes Anderson mixing
                     multiplicity-aware in the reduced (``mult``) path.
                     Default True.
+        device:     ``"cpu"`` (default, float64) or a torch device string
+                    like ``"mps"``/``"cuda"`` (float32 -- MPS has no
+                    float64 support at all, and CUDA float64 is slow
+                    enough that float32 is the practical choice too, same
+                    precedent as DECM's ``_bisection_kick``). Only
+                    supported together with ``mult`` (the degeneracy
+                    -reduced path) and ``backend`` resolving to
+                    ``"pytorch"`` -- the raw per-node chunked/numba paths
+                    stay CPU-only. The returned ``SolverResult`` is always
+                    CPU/float64 regardless of ``device``.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
@@ -522,19 +533,29 @@ def solve_fixed_point_dcm(
                 "backend='numba' is not yet supported together with the "
                 "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
             )
+    if device != "cpu" and (mult is None or backend == "numba"):
+        raise NotImplementedError(
+            "device != 'cpu' is only supported together with the "
+            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
+        )
+
+    _dev = torch.device(device)
+    _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
 
     if not isinstance(k_out, torch.Tensor):
-        k_out = torch.tensor(k_out, dtype=torch.float64)
+        k_out = torch.tensor(k_out, dtype=_dtype, device=_dev)
     else:
-        k_out = k_out.to(dtype=torch.float64)
+        k_out = k_out.to(dtype=_dtype, device=_dev)
     if not isinstance(k_in, torch.Tensor):
-        k_in = torch.tensor(k_in, dtype=torch.float64)
+        k_in = torch.tensor(k_in, dtype=_dtype, device=_dev)
     else:
-        k_in = k_in.to(dtype=torch.float64)
+        k_in = k_in.to(dtype=_dtype, device=_dev)
     if not isinstance(theta0, torch.Tensor):
-        theta = torch.tensor(theta0, dtype=torch.float64)
+        theta = torch.tensor(theta0, dtype=_dtype, device=_dev)
     else:
-        theta = theta0.clone().to(dtype=torch.float64)
+        theta = theta0.clone().to(dtype=_dtype, device=_dev)
+    if mult is not None:
+        mult = mult.to(dtype=_dtype, device=_dev)
 
     N = k_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)
@@ -814,8 +835,10 @@ def solve_fixed_point_dcm(
             _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
-        theta=theta.detach().numpy(),
-        best_theta=best_theta.detach().numpy(),
+        # NOTE: must split device+dtype into two .to() calls -- combining them
+        # in one call fails when converting FROM MPS to float64 directly.
+        theta=theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
+        best_theta=best_theta.detach().to(device="cpu").to(dtype=torch.float64).numpy(),
         converged=converged,
         iterations=n_iter,
         residuals=residuals,
@@ -839,6 +862,7 @@ def solve_fixed_point_dcm_degenerate(
     verbose: bool = False,
     monitor: bool = False,
     weight_anderson: bool = True,
+    device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced theta-Newton solver for the DCM.
 
@@ -903,6 +927,7 @@ def solve_fixed_point_dcm_degenerate(
         monitor=monitor,
         mult=mult,
         weight_anderson=weight_anderson,
+        device=device,
     )
 
     def _expand(theta_m):

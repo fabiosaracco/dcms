@@ -792,18 +792,18 @@ def _decm_step_chunked_weighted(
     # Pass 1: accumulate row sums (out-direction) + preliminary col sums
     # (in-direction, at the *input* theta -- used for F_current only)
     # ------------------------------------------------------------------
-    k_out_hat = torch.zeros(M, dtype=torch.float64)
-    k_in_hat = torch.zeros(M, dtype=torch.float64)
-    s_out_hat = torch.zeros(M, dtype=torch.float64)
-    s_in_hat = torch.zeros(M, dtype=torch.float64)
-    H_k_out = torch.zeros(M, dtype=torch.float64)
-    H_s_out = torch.zeros(M, dtype=torch.float64)
-    z_min_out = torch.full((M,), float("inf"), dtype=torch.float64)
+    k_out_hat = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    k_in_hat = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    s_out_hat = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    s_in_hat = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    H_k_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    H_s_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    z_min_out = torch.full((M,), float("inf"), dtype=theta.dtype, device=theta.device)
 
     for i_start in range(0, M, chunk_size):
         i_end = min(i_start + chunk_size, M)
-        local_i = torch.arange(i_end - i_start, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+        local_i = torch.arange(i_end - i_start, dtype=torch.long, device=theta.device)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long, device=theta.device)
 
         eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, M)
         eta_safe = eta_chunk.clamp(min=_Z_G_CLAMP)
@@ -886,16 +886,16 @@ def _decm_step_chunked_weighted(
     # ------------------------------------------------------------------
     # Pass 2: accumulate col sums using updated (theta_out_new, eta_out_new)
     # ------------------------------------------------------------------
-    k_in_hat2 = torch.zeros(M, dtype=torch.float64)
-    s_in_hat2 = torch.zeros(M, dtype=torch.float64)
-    H_k_in2 = torch.zeros(M, dtype=torch.float64)
-    H_s_in2 = torch.zeros(M, dtype=torch.float64)
-    z_min_in = torch.full((M,), float("inf"), dtype=torch.float64)
+    k_in_hat2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    s_in_hat2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    H_k_in2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    H_s_in2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    z_min_in = torch.full((M,), float("inf"), dtype=theta.dtype, device=theta.device)
 
     for i_start in range(0, M, chunk_size):
         i_end = min(i_start + chunk_size, M)
-        local_i = torch.arange(i_end - i_start, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
+        local_i = torch.arange(i_end - i_start, dtype=torch.long, device=theta.device)
+        global_j = torch.arange(i_start, i_end, dtype=torch.long, device=theta.device)
 
         eta2_chunk = eta_out_new[i_start:i_end, None] + eta_in[None, :]
         eta2_safe = eta2_chunk.clamp(min=_Z_G_CLAMP)

@@ -774,7 +774,7 @@ class TestHubOutFreezeInStep:
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_decm_degenerate(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
-            tol=1e-8, max_iter=4000, hub_sk_threshold=1.5,
+            tol=1e-8, max_iter=4000, hub_sk_threshold=0.25,   # s/k > 0.25: 6 out-hubs, 3 in-hubs
         )
         assert result.converged, result.message
         assert model.max_relative_error(result.best_theta) < CONV_TOL
@@ -796,3 +796,57 @@ class TestDiagStateCallback:
         assert [s[0] for s in seen] == list(range(len(seen))) and len(seen) == 5
         assert all(s[1] == (16,) and s[2] == (16,) for s in seen)   # 4 * M, M = 4 groups
         assert np.array_equal(res_hook.theta, res_plain.theta)
+
+
+class TestResumeKeepsNegativeHubEta:
+    """A checkpoint legitimately carries NEGATIVE hub eta (negative-eta
+    relaxation: only the pair sum eta_out+eta_in must stay > 0). The
+    start-of-solve clamp used to floor every eta to _ETA_MIN, wiping them:
+    e1's checkpoint went from MRE 6.66e-4 to 0.78 at iteration 1 and q4's from
+    2.86e-3 to 0.74, on every resume (see decm_low_degree_precision_floor)."""
+
+    THR = 0.25     # s/k threshold: nodes 0-2, 12-14 are out-hubs of this problem
+
+    def _setup(self):
+        model, theta_true = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        N = model.N
+        # a solution-quality start with hub eta_out pushed negative (partners keep z > 0)
+        theta0 = torch.as_tensor(theta_true, dtype=torch.float64).clone()
+        sk = model.s_out / model.k_out.clamp(min=1.0)
+        hub = (sk > self.THR) & (model.s_out > 0) & (model.k_out > 0)
+        assert hub.any(), "test problem must contain out-hubs"
+        theta0[2 * N:3 * N][hub] = -0.05
+        assert float(theta0[3 * N:].min()) > 0.05      # every pair sum stays positive
+        return model, theta0
+
+    def _iter0_mre(self, model, theta0, **kw):
+        seen = []
+        solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-15, max_iter=1, hub_sk_threshold=self.THR,
+            diag_callback=lambda n, a, r: seen.append(r), diag_every=1, **kw,
+        )
+        return seen[0]
+
+    def test_first_iteration_residual_is_that_of_the_given_theta0(self) -> None:
+        model, theta0 = self._setup()
+        N = model.N
+        as_is = model.max_relative_error(theta0)
+        clamped = theta0.clone()
+        clamped[2 * N:] = clamped[2 * N:].clamp(min=1e-10)
+        assert abs(model.max_relative_error(clamped) - as_is) > 0.1 * as_is   # non-vacuous: the clamp would change it
+        assert self._iter0_mre(model, theta0) == pytest.approx(as_is, rel=1e-6)
+
+    def test_negative_non_hub_eta_is_still_floored(self) -> None:
+        # only hub eta are exempt: a non-hub eta below the floor is still clamped
+        model, theta0 = self._setup()
+        N = model.N
+        theta_bad = theta0.clone()
+        sk_in = model.s_in / model.k_in.clamp(min=1.0)
+        non_hub_in = ~((sk_in > self.THR) & (model.s_in > 0) & (model.k_in > 0)) & (model.s_in > 0)
+        theta_bad[3 * N:][non_hub_in] = -0.05
+        floored = theta_bad.clone()
+        floored[3 * N:][non_hub_in] = 1e-10
+        # the solver must see the floored value, not the negative one
+        assert self._iter0_mre(model, theta_bad) == pytest.approx(
+            self._iter0_mre(model, floored), rel=1e-9)

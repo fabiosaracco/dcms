@@ -2010,6 +2010,18 @@ def solve_fixed_point_decm(
     # found this).
     _hub_eta_mask = _hub_4N_mask[2 * N :]
 
+    # The start-of-solve clamp above floors EVERY eta to _ETA_MIN, which wipes
+    # the negative hub eta (negative-eta relaxation) that a checkpoint
+    # legitimately carries: resuming e1 from MRE 6.66e-4 started at 0.78, q4
+    # from 2.86e-3 at 0.74, and the solver then had to re-climb them under
+    # _damp_hub_step. Hub eta are owned by the hub bisection, so take them
+    # from the caller's theta0 unclamped (non-hub eta keep the floor).
+    if _hub_active and (_hub_out_indices or _hub_in_indices):
+        _eta0 = _t(theta0)[2 * N :].clamp(-_ETA_MAX, _ETA_MAX)
+        theta[2 * N :] = torch.where(_hub_eta_mask, _eta0, theta[2 * N :])
+        if init_best_theta is None:
+            best_theta = theta.clone()
+
     if _hub_active and (_hub_out_indices or _hub_in_indices):
         # The raw per-node Newton step (whichever _decm_step_* variant is
         # bound above -- dense/chunked/weighted, all share the same

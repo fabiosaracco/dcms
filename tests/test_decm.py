@@ -692,3 +692,107 @@ class TestDECMBisectionDegenerate:
         assert "N=12 -> M=4" in result.message
         mre = model.max_relative_error(result.best_theta)
         assert mre < CONV_TOL, f"mre={mre:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# Hub eta_out freeze inside the Newton step + read-only state hook
+# ---------------------------------------------------------------------------
+
+from dcms.solvers.fixed_point_decm import (  # noqa: E402
+    _decm_step_chunked_weighted,
+    _decm_step_dense_weighted,
+    solve_fixed_point_decm_degenerate,
+)
+
+
+def _group_problem(M: int = 8, seed: int = 5):
+    """Group-level (k_out,k_in,s_out,s_in,mult) with a known exact solution,
+    plus a perturbed theta away from it (so raw Newton steps are non-trivial)."""
+    rng = np.random.default_rng(seed)
+    th_o, th_i = rng.uniform(0.5, 3.0, M), rng.uniform(0.5, 3.0, M)
+    et_o, et_i = rng.uniform(0.3, 2.0, M), rng.uniform(0.3, 2.0, M)
+    eta = et_o[:, None] + et_i[None, :]
+    P = 1.0 / (1.0 + np.exp(th_o[:, None] + th_i[None, :] + np.log(np.expm1(eta))))
+    W = P / (1.0 - np.exp(-eta))
+    mult = np.full(M, 2.0)
+    d = lambda A: np.diagonal(A)
+    k_out = (P * mult[None, :]).sum(1) - d(P)
+    k_in = (P * mult[:, None]).sum(0) - d(P)
+    s_out = (W * mult[None, :]).sum(1) - d(W)
+    s_in = (W * mult[:, None]).sum(0) - d(W)
+    t = lambda a: torch.tensor(a, dtype=torch.float64)
+    theta_true = np.concatenate([th_o, th_i, et_o, et_i])
+    theta = theta_true * (1.0 + 0.15 * rng.standard_normal(4 * M))
+    theta[2 * M:] = np.abs(theta[2 * M:]) + 0.05
+    return (t(theta), t(k_out), t(k_in), t(s_out), t(s_in), t(mult), M)
+
+
+class TestHubOutFreezeInStep:
+    """In the Gauss-Seidel step, the in-side pass must see the hub eta_out
+    that will actually be applied (the input value, since hub eta is owned by
+    the hub bisection and the raw Newton proposal is discarded by the caller),
+    not the raw proposal -- otherwise theta_in is corrected against a phantom
+    environment (the e1 post-fix-undo bug, see decm_low_degree_precision_floor)."""
+
+    @staticmethod
+    def _call(fn, theta, k_out, k_in, s_out, s_in, mult, M, mask):
+        z = lambda x: x == 0
+        args = (theta, k_out, k_in, s_out, s_in, z(k_out), z(k_in), z(s_out), z(s_in))
+        if fn is _decm_step_chunked_weighted:
+            return fn(*args, 3, 0.5, mult, hub_out_mask=mask)
+        return fn(*args, 0.5, mult, hub_out_mask=mask)
+
+    @pytest.mark.parametrize("fn", [_decm_step_dense_weighted, _decm_step_chunked_weighted])
+    def test_none_and_all_false_mask_are_identical(self, fn) -> None:
+        theta, k_out, k_in, s_out, s_in, mult, M = _group_problem()
+        ref = self._call(fn, theta, k_out, k_in, s_out, s_in, mult, M, None)
+        off = self._call(fn, theta, k_out, k_in, s_out, s_in, mult, M, torch.zeros(M, dtype=torch.bool))
+        assert torch.equal(ref[0], off[0]) and torch.equal(ref[1], off[1])
+
+    @pytest.mark.parametrize("fn", [_decm_step_dense_weighted, _decm_step_chunked_weighted])
+    def test_mask_freezes_hub_eta_out_and_changes_only_the_in_side(self, fn) -> None:
+        theta, k_out, k_in, s_out, s_in, mult, M = _group_problem()
+        mask = torch.zeros(M, dtype=torch.bool)
+        mask[[1, 4]] = True
+        ref_t, ref_F = self._call(fn, theta, k_out, k_in, s_out, s_in, mult, M, None)
+        new_t, new_F = self._call(fn, theta, k_out, k_in, s_out, s_in, mult, M, mask)
+        eta_out_in = theta[2 * M:3 * M]
+        # hub eta_out is held at its input value...
+        assert torch.equal(new_t[2 * M:3 * M][mask], eta_out_in[mask])
+        # ...while the unmasked raw step really would have moved it (test is not vacuous)
+        assert (ref_t[2 * M:3 * M][mask] - eta_out_in[mask]).abs().max() > 1e-6
+        # the residual is evaluated at the input theta: unaffected by the mask
+        assert torch.equal(ref_F, new_F)
+        # out-side pass 1 is unaffected: theta_out and non-hub eta_out are identical
+        assert torch.equal(ref_t[:M], new_t[:M])
+        assert torch.equal(ref_t[2 * M:3 * M][~mask], new_t[2 * M:3 * M][~mask])
+        # the in-side pass DOES see the different environment
+        assert (ref_t[M:2 * M] - new_t[M:2 * M]).abs().max() > 1e-9
+
+    def test_hub_solver_still_converges_with_freeze(self) -> None:
+        model, theta_true = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-8, max_iter=4000, hub_sk_threshold=1.5,
+        )
+        assert result.converged, result.message
+        assert model.max_relative_error(result.best_theta) < CONV_TOL
+
+
+class TestDiagStateCallback:
+    def test_called_every_iteration_and_read_only(self) -> None:
+        model, _ = make_decm_model_degenerate(N0=4, r=3, seed=2)
+        theta0 = model.initial_theta("degrees")
+        seen = []
+        kw = dict(tol=1e-12, max_iter=5)
+        res_hook = solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            diag_state_callback=lambda n, th, F: seen.append((n, tuple(th.shape), tuple(F.shape))), **kw,
+        )
+        res_plain = solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in, **kw,
+        )
+        assert [s[0] for s in seen] == list(range(len(seen))) and len(seen) == 5
+        assert all(s[1] == (16,) and s[2] == (16,) for s in seen)   # 4 * M, M = 4 groups
+        assert np.array_equal(res_hook.theta, res_plain.theta)

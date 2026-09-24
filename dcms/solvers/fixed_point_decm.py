@@ -155,6 +155,7 @@ def _decm_step_dense(
     zero_s_out: torch.Tensor,
     zero_s_in: torch.Tensor,
     max_step: float,
+    hub_out_mask: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One alternating GS-Newton step for the DECM (dense N×N computation).
 
@@ -244,6 +245,14 @@ def _decm_step_dense(
     )
     eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
     eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
+    if hub_out_mask is not None:
+        # Hub eta_out is owned by the hub bisection, not by this Newton
+        # step (the caller discards the raw value). Pass 2 must therefore
+        # see the eta_out that will actually be applied -- the input
+        # (previously bisected) value -- not the raw Newton proposal,
+        # otherwise every theta_in is corrected against a phantom
+        # environment (dominant for near-boundary in-hubs, z=eta_out+eta_in -> 0).
+        eta_out_new = torch.where(hub_out_mask, eta_out, eta_out_new)
 
     # ------- Pass 2: recompute col sums with updated θ_out, η_out -------
     eta2 = eta_out_new[:, None] + eta_in[None, :]
@@ -363,6 +372,7 @@ def _decm_step_dense_weighted(
     zero_s_in: torch.Tensor,
     max_step: float,
     mult: torch.Tensor,
+    hub_out_mask: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One alternating GS-Newton step for the degeneracy-reduced DECM.
 
@@ -464,6 +474,14 @@ def _decm_step_dense_weighted(
     )
     eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
     eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
+    if hub_out_mask is not None:
+        # Hub eta_out is owned by the hub bisection, not by this Newton
+        # step (the caller discards the raw value). Pass 2 must therefore
+        # see the eta_out that will actually be applied -- the input
+        # (previously bisected) value -- not the raw Newton proposal,
+        # otherwise every theta_in is corrected against a phantom
+        # environment (dominant for near-boundary in-hubs, z=eta_out+eta_in -> 0).
+        eta_out_new = torch.where(hub_out_mask, eta_out, eta_out_new)
 
     # ------- Pass 2: recompute col sums with updated θ_out, η_out -------
     eta2 = eta_out_new[:, None] + eta_in[None, :]
@@ -535,6 +553,7 @@ def _decm_step_chunked(
     zero_s_in: torch.Tensor,
     chunk_size: int,
     max_step: float,
+    hub_out_mask: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked alternating GS-Newton step for the DECM.
 
@@ -655,6 +674,14 @@ def _decm_step_chunked(
     eta_out_new = torch.where(
         zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
     )
+    if hub_out_mask is not None:
+        # Hub eta_out is owned by the hub bisection, not by this Newton
+        # step (the caller discards the raw value). Pass 2 must therefore
+        # see the eta_out that will actually be applied -- the input
+        # (previously bisected) value -- not the raw Newton proposal,
+        # otherwise every theta_in is corrected against a phantom
+        # environment (dominant for near-boundary in-hubs, z=eta_out+eta_in -> 0).
+        eta_out_new = torch.where(hub_out_mask, eta_out, eta_out_new)
 
     # ------------------------------------------------------------------
     # Pass 2: accumulate col sums using updated (θ_out_new, η_out_new)
@@ -746,6 +773,7 @@ def _decm_step_chunked_weighted(
     chunk_size: int,
     max_step: float,
     mult: torch.Tensor,
+    hub_out_mask: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked alternating GS-Newton step for the degeneracy-reduced DECM.
 
@@ -882,6 +910,14 @@ def _decm_step_chunked_weighted(
     eta_out_new = torch.where(
         zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
     )
+    if hub_out_mask is not None:
+        # Hub eta_out is owned by the hub bisection, not by this Newton
+        # step (the caller discards the raw value). Pass 2 must therefore
+        # see the eta_out that will actually be applied -- the input
+        # (previously bisected) value -- not the raw Newton proposal,
+        # otherwise every theta_in is corrected against a phantom
+        # environment (dominant for near-boundary in-hubs, z=eta_out+eta_in -> 0).
+        eta_out_new = torch.where(hub_out_mask, eta_out, eta_out_new)
 
     # ------------------------------------------------------------------
     # Pass 2: accumulate col sums using updated (theta_out_new, eta_out_new)
@@ -1225,6 +1261,7 @@ def solve_fixed_point_decm(
     bisection_kick_device: str = "cpu",
     diag_callback: Callable[[int, int, float], None] | None = None,
     diag_every: int = 1,
+    diag_state_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     streak_fix_threshold: int = 0,
     streak_fix_n_bisect: int = 60,
     streak_fix_n_sweeps: int = 5,
@@ -1518,9 +1555,17 @@ def solve_fixed_point_decm(
                         ``F_current``/``_v_targets`` from the real loop, at
                         the cost of one extra ``argmax`` per sampled
                         iteration.
-        diag_every:     Call ``diag_callback`` every this many iterations
-                        (default 1 = every iteration). Irrelevant if
-                        ``diag_callback`` is ``None``.
+        diag_every:     Call ``diag_callback`` (and ``diag_state_callback``)
+                        every this many iterations (default 1 = every
+                        iteration). Irrelevant if both are ``None``.
+        diag_state_callback: Read-only diagnostic hook, ``None`` by default
+                        (no behaviour change when omitted). If given, called
+                        as ``diag_state_callback(n_iter, theta, F_current)``
+                        right next to ``diag_callback``, with the iterate
+                        being evaluated this iteration and its full residual
+                        (the exact state whose max relative residual is the
+                        MRE logged for ``n_iter``). Do NOT mutate the
+                        tensors; clone them if you keep them.
         streak_fix_threshold: PROTOTYPE, experimental (2026-09-11,
                         corrected 2026-09-14) -- ``0`` (default) disables
                         entirely, zero behaviour change. If positive,
@@ -1679,21 +1724,23 @@ def solve_fixed_point_decm(
     # Step function with bound arguments
     if mult is not None:
         if effective_chunk > 0:
-            def _step(th):
+            def _step(th, hub_out_mask=None):
                 return _decm_step_chunked_weighted(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     effective_chunk, max_step, mult,
+                    hub_out_mask=hub_out_mask,
                 )
         else:
-            def _step(th):
+            def _step(th, hub_out_mask=None):
                 return _decm_step_dense_weighted(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     max_step, mult,
+                    hub_out_mask=hub_out_mask,
                 )
     elif _use_numba and variant == "theta-newton":
-        def _step(th):
+        def _step(th, hub_out_mask=None):  # mask unused: numba path keeps the old hub behaviour
             to_ = th[:N].numpy()
             ti_ = th[N:2*N].numpy()
             eo_ = th[2*N:3*N].numpy()
@@ -1717,18 +1764,20 @@ def solve_fixed_point_decm(
     if mult is not None:
         pass  # _step already bound to _decm_step_dense_weighted above
     elif effective_chunk > 0:
-        def _step(th):
+        def _step(th, hub_out_mask=None):
             return _decm_step_chunked(
                 th, k_out, k_in, s_out, s_in,
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                 effective_chunk, max_step,
+                hub_out_mask=hub_out_mask,
             )
     else:
-        def _step(th):
+        def _step(th, hub_out_mask=None):
             return _decm_step_dense(
                 th, k_out, k_in, s_out, s_in,
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                 max_step,
+                hub_out_mask=hub_out_mask,
             )
 
     # Anderson mixing needs per-component weights in the degeneracy-reduced
@@ -1980,7 +2029,7 @@ def solve_fixed_point_decm(
         _step_raw = _step
 
         def _step(th, _step_raw=_step_raw):
-            theta_new, F_current = _step_raw(th)
+            theta_new, F_current = _step_raw(th, hub_out_mask=_hub_out_mask)
             theta_new = torch.cat([
                 theta_new[: 2 * N],
                 torch.where(_hub_eta_mask, th[2 * N :], theta_new[2 * N :]),
@@ -2151,6 +2200,8 @@ def solve_fixed_point_decm(
 
             if diag_callback is not None and n_iter % diag_every == 0:
                 diag_callback(n_iter, _argmax_idx, res_norm)
+            if diag_state_callback is not None and n_iter % diag_every == 0:
+                diag_state_callback(n_iter, theta, F_current)
 
             if streak_fix_threshold > 0:
                 if _argmax_idx == _streak_id:
@@ -2611,6 +2662,7 @@ def solve_fixed_point_decm_degenerate(
     bisection_kick_device: str = "cpu",
     diag_callback: Callable[[int, int, float], None] | None = None,
     diag_every: int = 1,
+    diag_state_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     streak_fix_threshold: int = 0,
     streak_fix_n_bisect: int = 60,
     streak_fix_n_sweeps: int = 5,
@@ -2773,6 +2825,7 @@ def solve_fixed_point_decm_degenerate(
         bisection_kick_device=bisection_kick_device,
         diag_callback=diag_callback,
         diag_every=diag_every,
+        diag_state_callback=diag_state_callback,
         streak_fix_threshold=streak_fix_threshold,
         streak_fix_n_bisect=streak_fix_n_bisect,
         streak_fix_n_sweeps=streak_fix_n_sweeps,

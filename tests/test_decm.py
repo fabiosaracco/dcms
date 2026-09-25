@@ -850,3 +850,141 @@ class TestResumeKeepsNegativeHubEta:
         # the solver must see the floored value, not the negative one
         assert self._iter0_mre(model, theta_bad) == pytest.approx(
             self._iter0_mre(model, floored), rel=1e-9)
+
+
+class TestMinPairZ:
+    """The Anderson feasibility guard must use the smallest pair sum that EXISTS, not min(eta_out)+min(eta_in): the diagonal
+    pair (i, i) does not exist for a single-node group (relaxed hub with negative eta on both sides, q4 group 1403)."""
+
+    def test_plain_sum_when_argmins_differ(self) -> None:
+        from dcms.solvers.fixed_point_decm import _min_pair_z
+        eo = torch.tensor([0.5, 0.2, 1.0], dtype=torch.float64)
+        ei = torch.tensor([0.9, 0.4, 0.1], dtype=torch.float64)
+        assert _min_pair_z(eo, ei) == pytest.approx(0.2 + 0.1)
+
+    def test_coinciding_argmins_on_single_node_group_use_next_pair(self) -> None:
+        from dcms.solvers.fixed_point_decm import _min_pair_z
+        eo = torch.tensor([-1e-5, 0.3, 0.5], dtype=torch.float64)      # group 0: relaxed on both sides
+        ei = torch.tensor([-1.5e-3, 1.6e-4, 0.7], dtype=torch.float64)
+        mult = torch.ones(3, dtype=torch.float64)
+        # plain min+min = -1.51e-3 (the old guard would reject); real binding pairs: (0,1) = -1e-5+1.6e-4, (1,0) = 0.3-1.5e-3
+        assert _min_pair_z(eo, ei, mult) == pytest.approx(-1e-5 + 1.6e-4)
+        assert _min_pair_z(eo, ei, mult) > 1e-8
+
+    def test_multi_node_group_keeps_its_diagonal_pair(self) -> None:
+        from dcms.solvers.fixed_point_decm import _min_pair_z
+        eo = torch.tensor([0.05, 0.3], dtype=torch.float64)
+        ei = torch.tensor([0.02, 0.4], dtype=torch.float64)
+        assert _min_pair_z(eo, ei, torch.tensor([3.0, 1.0], dtype=torch.float64)) == pytest.approx(0.07)   # (i, i') exists
+
+    def test_all_positive_matches_old_rule(self) -> None:
+        from dcms.solvers.fixed_point_decm import _min_pair_z
+        g = torch.Generator().manual_seed(0)
+        eo = torch.rand(20, generator=g, dtype=torch.float64) + 0.1
+        ei = torch.rand(20, generator=g, dtype=torch.float64) + 0.1
+        mult = torch.full((20,), 2.0, dtype=torch.float64)
+        assert _min_pair_z(eo, ei, mult) == pytest.approx(float(eo.min() + ei.min()))
+
+
+class TestTargetedFixNegativeEta:
+    """A node 'unreachable' with eta >= 0 must be solved at its (negative) exact eta by the targeted fix, not clamped at
+    _ETA_MIN (which left s ~14% off after every streak-fix on q4's relaxed hub 1403)."""
+
+    def _prob(self):
+        theta, k_out, k_in, s_out, s_in, mult, M = _group_problem()
+        return theta, k_out, k_in, s_out, s_in, mult, M
+
+    def test_unreachable_target_goes_negative_and_is_exact(self) -> None:
+        from dcms.solvers.fixed_point_decm import _targeted_bisection_fix
+        theta, k_out, k_in, s_out, s_in, mult, M = self._prob()
+        s_big = s_out.clone()
+        s_big[0] = s_big[0] * 3.0                       # far above what any eta >= 0 can deliver
+        fixed = _targeted_bisection_fix(theta, k_out, k_in, s_big, s_in, mult, torch.tensor([0]), "out", n_sweeps=60, n_bisect=80)
+        eta0 = float(fixed[2 * M])
+        assert eta0 < 0.0
+        assert eta0 + float(theta[3 * M:].min()) > 0.0   # every pair sum stays positive
+        # s_out[0] is met exactly, k_out[0] too
+        z = lambda x: x == 0
+        F = _decm_step_dense_weighted(fixed, k_out, k_in, s_big, s_in, z(k_out), z(k_in), z(s_big), z(s_in), 0.5, mult)[1]
+        assert abs(float(F[2 * M])) / float(s_big[0]) < 1e-8
+        assert abs(float(F[0])) / float(k_out[0]) < 1e-8
+
+    def test_reachable_target_is_unchanged_positive(self) -> None:
+        from dcms.solvers.fixed_point_decm import _targeted_bisection_fix
+        theta, k_out, k_in, s_out, s_in, mult, M = self._prob()
+        fixed = _targeted_bisection_fix(theta, k_out, k_in, s_out, s_in, mult, torch.tensor([0]), "out", n_sweeps=8, n_bisect=80)
+        assert float(fixed[2 * M]) > 0.0
+
+
+class TestAdaptiveHubSweeps:
+    def test_default_and_adaptive_both_converge(self) -> None:
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        for sweeps in (3, 50):
+            res = solve_fixed_point_decm_degenerate(
+                theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+                tol=1e-8, max_iter=4000, hub_sk_threshold=0.25, hub_bisect_max_sweeps=sweeps,
+            )
+            assert res.converged, (sweeps, res.message)
+            assert model.max_relative_error(res.best_theta) < CONV_TOL
+
+
+class TestProjectPairFloor:
+    """Every existing pair sum eta_out_i + eta_in_j must be >= floor; a feasible input is untouched, hub-owned eta are never
+    modified, and the diagonal pair only exists for groups with more than one node."""
+
+    F = 1e-8
+
+    def _t(self, x):
+        return torch.tensor(x, dtype=torch.float64)
+
+    def test_feasible_input_is_returned_unchanged(self) -> None:
+        from dcms.solvers.fixed_point_decm import _project_pair_floor
+        eo, ei = self._t([0.5, 0.2, 1.0]), self._t([0.9, 0.4, 0.1])
+        no, ni = _project_pair_floor(eo, ei, self._t([1.0, 1.0, 1.0]), self.F)
+        assert torch.equal(no, eo) and torch.equal(ni, ei)
+
+    def test_negative_eta_with_feasible_pairs_is_untouched(self) -> None:
+        # relaxed hub on both sides (single-node group 0): the pair (0, 0) does not exist
+        from dcms.solvers.fixed_point_decm import _project_pair_floor
+        eo, ei = self._t([-1e-5, 0.3, 0.5]), self._t([-1.5e-3, 1.6e-4, 0.7])
+        no, ni = _project_pair_floor(eo, ei, self._t([1.0, 1.0, 1.0]), self.F)
+        assert torch.equal(no, eo) and torch.equal(ni, ei)
+
+    def test_violating_pair_is_repaired_to_the_floor(self) -> None:
+        from dcms.solvers.fixed_point_decm import _project_pair_floor, _min_pair_z
+        eo, ei = self._t([0.01, 0.4, 0.5]), self._t([0.6, -0.3, 0.2])       # pair (0, 1): 0.01 - 0.3 < 0
+        mult = self._t([1.0, 1.0, 1.0])
+        no, ni = _project_pair_floor(eo, ei, mult, self.F)
+        assert _min_pair_z(no, ni, mult) >= self.F - 1e-15
+        assert float(no[0]) == pytest.approx(0.3 + self.F)                  # raised only as much as needed
+        assert torch.equal(ni, ei)
+
+    def test_frozen_entries_are_never_modified(self) -> None:
+        from dcms.solvers.fixed_point_decm import _project_pair_floor
+        eo, ei = self._t([0.01, 0.4, 0.5]), self._t([0.6, -0.3, 0.2])
+        frozen = torch.tensor([True, False, False])
+        no, _ = _project_pair_floor(eo, ei, self._t([1.0, 1.0, 1.0]), self.F, frozen_out=frozen)
+        assert float(no[0]) == 0.01
+
+    def test_multi_node_group_keeps_its_diagonal_pair(self) -> None:
+        from dcms.solvers.fixed_point_decm import _project_pair_floor
+        eo, ei = self._t([0.05, 0.3]), self._t([-0.2, 0.4])                 # group 0 has 3 nodes: (i, i') exists -> violated
+        no, _ = _project_pair_floor(eo, ei, self._t([3.0, 1.0]), self.F)
+        assert float(no[0]) == pytest.approx(0.2 + self.F)
+
+
+class TestTheta0PairFloor:
+    def test_violating_theta0_is_repaired_before_the_first_step(self) -> None:
+        from dcms.solvers.fixed_point_decm import _min_pair_z
+        model, theta_true = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        N = model.N
+        theta0 = torch.as_tensor(theta_true, dtype=torch.float64).clone()
+        theta0[3 * N + 0] = -5.0                     # eta_in of node 0 far below every eta_out: pair sums < 0
+        assert _min_pair_z(theta0[2 * N:3 * N], theta0[3 * N:], None) < 0.0
+        res = solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-15, max_iter=1,
+        )
+        th = torch.as_tensor(res.theta, dtype=torch.float64)
+        assert bool(torch.isfinite(th).all())
+        assert _min_pair_z(th[2 * N:3 * N], th[3 * N:], None) >= 1e-8 - 1e-15

@@ -41,6 +41,7 @@ import datetime
 import math
 import sys
 import time
+import warnings
 from typing import Callable
 
 import torch
@@ -57,7 +58,7 @@ _ANDERSON_MAX_NORM: float = 1e6
 _ANDERSON_BLOWUP_FACTOR: float = 50.0
 _Q_MAX: float = 0.9999
 
-_Z_G_CLAMP: float = 1e-8
+_Z_G_CLAMP: float = 1e-6      # project-wide default (2026-09-25): solver, model residual, targeted fix and bisection kick all use it
 _Z_NEWTON_FLOOR: float = _Z_G_CLAMP
 _Z_NEWTON_FRAC: float = 0.5
 
@@ -66,6 +67,8 @@ _Z_NEWTON_FRAC: float = 0.5
 # branches) -- see _damp_hub_step. Only ever active for a node already
 # flagged unreachable under the old eta>=0-only rule.
 _G_DAMP_FRAC: float = 0.05
+# Adaptive hub-bisection sweeps: after the first 3, a hub is re-solved only while its eta change exceeds _HUB_SWEEP_TOL * z_min.
+_HUB_SWEEP_TOL: float = 1e-9   # relative to the hub's tightest pair sum z: dG/G ~ d_eta / z
 
 _THETA_MAX: float = 50.0
 _ANDERSON_THETA_FLOOR: float = 0.1
@@ -143,6 +146,72 @@ def _anderson_mixing(
 # -------------------------------------------------------------------------
 # Dense DECM step (for N ≤ _LARGE_N_THRESHOLD)
 # -------------------------------------------------------------------------
+
+def _min_pair_z(
+    eta_out: torch.Tensor, eta_in: torch.Tensor, mult: "torch.Tensor | None" = None
+) -> float:
+    """Smallest pair sum z_ij = eta_out_i + eta_in_j over the pairs that EXIST.
+
+    The model only requires z_ij > 0 pairwise (individual eta may be negative,
+    see the negative-eta relaxation of the hub bisection). ``min(eta_out) +
+    min(eta_in)`` is a valid lower bound only when the two arg-mins are
+    different groups: the diagonal pair (i, i) does not exist for a
+    single-node group (mult <= 1), so when both minima sit on such a group the
+    binding pair is the next-smallest combination. (Using the plain sum made
+    the Anderson feasibility guard reject EVERY mix as soon as one relaxed hub
+    had a negative eta on both sides -- q4 group 1403, 2026-09-25.)
+    """
+    n = eta_out.shape[0]
+    if n == 1:
+        return float("inf") if (mult is None or float(mult[0]) <= 1) else float((eta_out + eta_in)[0])
+    vo, io = torch.topk(eta_out, 2, largest=False)
+    vi, ii = torch.topk(eta_in, 2, largest=False)
+    z = float(vo[0] + vi[0])
+    if int(io[0]) == int(ii[0]) and (mult is None or float(mult[int(io[0])]) <= 1):
+        z = min(float(vo[0] + vi[1]), float(vo[1] + vi[0]))
+    return z
+
+
+def _partner_min_excl_self(other: torch.Tensor, mult: "torch.Tensor | None") -> torch.Tensor:
+    """For every index i: smallest entry of ``other`` over the partners of i. The own position (i, i) is a real pair only
+    when the group has more than one node (mult > 1), otherwise it is excluded."""
+    n = other.shape[0]
+    if n == 1:
+        own = other.clone()
+        return own if (mult is not None and float(mult[0]) > 1) else torch.full_like(other, float("inf"))
+    v, ix = torch.topk(other, 2, largest=False)
+    out = torch.where(torch.arange(n, device=other.device) == ix[0], v[1].expand(n), v[0].expand(n))
+    if mult is not None:
+        out = torch.where(mult > 1, torch.minimum(out, other), out)
+    return out
+
+
+def _project_pair_floor(
+    eta_out: torch.Tensor,
+    eta_in: torch.Tensor,
+    mult: "torch.Tensor | None",
+    floor: float,
+    frozen_out: "torch.Tensor | None" = None,
+    frozen_in: "torch.Tensor | None" = None,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Raise eta so that every existing pair sum z_ij = eta_out_i + eta_in_j is >= ``floor``.
+
+    The model only requires z_ij > 0 pairwise (individual eta may be negative). Instead of letting the equations silently
+    clamp a violating pair to the floor (which evaluates it with a huge weight G ~ 1/floor), the offending eta is moved to
+    the smallest feasible value: eta_out_i >= floor - min_j eta_in_j, then eta_in_j >= floor - min_i eta_out_i (with the
+    already-raised eta_out), which makes every pair feasible. Entries flagged in ``frozen_*`` (hub-owned eta, which have
+    their own feasible bracket in the hub bisection) are never modified. A feasible input is returned unchanged.
+    """
+    need_out = floor - _partner_min_excl_self(eta_in, mult)
+    new_out = torch.maximum(eta_out, need_out)
+    if frozen_out is not None:
+        new_out = torch.where(frozen_out, eta_out, new_out)
+    need_in = floor - _partner_min_excl_self(new_out, mult)
+    new_in = torch.maximum(eta_in, need_in)
+    if frozen_in is not None:
+        new_in = torch.where(frozen_in, eta_in, new_in)
+    return new_out, new_in
+
 
 def _decm_step_dense(
     theta: torch.Tensor,
@@ -1243,8 +1312,9 @@ def solve_fixed_point_decm(
     monitor: bool = False,
     topo_weig: bool = False,
     hub_sk_threshold: float = 0.0,
+    hub_bisect_max_sweeps: int = 3,
     backtracking_gamma: float = 0.0,
-    z_clamp: float = 1e-8,
+    z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
     init_best_theta: torch.Tensor | None = None,
@@ -1312,6 +1382,11 @@ def solve_fixed_point_decm(
                         If ``False`` (default), it prints a single global
                         ``MRE`` (the same ℓ∞ relative residual used for the
                         ``tol`` check) instead.
+        hub_bisect_max_sweeps: Maximum Gauss-Seidel sweeps (out-hubs then in-hubs) of the per-iteration hub bisection. The first 3 sweeps
+                        always run (default 3 = previous behaviour); further sweeps run only while the largest hub-eta change of the
+                        last sweep exceeds 1e-13. Raise (e.g. 50) when a relaxed (negative-eta) hub sits next to a tight partner
+                        (z = eta_out + eta_in ~ 1e-4): the alternation then converges very slowly and the hub's equations stay off by
+                        ~1e-4 for hundreds of iterations (q4 group 1403).
         hub_sk_threshold: When > 0, nodes whose observed strength-to-degree
                         ratio ``s_i / k_hat_i`` exceeds this value are treated
                         as *hub nodes* and solved exactly each iteration via 1D
@@ -1345,16 +1420,16 @@ def solve_fixed_point_decm(
                         independent module constants was tried and made
                         things *worse*, not better, so both roles are kept
                         tied to a single value here by design). Default
-                        1e-8 (the long-standing value, originally tuned for
-                        a different solver's z->0 deadlock and reused here
-                        without re-derivation) leaves existing behaviour
-                        unchanged. Raising it (e.g. to 1e-6) resolved a
-                        real stagnation on a hub-heavy N=28156 network
-                        (ita_election_dico3) that would not converge at the
-                        default; there is currently no general rule for
-                        picking a value beyond "try raising it if the
-                        solver stagnates on a network with extreme s/k
-                        hubs" -- see the DECM z-clamp investigation notes
+                        1e-6 since 2026-09-25 (the value that resolved a
+                        real stagnation on the hub-heavy N=28156 network
+                        ita_election_dico3, and the one every production
+                        run has used); the model's residual
+                        (``max_relative_error``), the targeted streak fix
+                        and the bisection kick use the same constant, so
+                        the solver is judged by the equations it solves.
+                        The previous default was 1e-8; there is no general
+                        rule for picking another value -- see the DECM
+                        z-clamp investigation notes
                         for the full experimental history.
         mult:           Internal use by :func:`solve_fixed_point_decm_degenerate`.
                         When provided (shape (M,)), ``k_out``/``k_in``/``s_out``/
@@ -1638,6 +1713,12 @@ def solve_fixed_point_decm(
     if chunk_size < 0:
         raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
 
+    if z_clamp != 1e-6:
+        warnings.warn(
+            f"z_clamp={z_clamp:g} != 1e-6: the model's residual (max_relative_error) clamps the pair sums at 1e-6, so for pairs "
+            f"between the two values the solver's equations differ from the residual it is judged by. Use the default 1e-6.",
+            stacklevel=2,
+        )
     global _Z_G_CLAMP, _Z_NEWTON_FLOOR
     _Z_G_CLAMP = z_clamp
     _Z_NEWTON_FLOOR = z_clamp
@@ -1917,7 +1998,15 @@ def solve_fixed_point_decm(
         # interior nodes alike, for both theta and eta.
         theta_restart = best_theta * torch.exp(noise)
         theta_restart[: 2 * N] = theta_restart[: 2 * N].clamp(-_THETA_MAX, _THETA_MAX)
-        theta_restart[2 * N :] = theta_restart[2 * N :].clamp(_ETA_MIN, _ETA_MAX)
+        _eta_r = theta_restart[2 * N :]
+        theta_restart[2 * N :] = torch.where(
+            _hub_eta_mask, _eta_r.clamp(-_ETA_MAX, _ETA_MAX), _eta_r.clamp(_ETA_MIN, _ETA_MAX)
+        )
+        _ero, _eri = _project_pair_floor(
+            theta_restart[2 * N : 3 * N], theta_restart[3 * N :], mult, _Z_G_CLAMP, _hub_eta_mask[:N], _hub_eta_mask[N:]
+        )
+        theta_restart[2 * N : 3 * N] = _ero
+        theta_restart[3 * N :] = _eri
         if verbose:
             print(
                 f"[perturbed-restart] restart #{restarts} (noise_scale={noise_scale:.1e}) "
@@ -2022,6 +2111,20 @@ def solve_fixed_point_decm(
         if init_best_theta is None:
             best_theta = theta.clone()
 
+    # The pair-sum condition z_ij = eta_out_i + eta_in_j > 0 must hold for the starting point too (theta0 is user input):
+    # raise the offending non-hub eta instead of letting the equations clamp the pair to the floor.
+    _eo0, _ei0 = _project_pair_floor(
+        theta[2 * N : 3 * N], theta[3 * N :], mult, _Z_G_CLAMP, _hub_eta_mask[:N], _hub_eta_mask[N:]
+    )
+    _n_raised = int((_eo0 != theta[2 * N : 3 * N]).sum() + (_ei0 != theta[3 * N :]).sum())
+    if _n_raised:
+        theta[2 * N : 3 * N] = _eo0
+        theta[3 * N :] = _ei0
+        if init_best_theta is None:
+            best_theta = theta.clone()
+        if verbose:
+            print(f"[theta0] {_n_raised} eta raised so that every pair sum eta_out_i + eta_in_j >= {_Z_G_CLAMP:g}.")
+
     if _hub_active and (_hub_out_indices or _hub_in_indices):
         # The raw per-node Newton step (whichever _decm_step_* variant is
         # bound above -- dense/chunked/weighted, all share the same
@@ -2047,6 +2150,17 @@ def solve_fixed_point_decm(
                 torch.where(_hub_eta_mask, th[2 * N :], theta_new[2 * N :]),
             ])
             return theta_new, F_current
+
+    # Every Newton step output must satisfy the pair-sum condition (non-hub eta are raised where needed; hub eta keep the
+    # feasible values given by the hub bisection).
+    _step_unprojected = _step
+
+    def _step(th, _inner=_step_unprojected):
+        theta_new, F_current = _inner(th)
+        _eo, _ei = _project_pair_floor(
+            theta_new[2 * N : 3 * N], theta_new[3 * N :], mult, _Z_G_CLAMP, _hub_eta_mask[:N], _hub_eta_mask[N:]
+        )
+        return torch.cat([theta_new[: 2 * N], _eo, _ei]), F_current
 
     def _damp_hub_step(
         cur_eta: "np.ndarray",
@@ -2115,7 +2229,27 @@ def solve_fixed_point_decm(
         # there; 2-step to avoid the direct MPS->float64 cast failure) and
         # convert the result back to the caller's own device/dtype at the end.
         _th_fp_np = theta_fp.detach().to(device="cpu").to(dtype=torch.float64).numpy()
-        for _sweep in range(3):
+        # Sweeps 1-3 always run over ALL hubs (previous behaviour). Further sweeps (up to hub_bisect_max_sweeps) only re-solve the
+        # hubs whose eta was still moving (> _HUB_SWEEP_TOL) in the previous sweep -- typically a relaxed hub and its tight partner
+        # (z = eta_out + eta_in ~ 1e-4, G ~ 1e4): that pair is hypersensitive and converges slowly under out/in alternation
+        # (q4 group 1403, e1 group 3174), while the ~90 settled hubs need no more work.
+        def _partner_min(eta_other: "np.ndarray", idx: "np.ndarray") -> "np.ndarray":
+            # smallest partner eta of each hub, the hub's own column excluded
+            _o = _np_hub.argsort(eta_other)
+            if eta_other.shape[0] < 2:
+                return _np_hub.zeros(idx.shape)
+            return _np_hub.where(idx == _o[0], eta_other[_o[1]], eta_other[_o[0]])
+
+        def _hub_z(eta_new: "np.ndarray", eta_other: "np.ndarray", idx: "np.ndarray") -> "np.ndarray":
+            # tightest partner pair sum of each hub (the hub's own column excluded), floored like the damping does
+            _o = _np_hub.argsort(eta_other)
+            _mo = _np_hub.where(idx == _o[0], eta_other[_o[1]], eta_other[_o[0]]) if eta_other.shape[0] > 1 else _np_hub.zeros(idx.shape)
+            return _np_hub.maximum(eta_new + _mo, _Z_G_CLAMP)
+
+        _hub_eta_pos = _np_hub.concatenate([2 * N + _hub_out_idx_arr, 3 * N + _hub_in_idx_arr])
+        _xs: list = []
+        for _sweep in range(max(3, hub_bisect_max_sweeps)):
+            _x_prev = _th_fp_np[_hub_eta_pos].copy()
             if _hub_out_indices:
                 _target_eta_out = _bisect_hub_eta_decm_batch(
                     hub_indices=_hub_out_indices,
@@ -2144,6 +2278,35 @@ def solve_fixed_point_decm(
                     _cur_eta_in, _target_eta_in, _th_fp_np[2 * N:3 * N], _hub_in_idx_arr
                 )
                 _th_fp_np[3 * N + _hub_in_idx_arr] = _new_eta_in
+            if _sweep < 2:
+                continue
+            # Sweeps 1-3 are the previous behaviour. Beyond that (hub_bisect_max_sweeps > 3) the out/in alternation of a
+            # relaxed hub with a tight partner (z ~ 1e-4, G ~ 1e4) contracts by only ~0.985 per sweep (q4 group 1403, e1
+            # group 3174): plain sweeping would need ~700 sweeps. Stop when every hub moved by < _HUB_SWEEP_TOL * z, and
+            # otherwise extrapolate the fixed point of the sweep map (vector Aitken, order 1) every 3rd sweep.
+            _x_now = _th_fp_np[_hub_eta_pos].copy()
+            _zt = _np_hub.concatenate([
+                _hub_z(_x_now[:_hub_out_idx_arr.size], _th_fp_np[3 * N:], _hub_out_idx_arr),
+                _hub_z(_x_now[_hub_out_idx_arr.size:], _th_fp_np[2 * N:3 * N], _hub_in_idx_arr),
+            ])
+            _rel_chg = float((_np_hub.abs(_x_now - _x_prev) / _zt).max())
+            if _rel_chg < _HUB_SWEEP_TOL:
+                break
+            _xs = (_xs + [_x_now])[-3:]
+            if len(_xs) == 3:
+                _d1, _d2 = _xs[1] - _xs[0], _xs[2] - _xs[1]
+                _n1 = float(_d1 @ _d1)
+                _rho = float(_d2 @ _d1) / _n1 if _n1 > 0.0 else 0.0
+                if _rho > 0.3:
+                    _rho = min(_rho, 0.999)
+                    _xe = _xs[2] + (_rho / (1.0 - _rho)) * _d2
+                    _eo, _ei = _th_fp_np[3 * N:], _th_fp_np[2 * N:3 * N]
+                    _floor = _np_hub.concatenate([
+                        _Z_G_CLAMP - (_zt[:_hub_out_idx_arr.size] * 0 + _partner_min(_eo, _hub_out_idx_arr)),
+                        _Z_G_CLAMP - (_zt[_hub_out_idx_arr.size:] * 0 + _partner_min(_ei, _hub_in_idx_arr)),
+                    ]).clip(min=-_ETA_MAX)
+                    _th_fp_np[_hub_eta_pos] = _np_hub.clip(_xe, _floor, _ETA_MAX)
+                _xs = []
         # See _bisection_kick's _to_dev_dtype for why the order must depend
         # on the target device (float64 can never touch MPS, even
         # transiently) -- here the source is always CPU/float64 (from the
@@ -2216,10 +2379,16 @@ def solve_fixed_point_decm(
                 diag_state_callback(n_iter, theta, F_current)
 
             if streak_fix_threshold > 0:
-                if _argmax_idx == _streak_id:
+                # Key the streak on (node, side), not on the single equation:
+                # a node's k and s equations on one side share the same
+                # (theta, eta) pair and typically alternate as the argmax
+                # (q4 plateau: k_in/s_in of one group, longest same-equation
+                # streak = 1, so the fix never fired).
+                _streak_key = (_argmax_idx % N) + N * ((_argmax_idx // N) % 2)
+                if _streak_key == _streak_id:
                     _streak_len += 1
                 else:
-                    _streak_id = _argmax_idx
+                    _streak_id = _streak_key
                     _streak_len = 1
 
             # --- Backtracking line search (PyTorch path only) ---
@@ -2554,7 +2723,7 @@ def solve_fixed_point_decm(
                         # Feasibility guard: if min(η_out) + min(η_in) < floor → reject mix
                         eta_out_mix = theta_next[2 * N : 3 * N]
                         eta_in_mix = theta_next[3 * N :]
-                        z_min_and = (eta_out_mix.min() + eta_in_mix.min()).item()
+                        z_min_and = _min_pair_z(eta_out_mix, eta_in_mix, mult)
                         if z_min_and < _Z_NEWTON_FLOOR:
                             theta_next = theta_fp
                             _and_g.clear()
@@ -2578,8 +2747,8 @@ def solve_fixed_point_decm(
 
             if streak_fix_threshold > 0 and _streak_len >= streak_fix_threshold:
                 _fix_group = torch.tensor([_streak_id % N], dtype=torch.long)
-                _fix_block_idx = _streak_id // N
-                _fix_block = ["k_out", "k_in", "s_out", "s_in"][_fix_block_idx]
+                _fix_side_idx = _streak_id // N          # 0 = out side, 1 = in side
+                _fix_block = "out-side" if _fix_side_idx == 0 else "in-side"
                 # A node's own theta_out/eta_out appear ONLY in its own
                 # k_out/s_out equations, and theta_in/eta_in ONLY in
                 # k_in/s_in -- no equation couples both sides of the same
@@ -2587,7 +2756,7 @@ def solve_fixed_point_decm(
                 # (2026-09-14 correction: fixing both sides unconditionally
                 # was the likely cause of the post-fix blowup cascade
                 # documented in decm_low_degree_precision_floor memory).
-                _fix_side = "out" if _fix_block_idx in (0, 2) else "in"
+                _fix_side = "out" if _fix_side_idx == 0 else "in"
                 if verbose:
                     print(
                         f"[streak-fix] group {_fix_group.item()} ({_fix_block}) monopolized "
@@ -2659,7 +2828,8 @@ def solve_fixed_point_decm_degenerate(
     topo_weig: bool = False,
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
-    z_clamp: float = 1e-8,
+    hub_bisect_max_sweeps: int = 3,
+    z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
     blowup_factor: float | None = None,
@@ -2822,6 +2992,7 @@ def solve_fixed_point_decm_degenerate(
         mult=mult,
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
+        hub_bisect_max_sweeps=hub_bisect_max_sweeps,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,
@@ -3297,7 +3468,7 @@ def _bisection_kick(
     zero_s_in = s_in_d == 0
     v_targets = torch.cat([k_out_d, k_in_d, s_out_d, s_in_d])
     v_nonzero = v_targets > 0
-    z_clamp = 1e-8 if kick_dtype == torch.float64 else 1e-6
+    z_clamp = _Z_G_CLAMP
     v_safe = v_targets.clamp(min=1e-30 if kick_dtype == torch.float32 else 1e-300)
 
     # Fully self-contained bisection-stage closures, EVERY tensor creation
@@ -3553,10 +3724,10 @@ def _targeted_bisection_fix(
     eta_out = theta[2 * M : 3 * M].clone()
     eta_in = theta[3 * M :].clone()
 
-    z_clamp = 1e-8
+    z_clamp = _Z_G_CLAMP     # same clamp as the rest of the solver (was a hard-coded 1e-8)
 
-    def _bisect(cand_lo: float, cand_hi: float, f: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
-        lo = torch.full((K,), cand_lo, dtype=torch.float64)
+    def _bisect(cand_lo: "float | torch.Tensor", cand_hi: float, f: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+        lo = cand_lo.clone() if torch.is_tensor(cand_lo) else torch.full((K,), cand_lo, dtype=torch.float64)
         hi = torch.full((K,), cand_hi, dtype=torch.float64)
         for _ in range(n_bisect):
             mid = 0.5 * (lo + hi)
@@ -3564,6 +3735,26 @@ def _targeted_bisection_fix(
             lo = torch.where(go_lo, mid, lo)
             hi = torch.where(go_lo, hi, mid)
         return 0.5 * (lo + hi)
+
+    def _partner_min(vec: torch.Tensor) -> torch.Tensor:
+        """Smallest partner eta of each target: the other side's eta over all partners, the target's own column only
+        counted when its group has more than one node (the diagonal pair (i, i) does not exist for mult <= 1)."""
+        if M < 2:
+            return torch.full((K,), float("inf"), dtype=torch.float64)
+        v, ix = torch.topk(vec, 2, largest=False)
+        om = torch.where(target_idx == ix[0], v[1].expand(K), v[0].expand(K))
+        if mult is not None:
+            om = torch.where(mult[target_idx] > 1, torch.minimum(om, vec[target_idx]), om)
+        return om
+
+    def _eta_lo(f: Callable[[torch.Tensor], torch.Tensor], other_min: torch.Tensor) -> torch.Tensor:
+        """Lower bracket for eta. Only the pair sum z = eta + eta_partner must stay > 0, NOT eta >= 0: a node that is
+        'unreachable' with eta >= 0 (s_model(_ETA_MIN) <= s_target) may go negative, down to the tightest partner's floor
+        (same rule as the per-iteration hub bisection). Clamping such a node at _ETA_MIN instead left its s equation
+        ~14% off after every streak-fix (q4 group 1403, 2026-09-25). Reachable nodes keep the old bracket."""
+        base = torch.full((K,), _ETA_MIN, dtype=torch.float64)
+        neg = (z_clamp - other_min).clamp(min=-_ETA_MAX)
+        return torch.where((f(base) <= 0.0) & (neg < _ETA_MIN), neg, base)
 
     for _ in range(n_sweeps):
         if side == "out":
@@ -3606,7 +3797,7 @@ def _targeted_bisection_fix(
             eta_out[target_idx] = torch.where(
                 s_out[target_idx] == 0,
                 torch.full((K,), _ETA_MAX, dtype=torch.float64),
-                _bisect(_ETA_MIN, _ETA_MAX, f_eta_out),
+                _bisect(_eta_lo(f_eta_out, _partner_min(eta_in)), _ETA_MAX, f_eta_out),
             )
 
         else:  # side == "in"
@@ -3649,7 +3840,7 @@ def _targeted_bisection_fix(
             eta_in[target_idx] = torch.where(
                 s_in[target_idx] == 0,
                 torch.full((K,), _ETA_MAX, dtype=torch.float64),
-                _bisect(_ETA_MIN, _ETA_MAX, f_eta_in),
+                _bisect(_eta_lo(f_eta_in, _partner_min(eta_out)), _ETA_MAX, f_eta_in),
             )
 
     return torch.cat([theta_out, theta_in, eta_out, eta_in])

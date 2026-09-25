@@ -56,7 +56,7 @@ _THETA_MAX: float = 50.0
 _Q_MAX: float = 0.9999
 
 # Minimum η = θ_β_out + θ_β_in used in G = −1/expm1(−η).
-_Z_G_CLAMP: float = 1e-8
+_Z_G_CLAMP: float = 1e-6
 
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
@@ -603,7 +603,7 @@ class DECMModel:
         topo_weig: bool = False,
         hub_sk_threshold: float = 0.0,
         backtracking_gamma: float = 0.0,
-        z_clamp: float = 1e-8,
+        z_clamp: float = 1e-6,
         reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
         patience: int = 750,
@@ -685,10 +685,10 @@ class DECMModel:
                            per-step trust-region floor (both roles must
                            stay coupled -- decoupling them was tested and
                            made things worse, reintroducing an
-                           unrecoverable plateau). Default 1e-8 (original
-                           value, unchanged behavior). Raise it (e.g. to
-                           1e-6) if the solver stagnates on a network with
-                           extreme s/k hub nodes -- see
+                           unrecoverable plateau). Default 1e-6 (project-wide
+                           since 2026-09-25, shared with the residual
+                           ``max_relative_error``; it was 1e-8 before and
+                           1e-6 was what production runs passed) -- see
                            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
                            ``z_clamp`` docs for the full mechanism and
                            trade-off.

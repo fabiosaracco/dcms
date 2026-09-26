@@ -988,3 +988,76 @@ class TestTheta0PairFloor:
         th = torch.as_tensor(res.theta, dtype=torch.float64)
         assert bool(torch.isfinite(th).all())
         assert _min_pair_z(th[2 * N:3 * N], th[3 * N:], None) >= 1e-8 - 1e-15
+
+
+class TestPatienceRelTol:
+    """patience_rel_tol > 0 makes a creeping record (tiny improvements) count as a stall; the default 0 is the old criterion."""
+
+    def _run(self, capsys, **kw):
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-30, max_iter=30, patience=4, verbose=True, **kw,
+        )
+        out = capsys.readouterr().out
+        return out.count("[patience]")
+
+    def test_default_is_unchanged(self, capsys) -> None:
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        a = solve_fixed_point_decm_degenerate(theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-12, max_iter=200)
+        b = solve_fixed_point_decm_degenerate(theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-12, max_iter=200,
+                                              patience_rel_tol=0.0)
+        assert np.array_equal(a.theta, b.theta) and a.iterations == b.iterations
+
+    def test_large_rel_tol_makes_stalls_visible(self, capsys) -> None:
+        n_strict = self._run(capsys, patience_rel_tol=0.0)
+        n_rel = self._run(capsys, patience_rel_tol=0.999999)      # a record must improve ~1e6x to count: stalls every window
+        assert n_rel >= 2
+        assert n_rel > n_strict
+
+    def test_best_theta_still_tracks_every_improvement(self) -> None:
+        # even when stalls (and perturbed restarts) fire constantly, best_theta must stay the true minimum of the run
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        res = solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-30, max_iter=60, patience=4, patience_rel_tol=0.5,
+        )
+        assert res.best_mre == pytest.approx(min(res.residuals))
+        assert model.max_relative_error(res.best_theta) == pytest.approx(res.best_mre, rel=1e-6)
+
+
+class TestTargetedFixSaturatedPair:
+    """For a node with large eta (weights almost all 1: s ~ k) p_ij depends on phi = theta + eta only. Solving eta at fixed theta moves
+    phi and breaks the k equation, so the alternation never converges (q5 group 832: k stayed off by 3.7e-4 for 60 sweeps). Solving eta
+    at fixed phi converges geometrically."""
+
+    def _saturated_problem(self):
+        M = 10
+        rng = np.random.default_rng(11)
+        th_o, th_i = rng.uniform(-6.0, -1.0, M), rng.uniform(-1.0, 3.0, M)
+        et_o, et_i = rng.uniform(0.3, 1.5, M), rng.uniform(0.3, 1.5, M)
+        th_o[0], et_o[0] = -9.0, 7.0                     # node 0: large eta_out, theta_out very negative => p_0j ~ 1 for many j
+        eta = et_o[:, None] + et_i[None, :]
+        P = 1.0 / (1.0 + np.exp(th_o[:, None] + th_i[None, :] + np.log(np.expm1(eta))))
+        W = P / (1.0 - np.exp(-eta))
+        mult = np.ones(M)
+        d = lambda A: np.diagonal(A)
+        k_out = (P * mult[None, :]).sum(1) - d(P); k_in = (P * mult[:, None]).sum(0) - d(P)
+        s_out = (W * mult[None, :]).sum(1) - d(W); s_in = (W * mult[:, None]).sum(0) - d(W)
+        t = lambda a: torch.tensor(a, dtype=torch.float64)
+        theta_true = np.concatenate([th_o, th_i, et_o, et_i])
+        return t(theta_true), t(k_out), t(k_in), t(s_out), t(s_in), t(mult), M, P
+
+    def test_pair_is_solved_exactly_from_a_perturbed_start(self) -> None:
+        from dcms.solvers.fixed_point_decm import _targeted_bisection_fix
+        theta_true, k_out, k_in, s_out, s_in, mult, M, P = self._saturated_problem()
+        assert float(P[0].sum()) > 0.3 * float(k_out[0]) and float(k_out[0]) > 1.0        # node 0 really is in the saturated regime
+        theta = theta_true.clone()
+        theta[0] += 0.4; theta[2 * M] -= 0.25                                              # perturb theta_out and eta_out of node 0
+        fixed = _targeted_bisection_fix(theta, k_out, k_in, s_out, s_in, mult, torch.tensor([0]), "out", n_sweeps=40, n_bisect=80)
+        z = lambda x: x == 0
+        F = _decm_step_dense_weighted(fixed, k_out, k_in, s_out, s_in, z(k_out), z(k_in), z(s_out), z(s_in), 0.5, mult)[1]
+        assert abs(float(F[0])) / float(k_out[0]) < 1e-8          # k_out(0)
+        assert abs(float(F[2 * M])) / float(s_out[0]) < 1e-8      # s_out(0)

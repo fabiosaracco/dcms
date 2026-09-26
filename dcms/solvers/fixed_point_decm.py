@@ -1313,6 +1313,7 @@ def solve_fixed_point_decm(
     topo_weig: bool = False,
     hub_sk_threshold: float = 0.0,
     hub_bisect_max_sweeps: int = 3,
+    patience_rel_tol: float = 0.0,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
@@ -1382,6 +1383,11 @@ def solve_fixed_point_decm(
                         If ``False`` (default), it prints a single global
                         ``MRE`` (the same ℓ∞ relative residual used for the
                         ``tol`` check) instead.
+        patience_rel_tol: Relative-improvement threshold of the stall criterion (default 0.0 = previous behaviour: ANY strictly smaller MRE
+                        counts as progress and resets the ``patience`` counter). With a value > 0 (e.g. 0.01) only a record that beats the
+                        reference record by more than that fraction resets it, so a plateau whose record keeps creeping down by ~1e-8 per
+                        iteration (q4: 1.90e-4 -> 1.77e-4 over 8000 iterations, zero [patience] events) is recognised as a stall and enters
+                        the recovery ladder (soft reset, then perturbed restart). ``best_theta`` is still updated on every improvement.
         hub_bisect_max_sweeps: Maximum Gauss-Seidel sweeps (out-hubs then in-hubs) of the per-iteration hub bisection. The first 3 sweeps
                         always run (default 3 = previous behaviour); further sweeps run only while the largest hub-eta change of the
                         last sweep exceeds 1e-13. Raise (e.g. 50) when a relaxed (negative-eta) hub sits next to a tight partner
@@ -1923,6 +1929,7 @@ def solve_fixed_point_decm(
     restarts = 0
     stalls_at_cap = 0
     iters_since_improve = 0
+    _stall_ref: float = best_theta_res     # reference record of the stall criterion (see patience_rel_tol)
     # 0/1/2: how far the current stagnation episode has escalated since the
     # last genuine improvement -- 0 = nothing tried yet (do the cheap
     # no-noise soft reset next), 1 = soft reset already tried (do the
@@ -2469,11 +2476,16 @@ def solve_fixed_point_decm(
             if res_norm < best_theta_res:
                 best_theta_res = res_norm
                 best_theta = theta.clone()
-                restarts = 0
-                stalls_at_cap = 0
-                iters_since_improve = 0
                 progressed_since_restart = True
-                _stall_tier = 0
+                if res_norm < _stall_ref * (1.0 - patience_rel_tol):
+                    # A SIGNIFICANT record (beats the reference by more than patience_rel_tol; any improvement when it is 0).
+                    _stall_ref = res_norm
+                    restarts = 0
+                    stalls_at_cap = 0
+                    iters_since_improve = 0
+                    _stall_tier = 0
+                else:
+                    iters_since_improve += 1
             else:
                 iters_since_improve += 1
 
@@ -2502,7 +2514,8 @@ def solve_fixed_point_decm(
                     if verbose:
                         print(
                             f"[patience] stalled {patience} iters with no "
-                            f"improvement -- soft reset (Anderson clear, no "
+                            f"{'improvement' if patience_rel_tol <= 0 else f'>{patience_rel_tol:.3g} relative improvement'}"
+                            f" -- soft reset (Anderson clear, no "
                             f"noise) at iter {n_iter}."
                         )
                     theta_rb, _ = _step(best_theta)
@@ -2829,6 +2842,7 @@ def solve_fixed_point_decm_degenerate(
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
     hub_bisect_max_sweeps: int = 3,
+    patience_rel_tol: float = 0.0,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -2993,6 +3007,7 @@ def solve_fixed_point_decm_degenerate(
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
         hub_bisect_max_sweeps=hub_bisect_max_sweeps,
+        patience_rel_tol=patience_rel_tol,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,
@@ -3779,12 +3794,17 @@ def _targeted_bisection_fix(
             )
 
             # eta_out[target]: target rows vs. ALL columns (updated theta_out, current eta_in).
+            # eta is solved at FIXED phi = theta + eta (theta = phi - eta), not at fixed theta: for large eta p_ij depends on phi
+            # only, so moving eta at fixed theta moves phi and breaks the k equation just solved -- the alternation then never
+            # converges (q5 group 832: k off by 3.7e-4 after 60 sweeps; with phi fixed it converges by ~0.36 per sweep).
+            phi_out = theta_out[target_idx] + eta_out[target_idx]
+
             def f_eta_out(cand: torch.Tensor) -> torch.Tensor:
                 z = cand[:, None] + eta_in[None, :]
                 z_safe = z.clamp(min=z_clamp)
                 G = -1.0 / torch.expm1(-z_safe)
                 log_q2 = -torch.log(torch.expm1(z_safe))
-                logit_p = -theta_out[target_idx][:, None] - theta_in[None, :] + log_q2
+                logit_p = -(phi_out - cand)[:, None] - theta_in[None, :] + log_q2
                 P = torch.sigmoid(logit_p)
                 W = P * G
                 W_self = W[rows, target_idx]
@@ -3794,11 +3814,13 @@ def _targeted_bisection_fix(
                     return W.sum(1) - s_out[target_idx]
                 return (W * mult[None, :]).sum(1) - W_self - s_out[target_idx]
 
-            eta_out[target_idx] = torch.where(
+            _eta_new = torch.where(
                 s_out[target_idx] == 0,
                 torch.full((K,), _ETA_MAX, dtype=torch.float64),
                 _bisect(_eta_lo(f_eta_out, _partner_min(eta_in)), _ETA_MAX, f_eta_out),
             )
+            theta_out[target_idx] = torch.where(s_out[target_idx] == 0, theta_out[target_idx], phi_out - _eta_new)
+            eta_out[target_idx] = _eta_new
 
         else:  # side == "in"
             # theta_in[target]: ALL rows (current, untouched theta_out/eta_out) vs. target columns.
@@ -3821,13 +3843,15 @@ def _targeted_bisection_fix(
                 _bisect(-_THETA_MAX, _THETA_MAX, f_theta_in),
             )
 
-            # eta_in[target]: ALL rows (current theta_out/eta_out, updated theta_in) vs. target columns.
+            # eta_in[target]: ALL rows (current theta_out/eta_out, updated theta_in) vs. target columns (at fixed phi, see the out side).
+            phi_in = theta_in[target_idx] + eta_in[target_idx]
+
             def f_eta_in(cand: torch.Tensor) -> torch.Tensor:
                 z = eta_out[:, None] + cand[None, :]
                 z_safe = z.clamp(min=z_clamp)
                 G = -1.0 / torch.expm1(-z_safe)
                 log_q4 = -torch.log(torch.expm1(z_safe))
-                logit_p = -theta_out[:, None] - theta_in[target_idx][None, :] + log_q4
+                logit_p = -theta_out[:, None] - (phi_in - cand)[None, :] + log_q4
                 P = torch.sigmoid(logit_p)
                 W = P * G
                 W_self = W[target_idx, rows]
@@ -3837,11 +3861,13 @@ def _targeted_bisection_fix(
                     return W.sum(0) - s_in[target_idx]
                 return (W * mult[:, None]).sum(0) - W_self - s_in[target_idx]
 
-            eta_in[target_idx] = torch.where(
+            _eta_new = torch.where(
                 s_in[target_idx] == 0,
                 torch.full((K,), _ETA_MAX, dtype=torch.float64),
                 _bisect(_eta_lo(f_eta_in, _partner_min(eta_out)), _ETA_MAX, f_eta_in),
             )
+            theta_in[target_idx] = torch.where(s_in[target_idx] == 0, theta_in[target_idx], phi_in - _eta_new)
+            eta_in[target_idx] = _eta_new
 
     return torch.cat([theta_out, theta_in, eta_out, eta_in])
 

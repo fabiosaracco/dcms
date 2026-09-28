@@ -1121,3 +1121,38 @@ class TestBlockNewton:
         sca = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)
         assert blk.converged and blk.iterations < 50
         assert not sca.converged and min(sca.residuals) > 1e-3
+
+
+class TestBlowupGuardDepthOne:
+    """anderson_depth=1 (plain Newton) must still be protected by the blowup guard/rollback: it used to live only in the depth > 1 branch,
+    so a depth-1 run could diverge with no [blowup] event at all (e1 blk2: MRE 2.6e-2 -> 0.77)."""
+
+    def _problem(self):
+        theta_true, ko, ki, so, si, mult, zs, M = TestBlockNewton._solution_problem(M=40, eta_lo=4.0, eta_hi=7.0, seed=3, mult_max=1)
+        th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
+        th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
+        return th0, ko, ki, so, si
+
+    @staticmethod
+    def _run(depth, capsys, **kw):
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        th0, ko, ki, so, si = TestBlowupGuardDepthOne._problem(TestBlowupGuardDepthOne)
+        res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=60, anderson_depth=depth, hub_sk_threshold=0.0,
+                                                patience=10**6, blowup_factor=1.05, verbose=True, num_threads=1, **kw)
+        return res, capsys.readouterr().out
+
+    def test_depth_one_has_the_guard(self, capsys) -> None:
+        res, out = self._run(1, capsys)
+        assert "[blowup]" in out and "rolling back" in out
+        assert all(math.isfinite(r) for r in res.residuals)
+
+    def test_depth_three_still_has_the_guard(self, capsys) -> None:
+        res, out = self._run(3, capsys)
+        assert "[blowup]" in out
+
+    def test_depth_one_default_threshold_does_not_fire_on_a_healthy_run(self) -> None:
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        th0, ko, ki, so, si = self._problem()
+        res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=30, anderson_depth=1, hub_sk_threshold=0.0,
+                                                patience=10**6, block_newton_gate=0.05, verbose=False, num_threads=1)
+        assert res.converged and res.iterations < 30          # the guard (default scale-adaptive factor) must not disturb a converging depth-1 run

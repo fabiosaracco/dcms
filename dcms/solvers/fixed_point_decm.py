@@ -1478,7 +1478,7 @@ def solve_fixed_point_decm(
         chunk_size:     If > 0, use chunked computation with this row-chunk
                         size.  If 0, auto-select: dense for
                         N ≤ ``_LARGE_N_THRESHOLD``, chunked otherwise.
-        anderson_depth: Anderson acceleration depth (0 = plain Newton).
+        anderson_depth: Anderson acceleration depth (0 = plain Newton, no blowup guard; 1 = plain Newton WITH the blowup guard / rollback; >= 2 = Anderson mixing + guard).
         max_step:       Maximum |Δ| per node per Newton step.
         max_time:       Wall-clock time limit in seconds (0 = no limit).
         backend:        Compute backend: ``"auto"`` (default), ``"pytorch"``,
@@ -2723,7 +2723,9 @@ def solve_fixed_point_decm(
                 # Already decided by the patience check above -- skip the
                 # normal Anderson/blowup handling for this iteration.
                 theta_next = _patience_restart_theta
-            elif anderson_depth > 1:
+            elif anderson_depth >= 1:
+                # depth 1 = no mixing (the history never reaches 2 entries) but the blowup guard below IS active: it used to live only
+                # in the depth > 1 branch, so a depth-1 run could diverge (e1: MRE 2.6e-2 -> 0.77) with no [blowup] rollback at all.
                 # Blowup guard -- skipped for exactly one iteration right
                 # after a perturbed restart (see `_post_restart_reset`
                 # above): the restart's own residual is deliberately large
@@ -2731,7 +2733,7 @@ def solve_fixed_point_decm(
                 # pre-restart record.
                 _blowup_recovered = False
                 if (
-                    len(_and_g) >= 2
+                    (len(_and_g) >= 2 or anderson_depth == 1)     # depth 1 has no history to wait for
                     and math.isfinite(res_norm)
                     and not _post_restart_reset
                     and res_norm > eff_blowup * _best_res_for_anderson

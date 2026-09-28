@@ -475,6 +475,20 @@ def _block_newton_deltas(
     return torch.where(gated, d_th, delta_theta), torch.where(gated, d_et, delta_eta), gated
 
 
+def _block_exclude(hub_mask, F_k, F_s, k_t, s_t, min_rel):
+    """Rows the joint 2x2 step must NOT touch: hub-owned rows plus rows already below ``min_rel`` in relative residual.
+
+    A nearly saturated row with s == k exactly has its true solution at infinity (residual ~ e^-c along the soft direction theta-c,
+    eta+c), so the joint Newton step would march it towards |theta|, eta ~ 30+ at max_step per iteration long after the row satisfies
+    its equations (e1: theta -31, eta +37, then MRE > 1). Rows already within ``min_rel`` (default 0.1*tol) are left to the scalar step."""
+    ex = hub_mask
+    if min_rel > 0.0:
+        rel = torch.maximum(F_k.abs() / k_t.clamp(min=1e-300), F_s.abs() / s_t.clamp(min=1e-300))
+        small = rel < min_rel
+        ex = small if ex is None else (ex | small)
+    return ex
+
+
 def _decm_step_dense_weighted(
     theta: torch.Tensor,
     k_out: torch.Tensor,
@@ -489,6 +503,7 @@ def _decm_step_dense_weighted(
     mult: torch.Tensor,
     hub_out_mask: "torch.Tensor | None" = None,
     block_newton_gate: float = 0.0,
+    block_newton_min_rel: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One alternating GS-Newton step for the degeneracy-reduced DECM.
 
@@ -516,6 +531,7 @@ def _decm_step_dense_weighted(
         block_newton_gate: 0 (default) = scalar per-parameter Newton steps (previous behaviour, bit-identical). > 0: rows whose 2x2
             (theta, eta) Hessian block has det/(A*C) below this value are updated with the joint 2x2 Newton step (see
             :func:`_block_newton_deltas`); non-hub rows only on the out side.
+        block_newton_min_rel: rows whose relative residual is already below this value keep the scalar step (see :func:`_block_exclude`).
 
     Returns:
         ``(theta_new, F_current)``, both shape (4M,)/(4M,); ``F_current``
@@ -575,7 +591,8 @@ def _decm_step_dense_weighted(
         E_out = ((P * G * g_) * mm_).sum(1) - (P * G * g_).diagonal()
         delta_theta_out, delta_eta_out, gated_out = _block_newton_deltas(
             k_out_hat - k_out, s_out_hat - s_out, H_k_out, Bp_out, Cp_out, E_out, H_s_out,
-            block_newton_gate, max_step, delta_theta_out, delta_eta_out, exclude=hub_out_mask,
+            block_newton_gate, max_step, delta_theta_out, delta_eta_out,
+            exclude=_block_exclude(hub_out_mask, k_out_hat - k_out, s_out_hat - s_out, k_out, s_out, block_newton_min_rel),
         )
 
     # ------- Update η_out (with z-floor) -------
@@ -651,6 +668,7 @@ def _decm_step_dense_weighted(
         delta_theta_in, delta_eta_in, gated_in = _block_newton_deltas(
             k_in_hat2 - k_in, s_in_hat2 - s_in, H_k_in2, Bp_in, Cp_in, E_in, H_s_in2,
             block_newton_gate, max_step, delta_theta_in, delta_eta_in,
+            exclude=_block_exclude(None, k_in_hat2 - k_in, s_in_hat2 - s_in, k_in, s_in, block_newton_min_rel),
         )
 
     # ------- Update η_in (with z-floor) -------
@@ -919,6 +937,7 @@ def _decm_step_chunked_weighted(
     mult: torch.Tensor,
     hub_out_mask: "torch.Tensor | None" = None,
     block_newton_gate: float = 0.0,
+    block_newton_min_rel: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked alternating GS-Newton step for the degeneracy-reduced DECM.
 
@@ -1053,7 +1072,8 @@ def _decm_step_chunked_weighted(
     if block_newton_gate > 0.0:
         delta_theta_out, delta_eta_out, gated_out = _block_newton_deltas(
             k_out_hat - k_out, s_out_hat - s_out, H_k_out, Bp_out, Cp_out, E_out, H_s_out,
-            block_newton_gate, max_step, delta_theta_out, delta_eta_out, exclude=hub_out_mask,
+            block_newton_gate, max_step, delta_theta_out, delta_eta_out,
+            exclude=_block_exclude(hub_out_mask, k_out_hat - k_out, s_out_hat - s_out, k_out, s_out, block_newton_min_rel),
         )
 
     # ------- Update η_out (with z-floor line-search) -------
@@ -1160,6 +1180,7 @@ def _decm_step_chunked_weighted(
         delta_theta_in, delta_eta_in, gated_in = _block_newton_deltas(
             k_in_hat2 - k_in, s_in_hat2 - s_in, H_k_in2, Bp_in, Cp_in, E_in, H_s_in2,
             block_newton_gate, max_step, delta_theta_in, delta_eta_in,
+            exclude=_block_exclude(None, k_in_hat2 - k_in, s_in_hat2 - s_in, k_in, s_in, block_newton_min_rel),
         )
 
     # ------- Update η_in (with z-floor line-search) -------
@@ -1430,6 +1451,7 @@ def solve_fixed_point_decm(
     hub_bisect_max_sweeps: int = 3,
     patience_rel_tol: float = 0.0,
     block_newton_gate: float = 0.0,
+    block_newton_min_rel: float | None = None,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
@@ -1509,6 +1531,10 @@ def solve_fixed_point_decm(
                         Newton step instead of two decoupled scalar steps (see :func:`_block_newton_deltas`). Targets the nearly saturated
                         rows (s ~ k, G ~ 1) where the scalar iteration contracts by ~1 - 1e-5 per step (q4/e1 plateau). ~0.05 selects only
                         those rows; non-hub rows only on the out side.
+        block_newton_min_rel: With ``block_newton_gate > 0``: rows whose relative residual is already below this value are not stepped jointly
+                        (they keep the scalar step). ``None`` (default) = ``0.1 * tol``; ``0.0`` = no restriction. Prevents the s == k rows,
+                        whose solution lies at infinity, from marching along the soft direction (theta-c, eta+c) far beyond what their
+                        residual needs (e1: eta ~ 37, theta ~ -31, then MRE > 1).
         hub_bisect_max_sweeps: Maximum Gauss-Seidel sweeps (out-hubs then in-hubs) of the per-iteration hub bisection. The first 3 sweeps
                         always run (default 3 = previous behaviour); further sweeps run only while the largest hub-eta change of the
                         last sweep exceeds 1e-13. Raise (e.g. 50) when a relaxed (negative-eta) hub sits next to a tight partner
@@ -1929,6 +1955,9 @@ def solve_fixed_point_decm(
     else:
         effective_chunk = chunk_size
 
+    # Joint 2x2 step: rows already below 0.1*tol keep the scalar step (see _block_exclude); explicit 0.0 disables the restriction.
+    _bn_min_rel = (0.1 * tol if block_newton_min_rel is None else float(block_newton_min_rel)) if block_newton_gate > 0.0 else 0.0
+
     # Step function with bound arguments
     if mult is not None:
         if effective_chunk > 0:
@@ -1937,7 +1966,7 @@ def solve_fixed_point_decm(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     effective_chunk, max_step, mult,
-                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate,
+                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate, block_newton_min_rel=_bn_min_rel,
                 )
         else:
             def _step(th, hub_out_mask=None):
@@ -1945,7 +1974,7 @@ def solve_fixed_point_decm(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     max_step, mult,
-                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate,
+                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate, block_newton_min_rel=_bn_min_rel,
                 )
     elif _use_numba and variant == "theta-newton":
         def _step(th, hub_out_mask=None):  # mask unused: numba path keeps the old hub behaviour
@@ -2967,6 +2996,7 @@ def solve_fixed_point_decm_degenerate(
     hub_bisect_max_sweeps: int = 3,
     patience_rel_tol: float = 0.0,
     block_newton_gate: float = 0.0,
+    block_newton_min_rel: float | None = None,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -3133,6 +3163,7 @@ def solve_fixed_point_decm_degenerate(
         hub_bisect_max_sweeps=hub_bisect_max_sweeps,
         patience_rel_tol=patience_rel_tol,
         block_newton_gate=block_newton_gate,
+        block_newton_min_rel=block_newton_min_rel,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,

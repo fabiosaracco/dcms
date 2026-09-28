@@ -1156,3 +1156,39 @@ class TestBlowupGuardDepthOne:
         res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=30, anderson_depth=1, hub_sk_threshold=0.0,
                                                 patience=10**6, block_newton_gate=0.05, verbose=False, num_threads=1)
         assert res.converged and res.iterations < 30          # the guard (default scale-adaptive factor) must not disturb a converging depth-1 run
+
+
+class TestBlockNewtonMinRel:
+    """block_newton_min_rel: rows already below the given relative residual keep the scalar step instead of the joint 2x2 step (an s == k row
+    has its solution at infinity, so the joint step would march it along (theta-c, eta+c) forever: e1 theta -31, eta +37, then MRE > 1)."""
+
+    def test_exclude_helper(self) -> None:
+        from dcms.solvers.fixed_point_decm import _block_exclude
+        F_k = torch.tensor([1e-9, 1e-3, 0.0, 1e-3], dtype=torch.float64); F_s = torch.tensor([0.0, 1e-9, 0.0, 1e-3], dtype=torch.float64)
+        k_t = torch.tensor([10.0, 10.0, 0.0, 10.0], dtype=torch.float64); s_t = k_t.clone()
+        hub = torch.tensor([False, False, False, True])
+        assert _block_exclude(hub, F_k, F_s, k_t, s_t, 0.0) is hub                       # 0.0 = no restriction: the hub mask is returned untouched
+        assert _block_exclude(None, F_k, F_s, k_t, s_t, 0.0) is None
+        ex = _block_exclude(hub, F_k, F_s, k_t, s_t, 1e-6)
+        assert ex.tolist() == [True, False, True, True]                                  # row 0 tiny, row 1 not, row 2 zero target (rel 0), row 3 hub
+        assert _block_exclude(None, F_k, F_s, k_t, s_t, 1e-6).tolist() == [True, False, True, False]
+
+    def test_huge_min_rel_reduces_to_the_scalar_step(self) -> None:
+        theta_true, ko, ki, so, si, mult, zs, M = TestBlockNewton._solution_problem()
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(7))
+        base = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult)
+        for step in (lambda **kw: _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, **kw),
+                     lambda **kw: _decm_step_chunked_weighted(th, ko, ki, so, si, *zs, 4, 5.0, mult, **kw)):
+            excl = step(block_newton_gate=1e9, block_newton_min_rel=1e9)                 # every row is 'already converged' -> scalar step everywhere
+            act = step(block_newton_gate=1e9, block_newton_min_rel=0.0)
+            assert float((excl[0] - base[0]).abs().max()) < 1e-12
+            assert float((act[0] - base[0]).abs().max()) > 1e-9                          # and without the restriction the joint step really differs
+
+    def test_solver_default_min_rel_still_converges_the_saturated_problem(self) -> None:
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        theta_true, ko, ki, so, si, mult, zs, M = TestBlockNewton._solution_problem(M=40, eta_lo=4.0, eta_hi=7.0, seed=3, mult_max=1)
+        th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
+        th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
+        kw = dict(tol=1e-6, max_iter=100, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, num_threads=1, block_newton_gate=0.05)
+        res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)       # block_newton_min_rel=None -> 0.1 * tol
+        assert res.converged and res.iterations < 50

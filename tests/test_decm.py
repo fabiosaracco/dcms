@@ -1061,3 +1061,63 @@ class TestTargetedFixSaturatedPair:
         F = _decm_step_dense_weighted(fixed, k_out, k_in, s_out, s_in, z(k_out), z(k_in), z(s_out), z(s_in), 0.5, mult)[1]
         assert abs(float(F[0])) / float(k_out[0]) < 1e-8          # k_out(0)
         assert abs(float(F[2 * M])) / float(s_out[0]) < 1e-8      # s_out(0)
+
+
+class TestBlockNewton:
+    """block_newton_gate: joint 2x2 (theta, eta) Newton step for ill-conditioned (nearly saturated) rows of the degeneracy-reduced step.
+
+    On a saturated row (s ~ k, G ~ 1) the k- and s-equations are almost the same function, so the two decoupled scalar Newton steps
+    contract by ~ 1 - det/(A*C)/2 per iteration (q4/e1 plateau: 1 - 1e-5 .. 1e-4)."""
+
+    @staticmethod
+    def _solution_problem(M: int = 15, eta_lo: float = 1.5, eta_hi: float = 3.5, seed: int = 1, mult_max: int = 3):
+        g = torch.Generator().manual_seed(seed)
+        mult = torch.randint(1, mult_max + 1, (M,), generator=g).double()
+        theta_true = torch.cat([torch.randn(M, generator=g) * 0.5, torch.randn(M, generator=g) * 0.5,
+                                torch.rand(M, generator=g) * (eta_hi - eta_lo) + eta_lo, torch.rand(M, generator=g) * (eta_hi - eta_lo) + eta_lo]).double()
+        z = torch.zeros(M, dtype=torch.bool)
+        ones = torch.ones(M, dtype=torch.float64)
+        F0 = _decm_step_dense_weighted(theta_true, ones, ones, ones, ones, z, z, z, z, 100.0, mult)[1]     # expected - 1
+        return theta_true, F0[:M] + 1, F0[M:2 * M] + 1, F0[2 * M:3 * M] + 1, F0[3 * M:] + 1, mult, (z, z, z, z), M
+
+    def test_gate_zero_is_the_scalar_step(self) -> None:
+        theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64)
+        a = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult)
+        b = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, block_newton_gate=1e-300)      # nothing is below this gate
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+    def test_dense_and_chunked_agree_with_the_gate_on(self) -> None:
+        theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64)
+        hub = torch.zeros(M, dtype=torch.bool); hub[:2] = True
+        for hm in (None, hub):
+            d = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, hub_out_mask=hm, block_newton_gate=1e9)
+            c = _decm_step_chunked_weighted(th, ko, ki, so, si, *zs, 4, 5.0, mult, hub_out_mask=hm, block_newton_gate=1e9)
+            assert float((d[0] - c[0]).abs().max()) < 1e-10 and float((d[1] - c[1]).abs().max()) < 1e-10
+
+    def test_joint_step_is_the_exact_2x2_newton_step(self) -> None:
+        theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64)
+        th_new, F = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 100.0, mult, block_newton_gate=1e9)
+        h = 1e-6
+        for g in range(M):
+            def Fg(dt, de, g=g):
+                t = th.clone(); t[g] += dt; t[2 * M + g] += de
+                return _decm_step_dense_weighted(t, ko, ki, so, si, *zs, 100.0, mult)[1][[g, 2 * M + g]]
+            J = torch.stack([(Fg(h, 0.0) - Fg(-h, 0.0)) / (2 * h), (Fg(0.0, h) - Fg(0.0, -h)) / (2 * h)], 1)
+            d_fd = -torch.linalg.solve(J, F[[g, 2 * M + g]])
+            d_step = torch.stack([th_new[g] - th[g], th_new[2 * M + g] - th[2 * M + g]])
+            assert float(((d_step - d_fd).abs() / d_fd.abs().clamp(min=1e-9)).max()) < 1e-4
+
+    def test_gate_solves_a_saturated_problem_the_scalar_step_cannot(self) -> None:
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem(M=40, eta_lo=4.0, eta_hi=7.0, seed=3, mult_max=1)   # all nodes distinct: the solver's own grouping has mult=1
+        assert float((so / ko).max()) < 1.001                                            # really saturated
+        th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
+        th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
+        kw = dict(tol=1e-9, max_iter=200, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, num_threads=1)
+        blk = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, block_newton_gate=0.05, **kw)
+        sca = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)
+        assert blk.converged and blk.iterations < 50
+        assert not sca.converged and min(sca.residuals) > 1e-3

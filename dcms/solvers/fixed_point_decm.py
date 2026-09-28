@@ -429,6 +429,52 @@ def compute_degeneracy_groups(
     return group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g
 
 
+def _block_newton_deltas(
+    F_k: torch.Tensor,
+    F_s: torch.Tensor,
+    A: torch.Tensor,
+    Bp: torch.Tensor,
+    Cp: torch.Tensor,
+    E: torch.Tensor,
+    C: torch.Tensor,
+    gate: float,
+    max_step: float,
+    delta_theta: torch.Tensor,
+    delta_eta: torch.Tensor,
+    exclude: "torch.Tensor | None" = None,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Joint 2x2 Newton step for (theta_i, eta_i) of the rows whose scalar steps are ill-conditioned.
+
+    The plain step solves theta_i from the k-equation alone (Delta = F_k / A) and eta_i from the s-equation alone (Delta = F_s / C),
+    which is block-Jacobi with the cross-derivative B ignored. The exact per-row Hessian block is [[A, B], [B, C]] with
+    A = sum m pq, B = sum m pq G, C = sum m (pq G^2 + p G (G-1)). For a nearly saturated row (s ~ k, G ~ 1) the two equations are
+    almost the same function: det/(A C) = 1 - rho^2 ~ 1e-5 (q4) .. 1e-4 (e1) and the scalar iteration contracts by only rho ~ 1 - 1e-5
+    per step (tens of thousands of iterations per e-fold -- the "crawl to infinity" plateau). The joint step removes that intra-row
+    ill-conditioning exactly.
+
+    Written with g = G - 1 (small for saturated rows) to avoid the catastrophic cancellation of A*C - B^2:
+        Bp = sum m pq g,  Cp = sum m pq g^2,  E = sum m p G g
+        B = A + Bp,   det = A*E + (A*Cp - Bp^2)   (second term >= 0 by Cauchy-Schwarz).
+    Rows with det/(A*C) < ``gate`` (and not in ``exclude``) get the joint step, scaled as one vector so that
+    max(|d_theta|, |d_eta|) <= max_step (clipping one component alone would break the theta/eta cancellation the soft mode needs).
+
+    Returns ``(delta_theta, delta_eta, gated)`` where the deltas equal the inputs for the non-gated rows.
+    """
+    B = A + Bp
+    det = A * E + (A * Cp - Bp * Bp).clamp(min=0.0)
+    rel = det / (A * C).clamp(min=1e-300)
+    gated = (rel < gate) & (A > 1e-15) & (C > 1e-15) & (det > 0.0)
+    if exclude is not None:
+        gated = gated & ~exclude
+    det_s = det.clamp(min=1e-300)
+    d_th = (C * F_k - B * F_s) / det_s
+    d_et = (A * F_s - B * F_k) / det_s
+    scale = (max_step / torch.maximum(d_th.abs(), d_et.abs()).clamp(min=1e-300)).clamp(max=1.0)
+    d_th = d_th * scale
+    d_et = d_et * scale
+    return torch.where(gated, d_th, delta_theta), torch.where(gated, d_et, delta_eta), gated
+
+
 def _decm_step_dense_weighted(
     theta: torch.Tensor,
     k_out: torch.Tensor,
@@ -442,6 +488,7 @@ def _decm_step_dense_weighted(
     max_step: float,
     mult: torch.Tensor,
     hub_out_mask: "torch.Tensor | None" = None,
+    block_newton_gate: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One alternating GS-Newton step for the degeneracy-reduced DECM.
 
@@ -466,6 +513,9 @@ def _decm_step_dense_weighted(
             (M,).
         max_step: Maximum |Delta theta| per group per step.
         mult: Group multiplicities (node count per group), shape (M,).
+        block_newton_gate: 0 (default) = scalar per-parameter Newton steps (previous behaviour, bit-identical). > 0: rows whose 2x2
+            (theta, eta) Hessian block has det/(A*C) below this value are updated with the joint 2x2 Newton step (see
+            :func:`_block_newton_deltas`); non-hub rows only on the out side.
 
     Returns:
         ``(theta_new, F_current)``, both shape (4M,)/(4M,); ``F_current``
@@ -512,13 +562,23 @@ def _decm_step_dense_weighted(
          s_out_hat - s_out, s_in_hat - s_in]
     )
 
-    # ------- Update θ_out (Newton step on F_k_out) -------
+    # ------- Newton deltas of θ_out (k-equation) and η_out (s-equation) -------
     delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
-
-    # ------- Update η_out (Newton step on F_s_out, with z-floor) -------
     delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
+    gated_out = None
+    if block_newton_gate > 0.0:
+        # Joint 2x2 step for the ill-conditioned (nearly saturated) rows -- see _block_newton_deltas.
+        g_ = G - 1.0
+        mm_ = mult[None, :]
+        Bp_out = ((pq * g_) * mm_).sum(1) - (pq * g_).diagonal()
+        Cp_out = ((pq * g_ * g_) * mm_).sum(1) - (pq * g_ * g_).diagonal()
+        E_out = ((P * G * g_) * mm_).sum(1) - (P * G * g_).diagonal()
+        delta_theta_out, delta_eta_out, gated_out = _block_newton_deltas(
+            k_out_hat - k_out, s_out_hat - s_out, H_k_out, Bp_out, Cp_out, E_out, H_s_out,
+            block_newton_gate, max_step, delta_theta_out, delta_eta_out, exclude=hub_out_mask,
+        )
+
+    # ------- Update η_out (with z-floor) -------
 
     # z_min_out[g] = min over h of eta_gh, excluding the diagonal only for
     # singleton groups (mult==1: no real edge behind that entry). For
@@ -543,6 +603,9 @@ def _decm_step_dense_weighted(
     )
     eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
     eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
+    # ------- Update θ_out (a jointly-stepped row shares the z-floor scaling of its η step) -------
+    theta_out_new = (theta_out + (delta_theta_out if gated_out is None else torch.where(gated_out, alpha_out, torch.ones_like(alpha_out)) * delta_theta_out)).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
     if hub_out_mask is not None:
         # Hub eta_out is owned by the hub bisection, not by this Newton
         # step (the caller discards the raw value). Pass 2 must therefore
@@ -575,13 +638,22 @@ def _decm_step_dense_weighted(
     H_k_in2 = ((pq2 * mult[:, None]).sum(0) - pq2_diag).clamp(min=1e-15)
     H_s_in2 = (((PGG1_2 + CORR_2) * mult[:, None]).sum(0) - H_s_in2_diag).clamp(min=1e-15)
 
-    # ------- Update θ_in (Newton step on F_k_in) -------
+    # ------- Newton deltas of θ_in (k-equation) and η_in (s-equation) -------
     delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
-
-    # ------- Update η_in (Newton step on F_s_in, with z-floor) -------
     delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
+    gated_in = None
+    if block_newton_gate > 0.0:
+        g2_ = G2 - 1.0
+        mm2_ = mult[:, None]
+        Bp_in = ((pq2 * g2_) * mm2_).sum(0) - (pq2 * g2_).diagonal()
+        Cp_in = ((pq2 * g2_ * g2_) * mm2_).sum(0) - (pq2 * g2_ * g2_).diagonal()
+        E_in = ((P2 * G2 * g2_) * mm2_).sum(0) - (P2 * G2 * g2_).diagonal()
+        delta_theta_in, delta_eta_in, gated_in = _block_newton_deltas(
+            k_in_hat2 - k_in, s_in_hat2 - s_in, H_k_in2, Bp_in, Cp_in, E_in, H_s_in2,
+            block_newton_gate, max_step, delta_theta_in, delta_eta_in,
+        )
+
+    # ------- Update η_in (with z-floor) -------
 
     eta2_for_min = eta2_safe.clone()
     if singleton.any():
@@ -601,6 +673,9 @@ def _decm_step_dense_weighted(
     )
     eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
     eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
+    # ------- Update θ_in -------
+    theta_in_new = (theta_in + (delta_theta_in if gated_in is None else torch.where(gated_in, alpha_in, torch.ones_like(alpha_in)) * delta_theta_in)).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
 
     theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
     return theta_new, F_current
@@ -843,6 +918,7 @@ def _decm_step_chunked_weighted(
     max_step: float,
     mult: torch.Tensor,
     hub_out_mask: "torch.Tensor | None" = None,
+    block_newton_gate: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked alternating GS-Newton step for the degeneracy-reduced DECM.
 
@@ -871,7 +947,7 @@ def _decm_step_chunked_weighted(
     handling), since exact equivalence with the already-verified dense
     weighted path was the primary correctness target here.
 
-    Args: same as :func:`_decm_step_dense_weighted`, plus:
+    Args: same as :func:`_decm_step_dense_weighted` (including ``block_newton_gate``), plus:
         chunk_size: Rows (groups) per processing chunk.
 
     Returns:
@@ -895,6 +971,9 @@ def _decm_step_chunked_weighted(
     s_in_hat = torch.zeros(M, dtype=theta.dtype, device=theta.device)
     H_k_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
     H_s_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    Bp_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    Cp_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    E_out = torch.zeros(M, dtype=theta.dtype, device=theta.device)
     z_min_out = torch.full((M,), float("inf"), dtype=theta.dtype, device=theta.device)
 
     for i_start in range(0, M, chunk_size):
@@ -927,6 +1006,14 @@ def _decm_step_chunked_weighted(
         s_out_hat[i_start:i_end] = (w_chunk * mult[None, :]).sum(1) - diag_w
         H_k_out[i_start:i_end] = (pq_chunk * mult[None, :]).sum(1) - diag_pq
         H_s_out[i_start:i_end] = (H_s_chunk * mult[None, :]).sum(1) - diag_H_s
+        if block_newton_gate > 0.0:
+            g_chunk = G_chunk - 1.0
+            pqg = pq_chunk * g_chunk
+            Bp_out[i_start:i_end] = (pqg * mult[None, :]).sum(1) - pqg[local_i, global_j]
+            pqgg = pqg * g_chunk
+            Cp_out[i_start:i_end] = (pqgg * mult[None, :]).sum(1) - pqgg[local_i, global_j]
+            pgg = p_chunk * G_chunk * g_chunk
+            E_out[i_start:i_end] = (pgg * mult[None, :]).sum(1) - pgg[local_i, global_j]
 
         # Column accumulation (in-direction, at input theta), weighted by
         # this chunk's own group multiplicities (the row/g side). The
@@ -959,15 +1046,17 @@ def _decm_step_chunked_weighted(
     H_k_out = H_k_out.clamp(min=1e-15)
     H_s_out = H_s_out.clamp(min=1e-15)
 
-    # ------- Update θ_out -------
+    # ------- Newton deltas of θ_out (k-equation) and η_out (s-equation) -------
     delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_out_new = torch.where(
-        zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
-    )
+    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
+    gated_out = None
+    if block_newton_gate > 0.0:
+        delta_theta_out, delta_eta_out, gated_out = _block_newton_deltas(
+            k_out_hat - k_out, s_out_hat - s_out, H_k_out, Bp_out, Cp_out, E_out, H_s_out,
+            block_newton_gate, max_step, delta_theta_out, delta_eta_out, exclude=hub_out_mask,
+        )
 
     # ------- Update η_out (with z-floor line-search) -------
-    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
     z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
     available_out = (z_min_out - z_floor_out).clamp(min=0.0)
     alpha_out = torch.where(
@@ -978,6 +1067,11 @@ def _decm_step_chunked_weighted(
     eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
     eta_out_new = torch.where(
         zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
+    )
+    # ------- Update θ_out (a jointly-stepped row shares the z-floor scaling of its η step) -------
+    theta_out_new = (theta_out + (delta_theta_out if gated_out is None else torch.where(gated_out, alpha_out, torch.ones_like(alpha_out)) * delta_theta_out)).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_out_new = torch.where(
+        zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
     )
     if hub_out_mask is not None:
         # Hub eta_out is owned by the hub bisection, not by this Newton
@@ -995,6 +1089,9 @@ def _decm_step_chunked_weighted(
     s_in_hat2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
     H_k_in2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
     H_s_in2 = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    Bp_in = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    Cp_in = torch.zeros(M, dtype=theta.dtype, device=theta.device)
+    E_in = torch.zeros(M, dtype=theta.dtype, device=theta.device)
     z_min_in = torch.full((M,), float("inf"), dtype=theta.dtype, device=theta.device)
 
     for i_start in range(0, M, chunk_size):
@@ -1023,6 +1120,17 @@ def _decm_step_chunked_weighted(
         s_in_hat2 += (w2_chunk * mult[i_start:i_end, None]).sum(0)
         H_k_in2 += (pq2_chunk * mult[i_start:i_end, None]).sum(0)
         H_s_in2 += (H_s2_chunk * mult[i_start:i_end, None]).sum(0)
+        if block_newton_gate > 0.0:
+            g2_chunk = G2_chunk - 1.0
+            pqg2 = pq2_chunk * g2_chunk
+            Bp_in += (pqg2 * mult[i_start:i_end, None]).sum(0)
+            pqgg2 = pqg2 * g2_chunk
+            Cp_in += (pqgg2 * mult[i_start:i_end, None]).sum(0)
+            pgg2 = p2_chunk * G2_chunk * g2_chunk
+            E_in += (pgg2 * mult[i_start:i_end, None]).sum(0)
+            Bp_in[i_start:i_end] -= pqg2[local_i, global_j]
+            Cp_in[i_start:i_end] -= pqgg2[local_i, global_j]
+            E_in[i_start:i_end] -= pgg2[local_i, global_j]
 
         k_in_hat2[i_start:i_end] -= diag_p2
         s_in_hat2[i_start:i_end] -= diag_w2
@@ -1044,15 +1152,17 @@ def _decm_step_chunked_weighted(
     H_k_in2 = H_k_in2.clamp(min=1e-15)
     H_s_in2 = H_s_in2.clamp(min=1e-15)
 
-    # ------- Update θ_in -------
+    # ------- Newton deltas of θ_in (k-equation) and η_in (s-equation) -------
     delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_in_new = torch.where(
-        zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
-    )
+    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
+    gated_in = None
+    if block_newton_gate > 0.0:
+        delta_theta_in, delta_eta_in, gated_in = _block_newton_deltas(
+            k_in_hat2 - k_in, s_in_hat2 - s_in, H_k_in2, Bp_in, Cp_in, E_in, H_s_in2,
+            block_newton_gate, max_step, delta_theta_in, delta_eta_in,
+        )
 
     # ------- Update η_in (with z-floor line-search) -------
-    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
     z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
     available_in = (z_min_in - z_floor_in).clamp(min=0.0)
     alpha_in = torch.where(
@@ -1063,6 +1173,11 @@ def _decm_step_chunked_weighted(
     eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
     eta_in_new = torch.where(
         zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
+    )
+    # ------- Update θ_in -------
+    theta_in_new = (theta_in + (delta_theta_in if gated_in is None else torch.where(gated_in, alpha_in, torch.ones_like(alpha_in)) * delta_theta_in)).clamp(-_THETA_MAX, _THETA_MAX)
+    theta_in_new = torch.where(
+        zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
     )
 
     theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
@@ -1314,6 +1429,7 @@ def solve_fixed_point_decm(
     hub_sk_threshold: float = 0.0,
     hub_bisect_max_sweeps: int = 3,
     patience_rel_tol: float = 0.0,
+    block_newton_gate: float = 0.0,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
@@ -1388,6 +1504,11 @@ def solve_fixed_point_decm(
                         reference record by more than that fraction resets it, so a plateau whose record keeps creeping down by ~1e-8 per
                         iteration (q4: 1.90e-4 -> 1.77e-4 over 8000 iterations, zero [patience] events) is recognised as a stall and enters
                         the recovery ladder (soft reset, then perturbed restart). ``best_theta`` is still updated on every improvement.
+        block_newton_gate: Degeneracy-reduced path only (``mult`` given). 0.0 (default) = previous behaviour, bit-identical. > 0: a group side
+                        whose 2x2 (theta, eta) Hessian block is ill-conditioned, det/(A*C) < block_newton_gate, is updated with the joint 2x2
+                        Newton step instead of two decoupled scalar steps (see :func:`_block_newton_deltas`). Targets the nearly saturated
+                        rows (s ~ k, G ~ 1) where the scalar iteration contracts by ~1 - 1e-5 per step (q4/e1 plateau). ~0.05 selects only
+                        those rows; non-hub rows only on the out side.
         hub_bisect_max_sweeps: Maximum Gauss-Seidel sweeps (out-hubs then in-hubs) of the per-iteration hub bisection. The first 3 sweeps
                         always run (default 3 = previous behaviour); further sweeps run only while the largest hub-eta change of the
                         last sweep exceeds 1e-13. Raise (e.g. 50) when a relaxed (negative-eta) hub sits next to a tight partner
@@ -1816,7 +1937,7 @@ def solve_fixed_point_decm(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     effective_chunk, max_step, mult,
-                    hub_out_mask=hub_out_mask,
+                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate,
                 )
         else:
             def _step(th, hub_out_mask=None):
@@ -1824,7 +1945,7 @@ def solve_fixed_point_decm(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     max_step, mult,
-                    hub_out_mask=hub_out_mask,
+                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate,
                 )
     elif _use_numba and variant == "theta-newton":
         def _step(th, hub_out_mask=None):  # mask unused: numba path keeps the old hub behaviour
@@ -2843,6 +2964,7 @@ def solve_fixed_point_decm_degenerate(
     hub_sk_threshold: float = 0.0,
     hub_bisect_max_sweeps: int = 3,
     patience_rel_tol: float = 0.0,
+    block_newton_gate: float = 0.0,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -3008,6 +3130,7 @@ def solve_fixed_point_decm_degenerate(
         hub_sk_threshold=hub_sk_threshold,
         hub_bisect_max_sweeps=hub_bisect_max_sweeps,
         patience_rel_tol=patience_rel_tol,
+        block_newton_gate=block_newton_gate,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,

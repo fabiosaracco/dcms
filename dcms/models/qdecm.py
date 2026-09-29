@@ -672,7 +672,7 @@ class qDECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
+    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0, z_clamp:float=1e-8, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -729,6 +729,15 @@ class qDECMModel:
                 with ``variant="theta-newton"``, ``backend != "numba"``, and
                 ``backtracking_gamma == 0.0``; silently falls back to the
                 full (unreduced) solver otherwise, with a printed note.
+            z_clamp (float): Floor on the raw z (the argument of the
+                ``1/expm1(z)`` weight factor) in the weight step, module-wide
+                for the duration of the call -- see
+                :func:`~dcms.solvers.fixed_point_qdecm.solve_fixed_point_qdecm`'s
+                ``z_clamp`` docs. Default 1e-8 (previous hard-coded value,
+                unchanged; the model's own residual computations elsewhere
+                in this file still hard-code 1e-8 independently of this
+                override -- unlike DECM's z_clamp, this has not been
+                dedicated-tuned, it is exposed for symmetry/debuggability).
             device (str): ``"cpu"`` (default, float64) or a torch device
                 string like ``"mps"``/``"cuda"`` (float32 -- MPS has no
                 float64 support at all, and CUDA float64 is slow enough
@@ -787,12 +796,12 @@ class qDECMModel:
 
         if _use_reduced:
             from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm_weight_degenerate  # lazy import to avoid circular dependency
-            _sol_weights = solve_fixed_point_qdecm_weight_degenerate(_sol_topo.best_theta, self.ic_weig, self.k_out, self.k_in, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, device=device)
+            _sol_weights = solve_fixed_point_qdecm_weight_degenerate(_sol_topo.best_theta, self.ic_weig, self.k_out, self.k_in, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, z_clamp=z_clamp, device=device)
         else:
             # Build the residual function that fixes theta_topo
             res_weight = lambda tb: self.residual_strength(_sol_topo.best_theta, tb)
             from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm  # lazy import to avoid circular dependency
-            _sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=_sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, backtracking_gamma=backtracking_gamma)
+            _sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=_sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, backtracking_gamma=backtracking_gamma, z_clamp=z_clamp)
         if len(_sol_weights.message)>0:
             print(f'Weights: {_sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 

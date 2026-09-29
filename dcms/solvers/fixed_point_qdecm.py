@@ -55,6 +55,7 @@ import datetime
 import math
 import sys
 import time
+import warnings
 from typing import Callable
 
 import torch
@@ -955,6 +956,7 @@ def solve_fixed_point_qdecm(
     backtracking_gamma: float = 0.0,
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
+    z_clamp: float = 1e-8,
     device: str = "cpu",
 ) -> SolverResult:
     """Fixed-point iteration for the qDECM weight step.
@@ -1025,6 +1027,27 @@ def solve_fixed_point_qdecm(
                      reduced (``mult``) path -- see
                      :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
                      parameter of the same name. Default True.
+        z_clamp:     Floor on the raw z (the argument of the ``1/expm1(z)``
+                     weight factor) at every clamp site in the weight step,
+                     module-wide for the duration of this call (overrides
+                     the module constant ``_Z_G_CLAMP``/``_Z_NEWTON_FLOOR``
+                     via ``global``, same mechanism as DECM's ``z_clamp`` --
+                     see :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`).
+                     Default 1e-8 (previous hard-coded value, unchanged).
+                     :meth:`~dcms.models.qdecm.qDECMModel.max_relative_error`
+                     and the rest of ``qdecm.py`` still hard-code 1e-8
+                     independently of this override -- unlike DECM's
+                     z_clamp, this one has NOT been "tied" to the model's
+                     own residual computation (that was a dedicated,
+                     multi-day investigation for DECM specifically, see
+                     decm_ita_dico3_zclamp_investigation memory; qDECM has
+                     never needed it, being 19/19 converged with the
+                     default). Exposed for symmetry/debuggability by the
+                     2026-09-29 audit, not because a different value is
+                     known to help -- a warning fires if you pass anything
+                     other than 1e-8, since equations solved with any other
+                     clamp would then disagree with what the model's own
+                     residual judges.
         device:      ``"cpu"`` (default, float64) or a torch device string
                      like ``"mps"``/``"cuda"`` (float32 -- see DECM's
                      ``_bisection_kick`` for the precedent). Only supported
@@ -1061,6 +1084,17 @@ def solve_fixed_point_qdecm(
             "device != 'cpu' is only supported together with the "
             "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
         )
+    if z_clamp != 1e-8:
+        warnings.warn(
+            f"z_clamp={z_clamp:g} != 1e-8: qDECMModel's own residual/weight computations "
+            f"(dcms/models/qdecm.py) still hard-code 1e-8, so for pairs between the two "
+            f"values the solver's equations would differ from the residual it is judged "
+            f"by. Use the default 1e-8.",
+            stacklevel=2,
+        )
+    global _Z_G_CLAMP, _Z_NEWTON_FLOOR
+    _Z_G_CLAMP = z_clamp
+    _Z_NEWTON_FLOOR = z_clamp
 
     _dev = torch.device(device)
     _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
@@ -1748,6 +1782,7 @@ def solve_fixed_point_qdecm_degenerate(
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
     weight_anderson: bool = True,
+    z_clamp: float = 1e-8,
     device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced qDECM solver (topology + conditioned-weight step).
@@ -1809,7 +1844,7 @@ def solve_fixed_point_qdecm_degenerate(
         max_step=max_step, max_time=max_time, backend=backend,
         num_threads=num_threads, verbose=verbose, monitor=monitor,
         hub_sk_threshold=hub_sk_threshold, weight_anderson=weight_anderson,
-        device=device,
+        z_clamp=z_clamp, device=device,
     )
 
     return SolverResult(
@@ -1842,6 +1877,7 @@ def solve_fixed_point_qdecm_weight_degenerate(
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
     weight_anderson: bool = True,
+    z_clamp: float = 1e-8,
     device: str = "cpu",
 ) -> SolverResult:
     """Degeneracy-reduced qDECM **weight step only**, given an already-solved
@@ -1937,6 +1973,7 @@ def solve_fixed_point_qdecm_weight_degenerate(
         hub_sk_threshold=hub_sk_threshold,
         mult=mult,
         weight_anderson=weight_anderson,
+        z_clamp=z_clamp,
         device=device,
     )
 

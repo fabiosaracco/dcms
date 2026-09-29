@@ -540,3 +540,50 @@ class TestDegeneracyReduction:
         assert "degeneracy-reduced" not in m.sol.message
 
 
+
+
+class TestZClampExposure:
+    """z_clamp: exposed as an overridable kwarg 2026-09-29 (audit finding -- previously
+    a hard-coded, unreachable module constant, unlike DECM's own tunable z_clamp).
+    Default 1e-8 unchanged; these tests check the plumbing, not a numerics claim."""
+
+    def test_default_is_silent_and_matches_the_module_constant(self) -> None:
+        import dcms.solvers.fixed_point_qdecm as fpq
+        import warnings
+        model, theta_topo_true, theta_weight_true = make_qdecm_model(N=6, seed=0)
+        res_weight = lambda tb: model.residual_strength(torch.tensor(theta_topo_true, dtype=torch.float64), tb)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            solve_fixed_point_qdecm(
+                res_weight, torch.tensor(theta_weight_true, dtype=torch.float64), model.s_out, model.s_in,
+                theta_topo=torch.tensor(theta_topo_true, dtype=torch.float64),
+                tol=1e-5, max_iter=5,
+            )
+        assert fpq._Z_G_CLAMP == 1e-8 and fpq._Z_NEWTON_FLOOR == 1e-8
+
+    def test_non_default_value_warns_and_reaches_the_module_constant(self) -> None:
+        import dcms.solvers.fixed_point_qdecm as fpq
+        model, theta_topo_true, theta_weight_true = make_qdecm_model(N=6, seed=0)
+        res_weight = lambda tb: model.residual_strength(torch.tensor(theta_topo_true, dtype=torch.float64), tb)
+        with pytest.warns(UserWarning, match="z_clamp"):
+            solve_fixed_point_qdecm(
+                res_weight, torch.tensor(theta_weight_true, dtype=torch.float64), model.s_out, model.s_in,
+                theta_topo=torch.tensor(theta_topo_true, dtype=torch.float64),
+                tol=1e-5, max_iter=5, z_clamp=1e-3,
+            )
+        assert fpq._Z_G_CLAMP == 1e-3 and fpq._Z_NEWTON_FLOOR == 1e-3
+        # restore the default so later tests in this module (any order) see the documented value
+        solve_fixed_point_qdecm(
+            res_weight, torch.tensor(theta_weight_true, dtype=torch.float64), model.s_out, model.s_in,
+            theta_topo=torch.tensor(theta_topo_true, dtype=torch.float64),
+            tol=1e-5, max_iter=1, z_clamp=1e-8,
+        )
+
+    def test_solve_tool_forwards_z_clamp(self) -> None:
+        import dcms.solvers.fixed_point_qdecm as fpq
+        model, _, _ = make_qdecm_model(N=6, seed=0)
+        with pytest.warns(UserWarning, match="z_clamp"):
+            model.solve_tool(tol=1e-3, max_iter=5, z_clamp=1e-4, reduce_degeneracy=False)
+        assert fpq._Z_G_CLAMP == 1e-4
+        model.solve_tool(tol=1e-3, max_iter=1, z_clamp=1e-8, reduce_degeneracy=False)   # restore default
+        assert fpq._Z_G_CLAMP == 1e-8

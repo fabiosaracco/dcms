@@ -602,15 +602,25 @@ class DECMModel:
         monitor: bool = False,
         topo_weig: bool = False,
         hub_sk_threshold: float = 0.0,
+        hub_bisect_max_sweeps: int = 3,
         backtracking_gamma: float = 0.0,
         z_clamp: float = 1e-6,
+        block_newton_gate: float = 0.0,
+        block_newton_min_rel: float | None = None,
+        streak_fix_threshold: int = 0,
+        streak_fix_n_sweeps: int = 5,
+        streak_fix_n_bisect: int = 60,
         reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
         patience: int = 750,
+        patience_rel_tol: float = 0.0,
         noise_base: float = 1e-4,
         noise_cap_mult: float = 16.0,
         noise_growth: float = 2.0,
         max_stalls: int = 5,
+        bisection_kick_iters: int = 0,
+        bisection_kick_n_bisect: int = 30,
+        bisection_kick_device: str = "cpu",
         seed: int | None = None,
         device: str = "cpu",
     ) -> bool:
@@ -674,6 +684,16 @@ class DECMModel:
                            networks with nodes having very high s/k ratios
                            (e.g. ``s/k > 5``) that cause stagnation.
                            Default=0.0 (disabled).
+            hub_bisect_max_sweeps: Maximum Gauss-Seidel sweeps (out-hubs then
+                           in-hubs) of the per-iteration hub bisection. The
+                           first 3 sweeps always run (default 3 = previous
+                           behaviour); raise this (e.g. 10) only when a
+                           relaxed (negative-eta) hub sits next to a tight
+                           partner (z = eta_out+eta_in ~ 1e-4) and the
+                           out/in alternation converges very slowly --
+                           values above ~10 risk an unsafe Aitken
+                           extrapolation of the sweep sequence, see
+                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm_degenerate`.
             backtracking_gamma: When > 0, enables a per-step backtracking
                            line search.  After each Newton step the residual
                            at the proposed iterate is evaluated; if it exceeds
@@ -692,6 +712,50 @@ class DECMModel:
                            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
                            ``z_clamp`` docs for the full mechanism and
                            trade-off.
+            block_newton_gate: 0.0 (default) = previous behaviour, bit-
+                           identical: theta (k-equation) and eta
+                           (s-equation) are always solved as two decoupled
+                           scalar Newton steps. > 0: a group whose joint
+                           2x2 (theta, eta) Hessian block is ill-conditioned
+                           (det/(A*C) < this value -- nearly saturated rows,
+                           s ~ k, where the two equations are almost the
+                           same function and the decoupled scalar steps
+                           contract by only ~1 - 1e-5 per iteration) is
+                           updated with the exact joint 2x2 Newton step
+                           instead. This is what closed the last 2 of the
+                           19 real bowtie2 networks (2026-09-28) after
+                           every other tuning knob had been exhausted on
+                           them, but is NOT safe as a blanket default: on
+                           several already-converged networks a bare
+                           ``block_newton_gate`` (without
+                           ``block_newton_min_rel``) made 30-iteration
+                           stability worse (see decm_b2_block_newton_2026_09_28
+                           memory) -- opt in per network, not globally, and
+                           always pair it with ``block_newton_min_rel``.
+                           Non-hub rows only, out side.
+            block_newton_min_rel: With ``block_newton_gate > 0``: a row
+                           whose relative residual is already below this
+                           value keeps the scalar step instead (an s == k
+                           row's true solution lies at infinity along the
+                           soft direction theta-c, eta+c, so the joint step
+                           would otherwise keep marching it there long past
+                           any useful precision, destabilizing neighbours).
+                           ``None`` (default) = ``0.1 * tol`` whenever the
+                           gate is active; ``0.0`` = no restriction.
+            streak_fix_threshold: > 0 enables the "same equation stuck as
+                           argmax" escape: if the same (node, side) is the
+                           single worst-residual equation for this many
+                           consecutive iterations, that node/side pair is
+                           solved directly (a small bisection, at fixed
+                           phi = theta + eta) instead of waiting for the
+                           global step to fix it. Default 0 (disabled).
+                           Typical values 1-50 depending on the network;
+                           this is what closed most of the 19 real
+                           networks' remaining plateaus.
+            streak_fix_n_sweeps: Gauss-Seidel out/in sweeps per streak-fix
+                           call. Default 5.
+            streak_fix_n_bisect: Bisection halvings per stage per streak-fix
+                           call. Default 60.
             reduce_degeneracy: If ``True`` (default), nodes sharing the exact
                            same ``(k_out, k_in, s_out, s_in)`` 4-tuple are
                            collapsed into a single group before solving (see
@@ -735,6 +799,15 @@ class DECMModel:
                            "Checkpointed multi-chunk runs"). Inert (zero
                            effect on the result) for instances that never
                            stagnate or blow up.
+            patience_rel_tol: Relative-improvement threshold of the stall
+                           criterion. Default 0.0 (previous behaviour: ANY
+                           strictly smaller residual resets the ``patience``
+                           counter). With a value > 0 (e.g. 0.01) only a
+                           record that beats the reference by more than that
+                           fraction resets it, so a plateau whose record
+                           keeps creeping down by a tiny amount every
+                           iteration is recognised as a stall and enters the
+                           recovery ladder instead of never triggering it.
             noise_base:    Scale of the multiplicative (log-scale) noise on
                            the first perturbed restart: every component of
                            theta is scaled as ``x_i *= exp(N(0, noise_base))``.
@@ -756,6 +829,24 @@ class DECMModel:
             max_stalls:    Give up (``converged=False``) after this many
                            restarts *at the noise cap* in a row without
                            improving the record. Default 5.
+            bisection_kick_iters: > 0 adds a structured (non-random) "kick"
+                           tier between the cheap soft reset and the noisy
+                           perturbed restart in the stagnation ladder: this
+                           many outer sweeps of exact coordinate bisection
+                           from ``best_theta``, self-contained and
+                           GPU-capable. Default 0 (disabled, previous
+                           behaviour). Not expected to itself find a better
+                           point -- see
+                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
+                           ``bisection_kick_iters`` docs for the rationale.
+            bisection_kick_n_bisect: Bisection halvings per stage per kick
+                           iteration. Default 30 (auto-capped at 30 when
+                           ``bisection_kick_device`` is not ``"cpu"``).
+            bisection_kick_device: ``"cpu"`` (default, float64, exact) or a
+                           torch device string like ``"mps"``/``"cuda"``
+                           (float32, faster per iteration but capped
+                           precision) for the kick specifically --
+                           independent of the main solve's ``device``.
             seed:          Seed for the perturbation RNG (private, does not
                            touch global RNG state). ``None`` (default) is
                            unseeded/non-reproducible -- only relevant for
@@ -822,13 +913,23 @@ class DECMModel:
                     monitor=monitor,
                     topo_weig=topo_weig,
                     hub_sk_threshold=hub_sk_threshold,
+                    hub_bisect_max_sweeps=hub_bisect_max_sweeps,
                     z_clamp=z_clamp,
+                    block_newton_gate=block_newton_gate,
+                    block_newton_min_rel=block_newton_min_rel,
+                    streak_fix_threshold=streak_fix_threshold,
+                    streak_fix_n_sweeps=streak_fix_n_sweeps,
+                    streak_fix_n_bisect=streak_fix_n_bisect,
                     blowup_factor=blowup_factor,
                     patience=patience,
+                    patience_rel_tol=patience_rel_tol,
                     noise_base=noise_base,
                     noise_cap_mult=noise_cap_mult,
                     noise_growth=noise_growth,
                     max_stalls=max_stalls,
+                    bisection_kick_iters=bisection_kick_iters,
+                    bisection_kick_n_bisect=bisection_kick_n_bisect,
+                    bisection_kick_device=bisection_kick_device,
                     seed=seed,
                     device=device,
                 )
@@ -851,14 +952,24 @@ class DECMModel:
                 monitor=monitor,
                 topo_weig=topo_weig,
                 hub_sk_threshold=hub_sk_threshold,
+                hub_bisect_max_sweeps=hub_bisect_max_sweeps,
                 backtracking_gamma=backtracking_gamma,
                 z_clamp=z_clamp,
+                block_newton_gate=block_newton_gate,
+                block_newton_min_rel=block_newton_min_rel,
+                streak_fix_threshold=streak_fix_threshold,
+                streak_fix_n_sweeps=streak_fix_n_sweeps,
+                streak_fix_n_bisect=streak_fix_n_bisect,
                 blowup_factor=blowup_factor,
                 patience=patience,
+                patience_rel_tol=patience_rel_tol,
                 noise_base=noise_base,
                 noise_cap_mult=noise_cap_mult,
                 noise_growth=noise_growth,
                 max_stalls=max_stalls,
+                bisection_kick_iters=bisection_kick_iters,
+                bisection_kick_n_bisect=bisection_kick_n_bisect,
+                bisection_kick_device=bisection_kick_device,
                 seed=seed,
             )
 

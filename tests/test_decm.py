@@ -1011,3 +1011,41 @@ class TestBlockNewtonMinRel:
         kw = dict(tol=1e-6, max_iter=100, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, num_threads=1, block_newton_gate=0.05)
         res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)       # block_newton_min_rel=None -> 0.1 * tol
         assert res.converged and res.iterations < 50
+
+
+class TestSolveToolAdvancedKwargs:
+    """`DECMModel.solve_tool()` must expose the solver's own recovery/precision knobs
+    (streak_fix_*, hub_bisect_max_sweeps, patience_rel_tol, block_newton_gate/min_rel,
+    bisection_kick_*) -- added 2026-09-29 after an audit found solve_tool() silently
+    missing every one of them, meaning the public API could not reproduce the actual
+    recipe that converged the hardest real networks (see decm_b2_block_newton_2026_09_28
+    memory)."""
+
+    def test_every_new_kwarg_reaches_the_solver_without_raising(self) -> None:
+        model, _ = make_decm_model(N=8, seed=1)
+        converged = model.solve_tool(
+            ic="degrees", tol=CONV_TOL, max_iter=4000, anderson_depth=10,
+            hub_bisect_max_sweeps=5, block_newton_gate=0.02, block_newton_min_rel=1e-6,
+            streak_fix_threshold=3, streak_fix_n_sweeps=4, streak_fix_n_bisect=20,
+            patience_rel_tol=0.0, bisection_kick_iters=0, bisection_kick_n_bisect=10,
+            bisection_kick_device="cpu",
+        )
+        assert converged, f"not converged with every new kwarg set: {model.sol.residuals[-1]:.3e}"
+
+    def test_block_newton_gate_reaches_the_solver_and_helps(self) -> None:
+        """Same saturated-network construction as TestBlockNewton, but driven through
+        DECMModel.solve_tool() (the public API) instead of the low-level solver function."""
+        theta_true, ko, ki, so, si, mult, zs, M = TestBlockNewton._solution_problem(
+            M=40, eta_lo=4.0, eta_hi=7.0, seed=3, mult_max=1,
+        )
+        assert float((so / ko).max()) < 1.001                                    # really saturated
+        model = DECMModel(ko, ki, so, si)
+        th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
+        th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
+        kw = dict(tol=1e-6, max_iter=200, anderson_depth=1, hub_sk_threshold=0.0,
+                  patience=10**6, multi_start=False, verbose=False)
+        no_gate = DECMModel(ko, ki, so, si)
+        assert not no_gate.solve_tool(ic=th0.clone(), **kw)
+        with_gate = DECMModel(ko, ki, so, si)
+        assert with_gate.solve_tool(ic=th0.clone(), block_newton_gate=0.05, **kw)
+        assert with_gate.sol.iterations < 50

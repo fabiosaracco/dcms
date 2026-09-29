@@ -1,0 +1,755 @@
+\documentclass[10pt]{article}
+
+% ------------------------------------------------------------------
+% Technical appendix: models and solvers of the dcms package.
+% Style follows Nature Computational Science's technical-appendix
+% conventions (compact numbered sections, boxed algorithms, a single
+% running notation, a Methods-like register) using the standard
+% article class, since the journal's proprietary .cls is not
+% redistributable. Compiles under pdflatex with only common packages.
+% ------------------------------------------------------------------
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage[T1]{fontenc}
+\usepackage{newtxtext,newtxmath}
+
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalfont\bfseries}{\thesubsection}{0.6em}{}
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\expm}{\operatorname{expm1}}
+\newcommand{\argmax}{\operatorname{argmax}}
+
+\title{\large \textbf{Maximum-entropy null models for directed weighted networks:\\
+equations, solvers, and numerical robustness mechanisms}\\[4pt]
+\normalsize Technical appendix}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2em}
+
+\begin{abstract}
+\noindent
+This appendix documents, at implementation precision, the four maximum-entropy
+network models implemented in the \texttt{dcms} package --- DCM, DWCM, qDECM
+and DECM, of increasing structural richness --- and the numerical machinery
+used to solve their defining equations on real, heavy-tailed directed
+networks with tens of thousands of nodes. We give the exponential-family
+derivation shared by all four models (Sec.~\ref{sec:framework}), the
+per-model constraint equations (Sec.~\ref{sec:models}), the two families of
+fixed-point solvers and the sequence of robustness mechanisms layered on top
+of them --- Anderson acceleration, exact hub bisection, degeneracy reduction,
+a stagnation/blowup recovery ladder, an argmax-streak targeted fix, and a
+joint block-Newton step for near-singular rows (Sec.~\ref{sec:methods}) ---
+together with the numerical evidence that motivated each one. Every equation
+below is transcribed from, and numerically validated against, the package's
+source (\texttt{dcms/models/*.py}, \texttt{dcms/solvers/*.py}).
+\end{abstract}
+
+% ==================================================================
+\section{Notation and the maximum-entropy framework}
+\label{sec:framework}
+% ==================================================================
+
+Let $G$ be a directed network on $N$ labelled nodes, represented by a binary
+adjacency matrix $A \in \{0,1\}^{N\times N}$ (with $A_{ii}=0$) and, where
+weights are modelled, a non-negative integer weight matrix
+$W \in \Z_{\ge 0}^{N\times N}$ with $W_{ij}>0 \iff A_{ij}=1$. Write
+$k^{\mathrm{out}}_i = \sum_{j\ne i} A_{ij}$, $k^{\mathrm{in}}_i = \sum_{j\ne
+i} A_{ji}$ for the observed degree sequence and $s^{\mathrm{out}}_i =
+\sum_{j\ne i} W_{ij}$, $s^{\mathrm{in}}_i = \sum_{j\ne i} W_{ji}$ for the
+observed strength sequence.
+
+All four models are instances of the same construction (Squartini \&
+Garlaschelli, 2011)\cite{squartini2011}: maximize the Shannon entropy
+$S[P] = -\sum_{G} P(G)\ln P(G)$ of a probability distribution $P$ over the
+ensemble of directed (weighted) graphs on $N$ nodes, subject to reproducing
+a chosen set of observed node-level statistics $\{C^{(a)}_i(G)\}$ in
+expectation, $\langle C^{(a)}_i \rangle_P = C^{(a)}_i(G^{\mathrm{obs}})$. The
+constrained maximum has the exponential-family (Gibbs--Boltzmann) form
+\begin{equation}
+P(G) = \frac{e^{-H(G;\boldsymbol\theta)}}{Z(\boldsymbol\theta)}, \qquad
+H(G;\boldsymbol\theta) = \sum_a \sum_i \theta^{(a)}_i\, C^{(a)}_i(G),
+\end{equation}
+where $\boldsymbol\theta$ is one Lagrange multiplier per constrained
+statistic per node. Because the constraints below are always separable
+across ordered node pairs $(i,j)$, $Z$ factorizes over pairs and every
+model reduces to solving a coupled system of $\dim(\boldsymbol\theta)$
+transcendental equations
+\begin{equation}
+\label{eq:generic-constraint}
+\langle C^{(a)}_i \rangle_{\boldsymbol\theta} = C^{(a)}_i(G^{\mathrm{obs}}),
+\qquad a=1,\dots,k,\ i=1,\dots,N,
+\end{equation}
+in $\boldsymbol\theta$ --- this is the root-finding problem every solver in
+Sec.~\ref{sec:methods} targets. Multipliers are always stored in the package
+as $\theta_i = -\ln x_i > 0$ (topology) and $\eta_i = -\ln\beta_i$ (weight,
+sign unconstrained --- see Sec.~\ref{sec:decm}), never as $x_i,\beta_i$
+directly, since the log-space parametrization keeps $x_i,\beta_i\in(0,1)$
+automatically and conditions the Newton steps of Sec.~\ref{sec:newton} far
+better than the raw multiplicative form.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Symbol & Meaning & Constraint(s) \\
+\midrule
+$\theta_{\mathrm{out},i},\theta_{\mathrm{in},i}$ & degree multipliers, node $i$ & $k^{\mathrm{out}}_i, k^{\mathrm{in}}_i$ \\
+$\eta_{\mathrm{out},i},\eta_{\mathrm{in},i}$ & strength multipliers, node $i$ & $s^{\mathrm{out}}_i, s^{\mathrm{in}}_i$ \\
+$x_i=e^{-\theta_{\mathrm{out},i}}$, $y_i=e^{-\theta_{\mathrm{in},i}}$ & topology fugacities & \\
+$\beta_{\mathrm{out},i}=e^{-\eta_{\mathrm{out},i}}$, $\beta_{\mathrm{in},i}=e^{-\eta_{\mathrm{in},i}}$ & weight fugacities & \\
+$p_{ij}$ & $\Pr(A_{ij}=1)$ under the fitted model & \\
+$W_{ij}$ (or $\mathbb E[W_{ij}]$) & expected weight of arc $i\to j$ & \\
+$N$ & number of nodes & \\
+$M$ & number of degeneracy-reduced groups (Sec.~\ref{sec:degeneracy}), $M\le N$ & \\
+\bottomrule
+\end{tabular}
+\caption{Running notation.}
+\label{tab:notation}
+\end{table}
+
+% ==================================================================
+\section{The four models}
+\label{sec:models}
+% ==================================================================
+
+The four models constrain an increasing subset of $\{k^{\mathrm{out}},
+k^{\mathrm{in}}, s^{\mathrm{out}}, s^{\mathrm{in}}\}$ and correspondingly
+increase in the number and coupling of their multipliers, summarized in
+Table~\ref{tab:models-summary} and derived individually below.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Model & Constrains & Unknowns & Coupled? & Source \\
+\midrule
+DCM  & $k^{\mathrm{out}}, k^{\mathrm{in}}$ & $2N$: $(\theta_{\mathrm{out}},\theta_{\mathrm{in}})$ & --- & \texttt{models/dcm.py} \\
+DWCM & $s^{\mathrm{out}}, s^{\mathrm{in}}$ & $2N$: $(\eta_{\mathrm{out}},\eta_{\mathrm{in}})$ & --- & \texttt{models/dwcm.py} \\
+qDECM & all four, two-step & $4N$: as above, solved sequentially & topology $\to$ weight only & \texttt{models/qdecm.py} \\
+DECM & all four, jointly & $4N$: $(\theta_{\mathrm{out}},\theta_{\mathrm{in}},\eta_{\mathrm{out}},\eta_{\mathrm{in}})$ & fully & \texttt{models/decm.py} \\
+\bottomrule
+\end{tabular}
+\caption{The four models, in order of increasing structural richness.}
+\label{tab:models-summary}
+\end{table}
+
+\subsection{DCM --- Directed Configuration Model}
+\label{sec:dcm}
+
+The DCM constrains only the degree sequences. Maximizing entropy under
+independent Bernoulli link variables $A_{ij}\sim\mathrm{Bernoulli}(p_{ij})$
+gives, for $i\ne j$,
+\begin{equation}
+p_{ij} = \frac{x_i y_j}{1+x_i y_j}, \qquad x_i=e^{-\theta_{\mathrm{out},i}},\ y_j=e^{-\theta_{\mathrm{in},j}},
+\end{equation}
+and the constraint equations~\eqref{eq:generic-constraint} become
+\begin{equation}
+\label{eq:dcm}
+k^{\mathrm{out}}_i = \sum_{j\ne i} \frac{x_i y_j}{1+x_i y_j}, \qquad
+k^{\mathrm{in}}_i = \sum_{j\ne i} \frac{x_j y_i}{1+x_j y_i}.
+\end{equation}
+The map $\theta\mapsto p_{ij}(\theta)$ is unconstrained on all of $\R$ (no
+feasibility boundary): $x_i,y_i>0$ for any finite $\theta$, and $p_{ij}\in
+(0,1)$ automatically. This is the only one of the four models with no
+feasibility region to track, and it converges reliably with the plainest
+solver variant (Sec.~\ref{sec:fpgs}) at every scale tested.
+
+\subsection{DWCM --- Directed Weighted Configuration Model}
+\label{sec:dwcm}
+
+The DWCM constrains only the strength sequences, under a model where each
+potential arc independently carries an integer weight drawn from a
+geometric distribution with success parameter $1-z_{ij}$,
+$z_{ij}=\beta_{\mathrm{out},i}\beta_{\mathrm{in},j}$. The resulting
+expected weight and constraint equations are
+\begin{equation}
+\label{eq:dwcm}
+\mathbb E[W_{ij}] = \frac{z_{ij}}{1-z_{ij}}, \qquad
+s^{\mathrm{out}}_i = \sum_{j\ne i} \frac{\beta_{\mathrm{out},i}\beta_{\mathrm{in},j}}{1-\beta_{\mathrm{out},i}\beta_{\mathrm{in},j}}, \qquad
+s^{\mathrm{in}}_i = \sum_{j\ne i} \frac{\beta_{\mathrm{out},j}\beta_{\mathrm{in},i}}{1-\beta_{\mathrm{out},j}\beta_{\mathrm{in},i}}.
+\end{equation}
+\textbf{Feasibility:} $z_{ij}<1$ for every realizable pair $i\ne j$, i.e.\
+$\eta_{\mathrm{out},i}+\eta_{\mathrm{in},j}>0$ in log-space. Unlike DCM,
+this is a genuine constraint: as any pair approaches $z_{ij}\to1^-$, both
+$\mathbb E[W_{ij}]$ and the Jacobian entries diverge --- the source of the
+``hub'' numerical pathology addressed in Sec.~\ref{sec:hub}.
+
+\subsection{qDECM --- Quasi-DECM (two-step, approximate)}
+\label{sec:qdecm}
+
+The qDECM constrains all four sequences but keeps the topology and weight
+sub-problems \emph{decoupled}: the link probability $p_{ij}$ is fixed by a
+plain DCM fit (Sec.~\ref{sec:dcm}) and only then does a second,
+\emph{conditioned} weight step introduce $\beta$:
+\begin{equation}
+\label{eq:qdecm}
+s^{\mathrm{out}}_i = \sum_{j\ne i} \frac{p_{ij}}{1-\beta_{\mathrm{out},i}\beta_{\mathrm{in},j}}, \qquad
+s^{\mathrm{in}}_i = \sum_{j\ne i} \frac{p_{ji}}{1-\beta_{\mathrm{out},j}\beta_{\mathrm{in},i}},
+\end{equation}
+with $p_{ij}$ from the already-solved DCM held fixed throughout. The
+conditional expected weight given a link, $\mathbb E[W_{ij}\mid A_{ij}=1] =
+1/(1-z_{ij})=:G_{ij}$, is the same geometric factor as DWCM's, so
+$\mathbb E[W_{ij}]=p_{ij}\,G_{ij}$ (numerator $p_{ij}$, \emph{not}
+$p_{ij}z_{ij}$ --- a frequent sign error this appendix flags explicitly
+since it silently produces a self-consistent but wrong fixed point).
+Separability is the entire point of this construction: because $p_{ij}$
+does not depend on $\beta$, the weight step (Eq.~\ref{eq:qdecm}) is itself
+exactly DWCM's fixed-point structure (Eq.~\ref{eq:dwcm}) with $\beta\beta$
+replaced by $p_{ij}$ in the numerator, so every DWCM solver and robustness
+mechanism (Secs.~\ref{sec:fpgs}--\ref{sec:hub}) applies unmodified. This
+makes qDECM the cheapest of the three weighted models to solve robustly,
+at the cost of being an \emph{approximation}: it does not reproduce the
+exact maximum-entropy ensemble under the joint (degree, strength)
+constraint set, only a product of two separately-exact ensembles.
+
+\subsection{DECM --- Directed Enhanced Configuration Model (exact, fully coupled)}
+\label{sec:decm}
+
+The DECM is the exact maximum-entropy model under the joint constraint set:
+unlike qDECM, the weight multipliers enter the link probability itself, so
+the degree and strength equations are \emph{coupled} through a single
+partition function per pair. For $i\ne j$, with $z_{ij} =
+\eta_{\mathrm{out},i}+\eta_{\mathrm{in},j}$,
+\begin{equation}
+\label{eq:decm-pij}
+p_{ij} = \sigma\!\big(-\theta_{\mathrm{out},i}-\theta_{\mathrm{in},j} - \ln\expm(z_{ij})\big),
+\qquad
+G_{ij} = \frac{1}{1-e^{-z_{ij}}} = -\frac{1}{\expm(-z_{ij})},
+\end{equation}
+where $\sigma(\cdot)$ is the logistic sigmoid and $\expm(x)=e^x-1$ is used
+throughout in place of $e^x-1$ for numerical stability near $x=0$ (the
+region every feasibility floor in Sec.~\ref{sec:decm-robustness} exists to
+protect). The expected weight is again $\mathbb E[W_{ij}]=p_{ij}G_{ij}$, and
+the $4N$ coupled constraint equations are
+\begin{equation}
+\label{eq:decm}
+k^{\mathrm{out}}_i = \sum_{j\ne i} p_{ij}, \quad
+k^{\mathrm{in}}_i = \sum_{j\ne i} p_{ji}, \quad
+s^{\mathrm{out}}_i = \sum_{j\ne i} p_{ij}G_{ij}, \quad
+s^{\mathrm{in}}_i = \sum_{j\ne i} p_{ji}G_{ji}.
+\end{equation}
+\textbf{Feasibility:} $z_{ij}=\eta_{\mathrm{out},i}+\eta_{\mathrm{in},j}>0$
+for every realizable pair $i\ne j$ --- note this is a constraint on the
+\emph{pairwise sum}, not on the individual multipliers: an individual
+$\eta_{\mathrm{out},i}$ may be negative provided every pair it participates
+in still sums positive (Sec.~\ref{sec:hub}, ``negative-$\eta$
+relaxation''). Because $\theta$ and $\eta$ both enter $p_{ij}$
+(Eq.~\ref{eq:decm-pij}), the Jacobian of Eq.~\ref{eq:decm} is not
+block-diagonal in $(\theta,\eta)$: this coupling, absent from qDECM by
+construction, is both what makes DECM the exact model and the entire
+reason Secs.~\ref{sec:hub}--\ref{sec:block-newton} exist.
+
+% ==================================================================
+\section{Numerical methods}
+\label{sec:methods}
+% ==================================================================
+
+All four models reduce to the root-finding problem of
+Eq.~\ref{eq:generic-constraint}; the package solves it with two families of
+fixed-point iterations (Secs.~\ref{sec:fpgs}--\ref{sec:newton}),
+accelerated by Anderson mixing, and --- for the harder models, principally
+DECM --- five additional mechanisms (Secs.~\ref{sec:hub}--\ref{sec:block-newton})
+that were each added in response to a specific, reproducible failure mode
+on real heavy-tailed networks. Every solver returns the best (lowest
+residual) iterate seen over the run, not merely the final one, and reports
+convergence by the $\ell_\infty$ \emph{relative} residual
+\begin{equation}
+\mathrm{MRE}(\theta) = \max_{a,i:\,C^{(a)}_i(G^{\mathrm{obs}})>0}
+\frac{\big|\langle C^{(a)}_i\rangle_\theta - C^{(a)}_i(G^{\mathrm{obs}})\big|}{C^{(a)}_i(G^{\mathrm{obs}})},
+\end{equation}
+which is the acceptance criterion throughout this appendix
+($\mathrm{MRE}\le\mathrm{tol}$, default $\mathrm{tol}=10^{-5}$ for the
+validation runs of Sec.~\ref{sec:validation}).
+
+\subsection{FP-GS: Gauss-Seidel fixed-point iteration with Anderson acceleration}
+\label{sec:fpgs}
+
+Every constraint equation in Sec.~\ref{sec:models} can be solved for its
+own multiplier in closed form, giving an update map $\theta \mapsto
+g(\theta)$; e.g.\ for the DCM,
+\begin{equation}
+x_i^{\mathrm{new}} = k^{\mathrm{out}}_i \Big/ \sum_{j\ne i} \frac{y_j}{1+x_i y_j}.
+\end{equation}
+Updating $\theta_{\mathrm{out}}$ first and using the \emph{fresh} values
+when updating $\theta_{\mathrm{in}}$ (Gauss--Seidel ordering, as opposed to
+Jacobi/simultaneous updates) lowers the spectral radius $\rho$ of the
+map's Jacobian and is strictly faster; convergence is local and linear
+with rate $\rho$ whenever $\rho<1$. On power-law degree/strength sequences
+a minority of hub nodes have $\rho\ge1$ under the plain map (most sharply
+for DWCM/qDECM's weight step, where $\rho$ grows with $(1-\beta_i\beta_j)^{-1}$
+as $\beta\to1$) and plain FP-GS oscillates or diverges on exactly those
+nodes --- the motivation for both the Newton reformulation of
+Sec.~\ref{sec:newton} and, for the most extreme hubs, the exact bisection
+of Sec.~\ref{sec:hub}.
+
+\textbf{Anderson($m$) acceleration.} Given the last $m$ fixed-point
+residuals $r_k = g(\theta_k)-\theta_k$, Anderson mixing finds the affine
+combination of the last $m$ map outputs that minimizes the mixed
+residual's norm,
+\begin{equation}
+\min_{c\in\R^m,\ \sum_k c_k = 1} \Big\| \sum_k c_k\, r_k \Big\|^2,
+\end{equation}
+a small $m\times m$ least-squares problem solved every iteration at
+$O(m^2)$ cost, turning the linear-rate fixed-point map into an
+effectively super-linear one; the package uses $m=10$ by default,
+reducing iteration counts by a measured $5$--$50\times$ on well-conditioned
+synthetic instances (Sec.~\ref{sec:validation}). Two guards protect the
+mixing from corrupting the run: (i) residuals are entered row-normalized
+by their own component-wise magnitude before the least-squares solve, so a
+handful of large-residual hub components cannot dominate the fitted
+coefficients; (ii) if a mixed iterate's residual exceeds
+\texttt{blowup\_factor} times the best residual seen so far, the mixing
+history is discarded and the run falls back to a plain (un-mixed) step for
+that iteration --- the first line of defence against the divergence modes
+that motivate Sec.~\ref{sec:decm-robustness}.
+
+\subsection{$\theta$-Newton: coordinate-wise Newton with Anderson acceleration}
+\label{sec:newton}
+
+Rather than solving $\theta=g(\theta)$, treat
+Eq.~\ref{eq:generic-constraint} as a root-finding problem
+$F(\theta)=0$, $F^{(a)}_i(\theta) := \langle C^{(a)}_i\rangle_\theta -
+C^{(a)}_i(G^{\mathrm{obs}})$, and take one \emph{diagonal} (coordinate-wise)
+Newton step per multiplier, holding every other coordinate fixed:
+\begin{equation}
+\label{eq:newton-generic}
+\Delta\theta^{(a)}_i = -\, F^{(a)}_i(\theta) \Big/ \frac{\partial F^{(a)}_i}{\partial \theta^{(a)}_i}(\theta),
+\end{equation}
+clipped to $|\Delta\theta^{(a)}_i|\le \texttt{max\_step}$ to bound the step
+size near hubs, and applied Gauss--Seidel style (fresh values feed
+forward within the same sweep) exactly as in Sec.~\ref{sec:fpgs}. For the
+DCM's out-degree equation the diagonal Jacobian entry is
+$\partial F^{\mathrm{out}}_i/\partial\theta_{\mathrm{out},i} =
+-\sum_{j\ne i} p_{ij}(1-p_{ij})$, always strictly negative, giving a step
+whose numerator (residual) and denominator (local curvature, roughly the
+node's degree) both scale with the node's connectivity --- this is the
+mechanism by which hub nodes, which break FP-GS's $\rho<1$ assumption, are
+handled gracefully by Newton instead: a large residual is matched by a
+large curvature, keeping the step well-scaled. For the weighted models the
+analogous diagonal is
+$\partial F^{\mathrm{out}}_i/\partial\eta_{\mathrm{out},i} =
+-\sum_{j\ne i} p_{ij}G_{ij}(G_{ij}-1) - p_{ij}(1-p_{ij})G_{ij}^2$
+(DECM; qDECM's is the first term alone, since $p_{ij}$ does not depend on
+$\eta$ there), always strictly negative by the same argument, guaranteeing
+descent. DECM alternates two coupled Gauss--Seidel--Newton passes per
+iteration: pass 1 updates $(\theta_{\mathrm{out}},\eta_{\mathrm{out}})$
+from row sums using the \emph{input} $(\theta_{\mathrm{in}},\eta_{\mathrm{in}})$;
+pass 2 updates $(\theta_{\mathrm{in}},\eta_{\mathrm{in}})$ from column sums
+using the pass-1 output --- the residual reported for the iteration is
+always evaluated at the pass's \emph{input} $\theta$, so it reflects the
+previous iteration's correction honestly, never an artificially zeroed
+in-progress value. Anderson acceleration (Sec.~\ref{sec:fpgs}) applies
+identically on top of this map. This variant is the package's reference
+method for every model at every scale, and the only one used for DECM.
+
+\textbf{The $z$-floor.} Whenever a model's equations contain a term of the
+form $1/(1-z_{ij})$ or $1/\expm(\pm z_{ij})$ (DWCM, qDECM's weight step,
+DECM), the raw Newton step in Eq.~\ref{eq:newton-generic} can propose a
+$z_{ij}\to0^+$ (or, for DECM, $z_{ij}\le0$) that violates feasibility and
+sends the corresponding term to $+\infty$. Every such solver therefore
+computes, after each proposed step, the tightest pair sum a node
+participates in and applies a trust-region-style line search: the step is
+scaled back (never reversed) so that the tightest pair never drops below
+$\max(\texttt{\_Z\_NEWTON\_FRAC}\times z_{\min},\ \texttt{z\_clamp})$ ---
+i.e.\ at most a fractional (default 50\%) shrinkage of the current
+tightest margin per step, with a hard floor \texttt{z\_clamp} below which
+the corresponding weight factor is simply capped rather than allowed to
+diverge numerically. \texttt{z\_clamp} is a genuine per-model tuning
+constant, not a universal one: $10^{-6}$ for DECM, $10^{-8}$ for qDECM,
+$10^{-15}$ for DWCM in the current release --- each independently selected
+for its own model's numerics, with no evidence a single shared value would
+suit all three (Sec.~\ref{sec:zclamp-note}).
+
+\subsection{Degeneracy reduction}
+\label{sec:degeneracy}
+
+\begin{proposition}[Label-swap symmetry]
+\label{prop:degeneracy}
+If two nodes $i,j$ of a given model share identical sufficient statistics
+--- $(k^{\mathrm{out}}_i,k^{\mathrm{in}}_i)=(k^{\mathrm{out}}_j,k^{\mathrm{in}}_j)$
+for DCM; $(s^{\mathrm{out}}_i,s^{\mathrm{in}}_i)=(s^{\mathrm{out}}_j,s^{\mathrm{in}}_j)$
+for DWCM; the full 4-tuple for qDECM's weight step and for DECM --- then at
+the (unique, by strict concavity of the log-likelihood) maximum-entropy
+solution their multipliers coincide.
+\end{proposition}
+\begin{proof}[Proof sketch]
+Relabelling $i\leftrightarrow j$ is a symmetry of the constraint set (their
+target statistics are equal, so the relabelled problem is identical to the
+original) and hence of the log-likelihood $\ell(\theta) = -H(G^{\mathrm{obs}};\theta)
+- \ln Z(\theta)$, which is invariant under simultaneously swapping
+$\theta_i\leftrightarrow\theta_j$. Since $\ell$ is strictly concave in
+$\theta$ (a standard property of this exponential family), its maximizer
+is unique, and a symmetry of a function with a unique maximizer must fix
+that maximizer --- hence $\theta_i=\theta_j$ at the solution.
+\qed
+\end{proof}
+On real, heavy-tailed degree/strength sequences a large fraction of nodes
+--- typically the low-degree bulk --- share exact sufficient-statistics
+tuples, so the number of distinct groups $M$ is often far smaller than
+$N$. Proposition~\ref{prop:degeneracy} lets every solver above be rewritten
+in terms of $M$ group-level unknowns, replacing the dominant $O(N^2)$
+pairwise cost of every step with $O(M^2)$ (each group $g$ of size
+$\mathrm{mult}[g]$ contributes $\mathrm{mult}[g]$ times to every sum it
+enters, with one term removed for the group's own diagonal
+self-interaction to preserve $i\ne j$ exactly). This is a mathematically
+exact reformulation, not an approximation, and is the default execution
+path for every model in the package once expanded back to per-node shape,
+measured at $10$--$67\times$ wall-clock speedups on real social-network
+data (Table~\ref{tab:degeneracy-speedup}).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llrr@{}}
+\toprule
+Model & Network & $N\to M$ & Speedup \\
+\midrule
+DCM  & social network A & $1304\to61$    & $24.2\times$ \\
+DCM  & social network B & $20914\to2310$ & $43.5\times$ \\
+DWCM & social network C & $15168\to1860$ & $47.1\times$ \\
+DWCM & social network D & $31874\to3083$ & $66.8\times$ \\
+qDECM (weight step) & social network B & $20914\to4070$ & $23.5\times$ \\
+DECM & social network C & $15168\to3003$ & $\sim10$--$25\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Degeneracy-reduction speedups measured on real (anonymized)
+directed social networks; \texttt{tol}$\approx10^{-9}$--$10^{-10}$,
+$\theta$-Newton, Anderson depth 10.}
+\label{tab:degeneracy-speedup}
+\end{table}
+
+\begin{remark}
+All four models carry a genuine additive gauge freedom on top of
+Proposition~\ref{prop:degeneracy}: because every model's equations depend
+on $\theta$ only through the sum $\theta_{\mathrm{out},i}+\theta_{\mathrm{in},j}$
+(and, where a strength part exists, separately through
+$\eta_{\mathrm{out},i}+\eta_{\mathrm{in},j}$), the shift
+$\theta_{\mathrm{out}}\mapsto\theta_{\mathrm{out}}+c,\ \theta_{\mathrm{in}}\mapsto\theta_{\mathrm{in}}-c$
+leaves every $p_{ij}$ (and, for the analogous $\eta$-shift, every
+$W_{ij}$) exactly unchanged. DECM has two independent such directions.
+Consequently the full and degeneracy-reduced solvers are not expected to
+land on bit-identical raw $\theta$ even when both are converged to machine
+precision; any comparison between two solutions of the same instance must
+be made through a gauge-invariant quantity ($p_{ij}$ and/or $\mathbb
+E[W_{ij}]$), never raw $\theta$.
+\end{remark}
+
+\subsection{Exact hub bisection}
+\label{sec:hub}
+
+A node $i$ with strength-to-degree ratio $s_i/k_i\gg1$ forces its weight
+fugacity toward the feasibility boundary ($\beta_i\to1$ for qDECM,
+$\eta_i\to0$ for DECM) at the true solution, where the Jacobian entries of
+Sec.~\ref{sec:newton} diverge and the coordinate Newton step becomes
+numerically unstable even though a solution provably exists (the boundary
+is approached, never reached, for any finite observed strength). For nodes
+flagged as hubs ($s_i/\hat k_i > \texttt{hub\_sk\_threshold}$, where
+$\hat k_i=\sum_j p_{ij}$ is the \emph{expected} degree from the current
+topology fit), the package instead finds that node's weight multiplier
+\emph{exactly} each iteration by 1-D bisection on the corresponding
+constraint equation, holding every other multiplier fixed:
+\begin{equation}
+f(\beta_{\mathrm{out},i}) = \sum_{j} \frac{p_{ij}}{1-\beta_{\mathrm{out},i}\beta_{\mathrm{in},j}} - s^{\mathrm{out}}_i = 0 \quad\text{(qDECM)}, \qquad
+f(\eta_{\mathrm{out},i}) = \sum_j p_{ij}(\eta)\,G_{ij}(\eta) - s^{\mathrm{out}}_i = 0 \quad\text{(DECM)},
+\end{equation}
+each $f$ monotone in its argument (increasing in $\beta$, decreasing in
+$\eta$) on the feasible interval, guaranteeing a unique root found to
+machine precision in $\sim60$ bisection halvings. Because a node can be
+simultaneously an out-hub and an in-hub, all out-hubs are bisected first
+against the current in-side values, then all in-hubs against the fresh
+out-side values, for \texttt{hub\_bisect\_max\_sweeps} (default 3) total
+Gauss--Seidel passes to reach mutual consistency; Anderson mixing
+(Sec.~\ref{sec:fpgs}) excludes hub components from its residual history
+and overwrites them with the bisection value after every mixed step, so
+hub multipliers are never corrupted by an extrapolated mixing coefficient.
+
+\textbf{Negative-$\eta$ relaxation (DECM only).} DECM's feasibility
+constraint is on the pairwise sum $\eta_{\mathrm{out},i}+\eta_{\mathrm{in},j}>0$
+(Sec.~\ref{sec:decm}), not on $\eta_{\mathrm{out},i}\ge0$ individually; an
+extreme-outlier hub can require $\eta_{\mathrm{out},i}<0$ while every pair
+it participates in still sums positive. The bisection bracket is widened
+to allow this for nodes proven ``unreachable'' under the naive
+$\eta\ge0$-only rule, with the growth of the resulting weight factor
+$G_{ij}$ capped at a relative $5\%$ per bisection call (converted back to
+an $\eta$ floor via $G$'s exact inverse) to prevent a single relaxed
+hub's update from destabilizing its tightest partner's own, undamped
+Newton step on the same iteration.
+
+\subsection{DECM stagnation and blowup recovery}
+\label{sec:decm-robustness}
+
+Even with Secs.~\ref{sec:fpgs}--\ref{sec:hub}, some hub-heavy DECM
+instances stall at a \emph{quasi-fixed point}: the deterministic
+Newton/Anderson dynamics reproduce the same trajectory indefinitely, so a
+plain rollback-and-retry cannot escape it. Two triggers share one
+escalation ladder:
+\begin{itemize}[nosep]
+\item \textbf{Stagnation}: no record ($\ell_\infty$-best) improvement for
+\texttt{patience} consecutive iterations (or, with
+\texttt{patience\_rel\_tol}$>0$, no improvement exceeding that
+\emph{relative} fraction --- guarding against a record that creeps down by
+a negligible amount every iteration without ever formally stalling).
+\item \textbf{Repeated blowup}: an isolated Anderson blowup
+(Sec.~\ref{sec:fpgs}) is left to its cheap rollback; only if it recurs with
+no record improvement in between does it escalate to the same ladder.
+\end{itemize}
+The ladder itself has three tiers, each attempted only after the previous
+one has also failed to beat the record: (1) a free soft reset (clear
+Anderson history, one plain Newton step from the best iterate, no noise);
+(2) an optional structured ``kick'' of \texttt{bisection\_kick\_iters}
+outer sweeps of exact per-node coordinate bisection (self-contained,
+GPU-capable, independent of Sec.~\ref{sec:hub}'s hub-only machinery); (3) a
+perturbed restart from the best iterate with multiplicative,
+log-scale Gaussian noise, $\theta_i \mathrel{*}= \exp\mathcal N(0,\sigma)$,
+$\sigma$ starting at \texttt{noise\_base} and doubling on each further
+failed restart up to a cap, resetting only on a genuine improvement ---
+multiplicative rather than additive noise because a fixed absolute kick is
+simultaneously too weak to move a topological hub sitting near its
+$\theta$ boundary and catastrophic for a strength hub sitting near its
+$\eta$ floor. The run gives up ($\mathrm{converged}=\mathrm{False}$) only
+after \texttt{max\_stalls} restarts \emph{at the noise cap} in a row
+without improving the record. On a validation instance ($N=15168$,
+$M=3003$ after reduction, several extreme-hub nodes), this ladder
+converged an otherwise-stalled run unattended in 9460 iterations
+(one repeated-blowup restart, four stagnation restarts) to
+$\mathrm{MRE}=9.45\times10^{-6}$.
+
+\subsection{Argmax-streak targeted fix}
+\label{sec:streak}
+
+On a subset of real instances, once the rest of the network is well below
+tolerance, a single $(\text{node}, \text{side})$ pair's equations remain
+the residual's $\argmax$ for many consecutive iterations: the global step
+still corrects it, but too slowly relative to everything else. Tracking
+the identity of the $\argmax$ across iterations, once the same pair has
+held it for \texttt{streak\_fix\_threshold} consecutive iterations, that
+pair's $(\theta,\eta)$ is solved directly by nested bisection --- the
+$k$-equation for $\theta$ and the $s$-equation for $\eta$, at \emph{fixed}
+$\varphi=\theta+\eta$ rather than alternating with one held fixed at a
+time (an earlier $\theta$-fixed/$\eta$-fixed alternation failed to
+converge whenever $\eta$ was large, the two 1-D searches fighting each
+other along what is effectively a single direction once $\varphi$ is
+introduced), including the negative-$\eta$ bracket of
+Sec.~\ref{sec:hub} where applicable and both sides (correcting one side
+can shift the other's own balance).
+
+\subsection{Joint block-Newton step for near-singular rows}
+\label{sec:block-newton}
+
+A further plateau shape survives every mechanism above: a family of nodes
+with $s_i\approx k_i$, i.e.\ $G_{ij}\approx1$ for their dominant partners.
+Sec.~\ref{sec:newton}'s Newton step treats $\theta$ (from the
+$k$-equation) and $\eta$ (from the $s$-equation) as \emph{decoupled}
+scalar unknowns, ignoring the equations' cross-derivative --- but as
+$G\to1$ the two equations become nearly the same function of $(\theta,\eta)$,
+so the row's true $2\times2$ Hessian block is nearly singular and the
+decoupled iteration crawls.
+
+\textbf{Derivation.} Write, per group/node and summed over its partners
+with multiplicity $m_j$ (Sec.~\ref{sec:degeneracy}), $p=p_{ij}$,
+$q=1-p$, $G=G_{ij}$, $g:=G-1\ (\ge0)$, and define
+\begin{equation}
+A = \textstyle\sum_j m_j\,p q, \qquad
+B_p = \textstyle\sum_j m_j\,p q\,g, \qquad
+C_p = \textstyle\sum_j m_j\,p q\,g^2, \qquad
+E = \textstyle\sum_j m_j\,p\,G\,g.
+\end{equation}
+$A$ is exactly Sec.~\ref{sec:newton}'s $\theta$-diagonal
+$-\partial F_k/\partial\theta$; the row's exact $2\times2$ Hessian block
+of $(F_k,F_s)$ with respect to $(\theta,\eta)$ is
+$\begin{psmallmatrix}A & B\\ B & C\end{psmallmatrix}$ with $B=A+B_p$
+and $C=A+2B_p+C_p+E$ (the latter is Sec.~\ref{sec:newton}'s $\eta$-diagonal,
+re-expressed in the $g$-basis). A direct expansion gives the determinant in
+a cancellation-safe form,
+\begin{equation}
+\label{eq:block-det}
+\det = AC-B^2 = A\,E + \big(A\,C_p - B_p^2\big),
+\end{equation}
+where the bracketed term is non-negative by the Cauchy--Schwarz inequality
+applied to the sequences $\sqrt{m_jpq}$ and $\sqrt{m_jpq}\,g_j$, and $A,E\ge0$
+outright ($p,G,g\ge0$) --- so $\det\ge0$ always, as it must for a
+principal minor of a concave log-likelihood's (negative semi-definite)
+Hessian, and Eq.~\ref{eq:block-det} avoids ever forming the much larger,
+near-cancelling quantities $AC$ and $B^2$ directly (both $O(A^2)$ when
+$B_p\ll A$, while their difference is $O(A\cdot E)$, orders of magnitude
+smaller on the near-singular rows this mechanism targets). The relative
+conditioning $\det/(AC)=1-\rho^2$ (with $\rho=B/\sqrt{AC}$ the row's
+correlation coefficient between the two equations) was measured at
+$10^{-4}$--$10^{-5}$ on the affected rows of two real instances, meaning
+the plain decoupled iteration of Sec.~\ref{sec:newton} contracts by only
+$\rho\approx1-10^{-5}$ per step along that row's own soft direction ---
+thousands of iterations per e-fold of progress.
+
+\textbf{Mechanism (\texttt{block\_newton\_gate}).} For a row with
+$\det/(AC) < \texttt{block\_newton\_gate}$, solve the exact joint step
+$(\Delta\theta,\Delta\eta) = \begin{psmallmatrix}A&B\\B&C\end{psmallmatrix}^{-1}(F_k,F_s)$
+instead of the two decoupled scalar steps, jointly rescaled to respect
+\texttt{max\_step} and the $z$-floor of Sec.~\ref{sec:newton}.
+\texttt{block\_newton\_gate}$=0$ (the default) reproduces the decoupled
+step bit-for-bit; hub-owned rows (Sec.~\ref{sec:hub}) are always excluded.
+
+\textbf{The runaway-row failure mode and \texttt{block\_newton\_min\_rel}.}
+A row with $s_i=k_i$ \emph{exactly} has no finite solution: its fixed
+point lies at $\theta\to-\infty,\eta\to+\infty$ along the soft direction
+$(\theta-c,\eta+c)$ (the direction Eq.~\ref{eq:block-det}'s near-zero
+eigenvalue corresponds to), with the residual only ever approaching zero
+in the limit. Once such a row's residual is already small, the joint step
+of the previous paragraph has nothing stopping it from continuing to march
+that row along the soft direction at \texttt{max\_step} per iteration
+indefinitely, well past any useful precision --- and several rows doing
+this simultaneously destabilizes their neighbours through the shared
+partition function. \texttt{block\_newton\_min\_rel} (default $0.1\times\texttt{tol}$
+whenever the gate is active) excludes a row from the joint step once its
+own relative residual is already below that value, leaving it to the
+(slow, but harmless) decoupled step from then on.
+
+\begin{remark}[Validated scope]
+\texttt{block\_newton\_gate} alone, without \texttt{block\_newton\_min\_rel},
+is \emph{not} a safe default: on a stability check re-solving 14
+already-converged real instances for 30 further iterations, a bare gate
+made 4 of them measurably worse (one instance's residual rose transiently
+to $\mathcal O(10^3)$ above tolerance before settling; another had not
+recovered by the 30th iteration) and diverged a fifth, previously easy,
+instance entirely when solved from a fresh initial condition. Paired with
+\texttt{block\_newton\_min\_rel}, the mechanism closed the two hardest
+instances of the validation set (Sec.~\ref{sec:validation}) from
+long-standing plateaus in under 100 iterations each, but the full
+stability check above has not yet been repeated with
+\texttt{block\_newton\_min\_rel} active. It is documented and shipped as
+an opt-in, per-instance mechanism, not (yet) a default recipe.
+\end{remark}
+
+% ==================================================================
+\section{Implementation notes}
+\label{sec:implementation}
+% ==================================================================
+
+\textbf{Dense/chunked execution.} For $N$ (or, on the degeneracy-reduced
+path, $M$) below a per-model threshold ($5000$ for DCM/DWCM, $2000$ for
+qDECM/DECM), every solver materializes the full $N\times N$ (or
+$M\times M$) probability/weight matrix once per iteration; above it, rows
+are processed in chunks of 512 to keep peak memory at $O(\mathrm{chunk}\times N)$
+rather than $O(N^2)$, with results proven identical to the dense path up
+to floating-point summation order.
+
+\textbf{Backends.} Every solver accepts \texttt{backend $\in$ \{"auto",
+"pytorch", "numba"\}}; \texttt{"auto"} selects PyTorch for $N\le100000$
+and a parallel Numba JIT kernel above that (peak RAM was found
+empirically indistinguishable between the two backends at every scale
+tested; the crossover is purely a wall-clock optimization, $\sim13$--$14\%$
+faster on Numba only above $N\approx100000$).
+
+\textbf{GPU/device.} All four models' degeneracy-reduced solvers accept a
+\texttt{device} string (\texttt{"cpu"} default float64, or
+\texttt{"mps"}/\texttt{"cuda"} float32 --- MPS has no float64 support at
+all, and CUDA float64 throughput makes float32 the practical choice
+there too); the returned result is always converted back to CPU/float64
+regardless. DECM's stagnation-recovery machinery
+(Sec.~\ref{sec:decm-robustness}) stays internally CPU-only by design and
+interoperates transparently with a non-CPU main loop.
+
+\subsection{On \texttt{z\_clamp} consistency across models}
+\label{sec:zclamp-note}
+
+Sec.~\ref{sec:newton} noted that \texttt{z\_clamp} is model-specific by
+design ($10^{-6}$ DECM, $10^{-8}$ qDECM, $10^{-15}$ DWCM). As of this
+writing all three values are independently tunable parameters, each tied
+(where applicable) to the same value the corresponding model's own
+residual/likelihood computation uses internally, so the equations a solver
+converges and the residual it is judged against never silently disagree.
+DECM's value received a dedicated multi-instance investigation before
+being fixed at $10^{-6}$; qDECM's and DWCM's have not, and are exposed
+for parity and debuggability rather than because a different value is
+known to help either model --- both already converge their full real-network
+validation set at the shipped defaults.
+
+% ==================================================================
+\section{Validation}
+\label{sec:validation}
+% ==================================================================
+
+\textbf{Synthetic benchmarks.} On synthetic power-law networks
+($N\in\{1000,5000\}$, multiple random seeds, Chung--Lu topology with
+Pareto-distributed target degrees/strengths), $\theta$-Newton
+Anderson(10) reaches $\mathrm{MRE}\le10^{-5}$ on $100\%$ of tested seeds
+for all four models; DECM additionally falls back to a \texttt{"qdecm"}
+warm-start and then a random restart on any seed the plain
+\texttt{"degrees"} initial condition fails to converge from, resolving the
+remainder.
+
+\textbf{Real-network validation.} The package's target real-world
+validation set --- 19 directed, weighted networks drawn from online social
+media data, $N$ ranging from a few hundred to $\sim10^5$ nodes, several
+with extreme strength-to-degree hubs ($s/k$ up to $\sim150$) --- is fully
+solved by DECM (the exact, most demanding model) to $\mathrm{MRE}\le10^{-5}$
+using the mechanisms of this appendix; DWCM and qDECM, structurally easier
+per Sec.~\ref{sec:qdecm}, converge the same set with Secs.~\ref{sec:fpgs}--\ref{sec:hub}
+alone. The two hardest instances in the set required
+Sec.~\ref{sec:block-newton}'s mechanism specifically: one converged from a
+$3.52\times10^{-5}$ plateau in 46 iterations with
+\texttt{block\_newton\_gate} alone; the other, whose near-singular-row
+family was larger and triggered the runaway-row failure mode of
+Sec.~\ref{sec:block-newton}, converged from a $1.85\times10^{-4}$ plateau
+in 94 iterations once \texttt{block\_newton\_min\_rel} was added.
+
+% ==================================================================
+\section*{Data and code availability}
+% ==================================================================
+The \texttt{dcms} package, including every equation and mechanism
+described in this appendix, is available at the repository this appendix
+ships with; \texttt{README.md} \S\S2.1--2.9 give the equivalent
+documentation in narrative/API-reference form, and \texttt{tests/} gives
+executable, machine-checked specifications of every claim above (constraint
+equations solved to a known synthetic ground truth; the block-Newton step
+verified against a finite-difference Newton solve to $1.6\times10^{-7}$
+relative error; the degeneracy reduction verified to reproduce the
+unreduced per-node solution to machine precision on synthetic
+degenerate instances).
+
+% ==================================================================
+\begin{thebibliography}{9}
+
+\bibitem{squartini2011}
+Squartini, T. \& Garlaschelli, D.
+Analytical maximum-likelihood method to detect patterns in real networks.
+\textit{New Journal of Physics} \textbf{13}, 083001 (2011).
+
+\bibitem{walker2011}
+Walker, H. F. \& Ni, P.
+Anderson acceleration for fixed-point iterations.
+\textit{SIAM Journal on Numerical Analysis} \textbf{49}, 1715--1735 (2011).
+
+\bibitem{kelley1995}
+Kelley, C. T.
+\textit{Iterative Methods for Linear and Nonlinear Equations} (SIAM, 1995).
+
+\bibitem{vallarano2021}
+Vallarano, N. \textit{et al.}
+Fast and scalable likelihood maximization for exponential random graph models with local constraints.
+\textit{Scientific Reports} \textbf{11}, 15227 (2021).
+
+\end{thebibliography}
+
+\end{document}

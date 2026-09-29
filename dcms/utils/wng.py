@@ -3,21 +3,6 @@ import numpy as np
 import torch
 
 
-def k_s_generator(N, connectance=0.5, max_w=1000):
-    # get the topology
-    matrix = np.random.uniform(0, 1, (N, N))
-    matrix-=np.diag(matrix.diagonal())
-    matrix[matrix< 1-connectance] = 0  
-    matrix = torch.tensor(matrix, dtype=torch.float32)
-    A = torch.where(matrix > 0, 1, 0)  # Binarizza la matrice
-    W = np.random.randint(1, max_w, (N, N))
-    W = torch.tensor(W, dtype=torch.float32)
-    W=(W*A)
-    assert torch.all(torch.where(W > 0, 1, 0)==A)
-    s=torch.cat((W.sum(1), W.sum(0)))
-    k=torch.cat((A.sum(1), A.sum(0)))
-    return k, s
-
 def k_s_generator_pl(N, rho=1e-3, seed=None, alpha_pareto = 2.5):
     """Generate test network, using a CL model for the topology, w/ power law distributed degrees and strengths"""
     np.random.seed(seed)

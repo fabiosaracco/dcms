@@ -46,7 +46,7 @@ from typing import Callable
 
 import torch
 
-from dcms.models.parameters import qDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
+from dcms.models.parameters import DECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
 from dcms.solvers.base import SolverResult
 from dcms.utils.profiling import _PeakRAMMonitor

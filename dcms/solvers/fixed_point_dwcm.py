@@ -73,6 +73,17 @@ _ANDERSON_BLOWUP_FACTOR: float = 100.0
 # A value of 0.1 allows up to 10× acceleration per step while keeping θ > 0.
 _ANDERSON_THETA_FLOOR: float = 0.1
 
+# θ-Newton z = theta_out_i + theta_in_j floor against the W = 1/expm1(z)
+# singularity as z -> 0 (the same role DECM's `_Z_G_CLAMP` and qDECM's
+# `_Z_G_CLAMP` play for their own z = eta_out_i + eta_in_j -- named here for
+# the first time (2026-09-29 audit) purely for discoverability/consistency,
+# same value as before this rename (no behaviour change). DWCM has never
+# needed to relax this the way DECM's hub bisection does, so it has stayed
+# a plain floor; the three models' values (DWCM 1e-15, qDECM 1e-8, DECM
+# 1e-6) are NOT unified on purpose -- each was tuned independently for its
+# own numerics and there is no evidence one value would suit all three.
+_Z_G_CLAMP: float = 1e-15
+
 # In the β-space FP variants (gauss-seidel, jacobi), the FP map β_new = s/D(β)
 # can have spectral radius > 1 for high-strength hub nodes (β* ≈ 1), causing
 # slowly-growing oscillations that Anderson cannot accelerate away.  When the
@@ -253,7 +264,7 @@ def _dwcm_step_dense_weighted(
     theta_in = theta[M:]
 
     z = theta_out[:, None] + theta_in[None, :]
-    W = 1.0 / torch.expm1(z.clamp(min=1e-15))
+    W = 1.0 / torch.expm1(z.clamp(min=_Z_G_CLAMP))
     W_diag = W.diagonal()
     W1W = W * (1.0 + W)
     W1W_diag = W1W.diagonal()
@@ -265,7 +276,7 @@ def _dwcm_step_dense_weighted(
     theta_out_new = torch.where(s_out == 0, torch.full_like(theta_out_new, _ETA_MAX), theta_out_new)
 
     z2 = theta_out_new[:, None] + theta_in[None, :]
-    W2 = 1.0 / torch.expm1(z2.clamp(min=1e-15))
+    W2 = 1.0 / torch.expm1(z2.clamp(min=_Z_G_CLAMP))
     W2_diag = W2.diagonal()
     W1W2 = W2 * (1.0 + W2)
     W1W2_diag = W1W2.diagonal()
@@ -1227,7 +1238,7 @@ def _theta_newton_step_dense(
 
     # W_ij = 1/expm1(θ_out_i + θ_in_j),  W[i,i] = 0 (no self-loops)
     z = theta_out[:, None] + theta_in[None, :]          # (N, N)
-    W = 1.0 / torch.expm1(z.clamp(min=1e-15))          # (N, N)
+    W = 1.0 / torch.expm1(z.clamp(min=_Z_G_CLAMP))          # (N, N)
     W.fill_diagonal_(0.0)
 
     # Residual at current θ (free from the already-computed W)
@@ -1246,7 +1257,7 @@ def _theta_newton_step_dense(
 
     # In-direction Newton step (GS: use updated θ_out_new)
     z2 = theta_out_new[:, None] + theta_in[None, :]     # (N, N)
-    W2 = 1.0 / torch.expm1(z2.clamp(min=1e-15))        # (N, N)
+    W2 = 1.0 / torch.expm1(z2.clamp(min=_Z_G_CLAMP))        # (N, N)
     W2.fill_diagonal_(0.0)
 
     F_in2 = W2.sum(dim=0) - s_in                        # (N,)
@@ -1302,7 +1313,7 @@ def _theta_newton_step_chunked(
         i_end = min(i_start + chunk_size, N)
         chunk_len = i_end - i_start
         z_chunk = theta_out[i_start:i_end, None] + theta_in[None, :]   # (chunk, N)
-        W_chunk = 1.0 / torch.expm1(z_chunk.clamp(min=1e-15))
+        W_chunk = 1.0 / torch.expm1(z_chunk.clamp(min=_Z_G_CLAMP))
         local_i = torch.arange(chunk_len, dtype=torch.long)
         global_j = torch.arange(i_start, i_end, dtype=torch.long)
         W_chunk[local_i, global_j] = 0.0
@@ -1330,7 +1341,7 @@ def _theta_newton_step_chunked(
         chunk_len = j_end - j_start
         # z2[j_local, i] = θ_out_new[j] + θ_in[i]
         z2_chunk = theta_out_new[j_start:j_end, None] + theta_in[None, :]  # (chunk, N)
-        W2_chunk = 1.0 / torch.expm1(z2_chunk.clamp(min=1e-15))
+        W2_chunk = 1.0 / torch.expm1(z2_chunk.clamp(min=_Z_G_CLAMP))
         local_j = torch.arange(chunk_len, dtype=torch.long)
         global_i = torch.arange(j_start, j_end, dtype=torch.long)
         W2_chunk[local_j, global_i] = 0.0

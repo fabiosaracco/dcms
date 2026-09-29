@@ -19,3 +19,6 @@ htmlcov/
 venv/
 env/
 bad_seeds_phase4.txt
+
+# Jupyter checkpoints (auto-generated, was accidentally tracked before 2026-09-29)
+.ipynb_checkpoints/

@@ -458,7 +458,66 @@ model.solve_tool(
 )
 ```
 
-**Status:** available on all four models (DCM, DWCM, qDECM, DECM), including DECM's chunked degeneracy-reduced step (used automatically once `M` exceeds `qDECM_LARGE_N_THRESHOLD=2000` — i.e. every large real network). DECM's stagnation-recovery mechanisms (hub bisection, perturbed restart, §2.6) remain internally CPU-only by design and interoperate transparently with a non-CPU main-loop `device` — theta is moved to/from the right device automatically at each boundary, with no action needed from the caller.
+**Status:** available on all four models (DCM, DWCM, qDECM, DECM), including DECM's chunked degeneracy-reduced step (used automatically once `M` exceeds `DECM_LARGE_N_THRESHOLD=2000` — i.e. every large real network). DECM's stagnation-recovery mechanisms (hub bisection, perturbed restart, §2.6) remain internally CPU-only by design and interoperate transparently with a non-CPU main-loop `device` — theta is moved to/from the right device automatically at each boundary, with no action needed from the caller.
+
+---
+
+### 2.8 Argmax-streak targeted fix — breaking a single equation's monopoly on the residual (DECM)
+
+On some networks, once every other equation is well below tolerance, the same single `(node, side)` pair stays the argmax of the residual for many iterations in a row — the global Newton/Anderson step keeps nudging it, but too slowly, because that pair's own `(θ, η)` equations are ill-conditioned relative to the rest of the network (typically a node paired with a hub, or otherwise near a boundary). `streak_fix_threshold` breaks this monopoly by solving that one pair directly instead of waiting for the global step to finish it off.
+
+**Mechanism:**
+1. Each iteration, track which `(node, side)` (`side` = out or in — a node's `k` and `s` equations on one side share the same `(θ, η)` pair, so they're keyed together, not separately) is the argmax of the relative residual.
+2. If the *same* key has been the argmax for `streak_fix_threshold` consecutive iterations, run `_targeted_bisection_fix`: solve the `k`-equation for `θ` and the `s`-equation for `η` **at fixed `φ = θ + η`**, via nested bisection (`streak_fix_n_sweeps` outer sweeps × `streak_fix_n_bisect` bisection halvings each), for both the offending side and — since fixing one side can shift the other's balance — the opposite side too.
+3. Anderson history is cleared afterward (the fix is a discontinuous jump, not a step the mixing history should extrapolate from).
+
+**Why `φ`-fixed, not `θ`-fixed:** an earlier version alternated solving `θ` with `η` fixed, then `η` with `θ` fixed — this failed to converge whenever `η` was large (the two 1D searches fight each other along the same effective direction). Solving at fixed `φ = θ + η` instead decouples the pair cleanly and converges in a handful of sweeps regardless of scale.
+
+**Negative-`η` support:** the bisection bracket for `η` includes negative values for nodes that are "unreachable" under the plain `η ≥ 0` rule (see §2.3's hub bisection) but satisfy the true constraint `η_out_i + η_in_j > 0` for every existing pair — the same relaxation the hub bisection uses, applied here to non-hub nodes that get stuck.
+
+**When to use:** `streak_fix_threshold=0` (default) disables it — inert on networks that don't have this failure mode. When a network's residual visibly stalls with one equation dominating for a long stretch, values from `1` (fix immediately, every time the same pair repeats) to `50` (fix only after a long monopoly) have all been the deciding factor on different real networks; there is no single value that's right for every network, and this is exactly the kind of knob §3.4's `solve_tool()` now exposes so it can be tuned per network rather than guessed.
+
+**Combine with:** `hub_bisect_max_sweeps` (raise from the default 3 only when a relaxed hub sits next to a very tight partner, `z = η_out+η_in ~ 1e-4` — the out/in alternation of the ordinary hub bisection converges very slowly there; values above ~10 risk an unsafe extrapolation of the sweep sequence, don't raise it blindly) and `patience_rel_tol` (> 0 makes the stagnation-recovery ladder of §2.6 treat a record that's creeping down by a tiny amount every iteration — e.g. by ~1e-8 per step over thousands of iterations, which never triggers the *default* `patience_rel_tol=0`'s "any improvement resets the counter" rule — as a genuine stall, entering recovery instead of silently crawling forever).
+
+```python
+model = DECMModel(k_out, k_in, s_out, s_in)
+converged = model.solve_tool(
+    streak_fix_threshold=50,   # fix a (node, side) pair directly after it dominates the argmax for 50 iterations
+    streak_fix_n_sweeps=5,     # phi-fixed bisection sweeps per fix (default)
+    streak_fix_n_bisect=60,    # bisection halvings per sweep (default)
+    hub_bisect_max_sweeps=10,  # raise only if a relaxed hub / tight-partner pair converges slowly
+    patience_rel_tol=0.01,     # only a >1% record improvement resets the stagnation counter
+)
+```
+
+---
+
+### 2.9 Joint 2×2 block-Newton step for nearly saturated rows (DECM)
+
+Even with every mechanism above, a handful of real networks still plateaued: after degeneracy reduction, a family of nodes with `s ≈ k` (every out-link carries essentially weight 1) kept the residual pinned at a fixed floor no amount of extra time moved. Tracing one of these plateaus down to the group level found the actual cause: the Newton step solves `θ` from the `k`-equation and `η` from the `s`-equation as two **decoupled** scalar Newton steps (ignoring the cross-derivative between them). For a row with `s ≈ k` — where the weight factor `G = 1/(1-β_out β_in) ≈ 1` — the two equations are *almost the same function*, so the exact 2×2 Hessian block `[[A,B],[B,C]]` of that row is nearly singular: `det/(A·C) = 1 - ρ² ~ 1e-4`–`1e-5` on the affected rows. The decoupled scalar iteration only contracts by `ρ ≈ 1 - 1e-5` per step along that row's own soft direction — thousands of iterations per e-fold of progress, which looks exactly like a stall.
+
+**Mechanism (`block_newton_gate`):** for a row whose `det/(A·C)` falls below `block_newton_gate`, solve the exact joint 2×2 Newton step for `(θ, η)` instead of the two decoupled scalar ones (written in the numerically stable `g = G-1` form to avoid cancellation in `A·C - B²`; jointly clipped to `max_step` and sharing the pair-sum `η ≥ z_clamp` floor's scaling, so it can't push the pair below the feasibility floor either). `block_newton_gate=0.0` (default) reproduces the old decoupled step bit-for-bit. Hub-owned rows (§2.3) are always excluded — their `η` already belongs to the hub bisection.
+
+**The failure mode this alone does NOT fix — and why `block_newton_min_rel` exists:** a row with `s == k` *exactly* has no finite solution — its true fixed point lies at `θ → -∞, η → +∞` along the soft direction `(θ - c, η + c)`, with the residual only ever approaching zero in the limit. Once such a row's residual is already small, the joint step has nothing stopping it from continuing to march that row along the soft direction at `max_step` per iteration, forever, long past any useful precision — and a handful of rows doing this simultaneously destabilizes their neighbours (`θ` reaching -30, `η` reaching +37 was traced directly on one real network before the residual exploded past 1). `block_newton_min_rel` (default `0.1 * tol` whenever the gate is active, `0.0` disables the restriction) excludes rows whose relative residual is already below that value from the joint step, leaving them to the harmless (if slow) scalar step once they're that close.
+
+**⚠️ Honest status — this is opt-in per network, not a default, and `block_newton_gate` alone (without `min_rel`) is not safe:**
+- On a 30-iteration stability check from several already-converged real networks, a bare `block_newton_gate=0.05` (no `min_rel`) made 4 of them **worse**, some substantially (one network's residual rose from converged to a transient peak of 8.8×10³ before settling back down; another rose to 4.9×10⁻¹ and had *not* recovered by iteration 30) — and diverged a different, previously-easy network within a 10-minute fresh-start run that converges cleanly with the gate off.
+- With `min_rel` added, the two plateaued real networks this was built for both converged cleanly (see below) — but the full stability check above has **not** been re-run with `min_rel` active, so a blanket default is not yet justified either way.
+- **Recommendation:** treat `block_newton_gate`/`block_newton_min_rel` as a targeted intervention for a network you've confirmed is stuck on this specific failure mode (a `hub_sk_threshold`-independent residual plateau dominated by `s ≈ k` rows), not something to turn on everywhere. Always pair a non-zero `block_newton_gate` with `block_newton_min_rel` (its default already does this).
+
+**Validated on two real networks that had resisted every other mechanism in this README** (quirinale_dico4 and ita_elections_dico1 — the last two of the project's 19 real-world networks to reach `MRE ≤ 1e-5`, closing that count out entirely, 2026-09-28):
+- `quirinale_dico4` (N=22 754): plateaued at MRE=3.5175×10⁻⁵. `block_newton_gate=0.05` alone (converged too fast, 46 iterations, to observe the runaway-row failure mode above) reached **MRE=9.35×10⁻⁶**.
+- `ita_elections_dico1` (N=107 056): plateaued at MRE=1.8513×10⁻⁴ — a larger, more dominant `s≈k` family than `quirinale_dico4`'s. `block_newton_gate=0.05` alone repeatedly diverged via the runaway-row mode within ~35-100 iterations (traced and confirmed identical at `anderson_depth=1` and `anderson_depth=3`, ruling out an Anderson-mixing artifact). Adding `block_newton_min_rel=1e-6` (the same value the default formula gives at `tol=1e-5`) converged cleanly in 94 iterations to **MRE=9.96×10⁻⁶**.
+
+```python
+model = DECMModel(k_out, k_in, s_out, s_in)
+converged = model.solve_tool(
+    hub_sk_threshold=2.0,        # this network's other stuck rows are hub-shaped too; tune independently
+    streak_fix_threshold=1,      # often combined with the streak-fix of §2.8
+    block_newton_gate=0.05,      # opt in only once you've confirmed a s~k plateau -- see the caveat above
+    block_newton_min_rel=None,   # None = 0.1*tol whenever the gate is active (recommended); 0.0 = no restriction
+)
+```
 
 ---
 
@@ -567,6 +626,7 @@ converged = model.solve_tool(
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
+    z_clamp=1e-8,           # floor on the weight step's z; exposed for symmetry with DECM's own z_clamp, don't change lightly
     reduce_degeneracy=True, # collapse degenerate node groups in both steps (see §2.5); default True
     device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
 )
@@ -618,14 +678,25 @@ converged = model.solve_tool(
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
+    hub_bisect_max_sweeps=3,# raise (e.g. 10) only for a relaxed hub next to a very tight partner (see §2.8)
     backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
+    z_clamp=1e-6,           # floor on the pair sum eta_out+eta_in; tied to the residual's own clamp, don't change lightly
+    block_newton_gate=0.0,  # >0: exact joint 2x2 (theta,eta) step on ill-conditioned (s~k) rows; opt-in, see §2.9
+    block_newton_min_rel=None,  # None = 0.1*tol whenever the gate is active (recommended); see §2.9
+    streak_fix_threshold=0, # >0: directly solve a (node,side) pair that monopolizes the argmax this many iters (see §2.8)
+    streak_fix_n_sweeps=5,  # phi-fixed bisection sweeps per streak-fix call (see §2.8)
+    streak_fix_n_bisect=60, # bisection halvings per sweep (see §2.8)
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
     blowup_factor=None,     # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner (see §2.6)
     patience=750,           # restart from best_theta+noise after this many iters with no improvement (see §2.6)
-    noise_base=1e-2,        # scale of the first perturbed restart's (multiplicative) noise (see §2.6)
+    patience_rel_tol=0.0,   # >0: only a record improvement by more than this fraction resets patience (see §2.8)
+    noise_base=1e-4,        # scale of the first perturbed restart's (multiplicative) noise (see §2.6)
     noise_cap_mult=16.0,    # noise scale saturates at noise_base * noise_cap_mult (see §2.6)
     noise_growth=2.0,       # noise growth rate per consecutive failed restart (see §2.6)
     max_stalls=5,           # give up after this many restarts at max noise with no improvement (see §2.6)
+    bisection_kick_iters=0, # >0: a structured (non-random) coordinate-bisection kick, tier 2 of the §2.6 ladder
+    bisection_kick_n_bisect=30,  # bisection halvings per stage per kick iteration
+    bisection_kick_device="cpu", # "cpu" (float64, exact) or "mps"/"cuda" (float32) for the kick specifically
     seed=None,              # seed for the restart RNG; irrelevant if no restart ever fires (see §2.6)
     device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
                              # covers both the dense and chunked reduced-path steps; stagnation recovery (§2.6) stays CPU-only internally and interoperates transparently

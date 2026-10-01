@@ -585,3 +585,62 @@ class TestDegeneracyReduction:
         np.fill_diagonal(W1, 0.0)
         np.fill_diagonal(W2, 0.0)
         assert np.max(np.abs(W1 - W2)) < 1e-4
+
+
+class TestFpgsNewtonMiniLoopGuard:
+    """The FP-GS periodic Newton-Anderson mini-loop (fixed_point_dwcm.py, fired after 30
+    iterations with no record improvement -- see decm_dwcm_degenerate_stagnation_bug memory)
+    used to accept its own output unconditionally (`theta_next = theta_nt`) even when its
+    internal Anderson mixing itself diverged. Found 2026-09-30 on a from-scratch benchmark run
+    (a different machine, via the cref_out mailbox): ita_elections_dico1 sits in a near-exact
+    floating-point limit cycle under DWCM, and depending on the CPU thread count (hence the
+    float64 summation order of PyTorch's parallel reductions -- NOT a bug in the network's own
+    data), the mini-loop's own correction can itself diverge by several orders of magnitude
+    before being handed back to the main loop as its new starting point, wasting the 30
+    iterations of progress the mechanism exists to recover and -- since it also resets the
+    blowup-guard reference right after -- going undetected until the outer 200-iteration
+    stagnation check eventually gives up. Fixed by scoring the mini-loop's actual final output
+    and falling back to best_theta (a point already known to be no worse) when it is not --
+    using the same `_ANDERSON_BLOWUP_FACTOR` tolerance the rest of the file already judges
+    genuine divergence by, not a stricter bar (which empirically rejected useful partial
+    progress on normal, non-pathological firings too -- see the commit message for the two
+    tolerances compared side by side)."""
+
+    _REAL_NET = (
+        Path(__file__).resolve().parents[2] / "bowtie2" / "tests" / "ita_elections_dico1_gdamp_decm.pkl"
+    )
+
+    def test_mini_loop_fix_on_the_real_network_that_found_the_bug(self) -> None:
+        if not self._REAL_NET.exists():
+            pytest.skip(f"real-network data not present at {self._REAL_NET} (outside this repo)")
+        import pickle
+        with open(self._REAL_NET, "rb") as fh:
+            m = pickle.load(fh)  # a DECMModel; only s_out/s_in are used here
+        model = DWCMModel(m.s_out, m.s_in)
+        prev_threads = torch.get_num_threads()
+        try:
+            # num_threads=2 is the specific reproduction that found this bug (see the memory
+            # note above) -- it is not guaranteed to reproduce the EXACT failure on every
+            # torch build/platform (float64 summation order is build/platform-dependent), but
+            # is the best concrete regression guard available against reintroducing the
+            # "accept the mini-loop's output unconditionally" bug.
+            torch.set_num_threads(2)
+            converged = model.solve_tool(
+                ic="strengths", tol=1e-5, max_iter=500, max_time=300,
+                anderson_depth=10, backend="pytorch", num_threads=2,
+            )
+        finally:
+            torch.set_num_threads(prev_threads)
+        assert converged, (
+            f"ita_elections_dico1/DWCM did not converge at num_threads=2: "
+            f"{model.sol.message}"
+        )
+
+    def test_easy_network_unaffected(self) -> None:
+        """The guard must be inert (no behaviour change) for a network that never stagnates
+        long enough to fire the mini-loop at all."""
+        model, _ = make_dwcm_model(N=10, seed=1)
+        converged = model.solve_tool(
+            ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10, backend="pytorch",
+        )
+        assert converged

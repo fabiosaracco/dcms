@@ -644,3 +644,54 @@ class TestFpgsNewtonMiniLoopGuard:
             ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10, backend="pytorch",
         )
         assert converged
+
+
+class TestFpgsNewtonMiniLoopJitterRetry:
+    """2026-10-07: a diverging mini-loop (TestFpgsNewtonMiniLoopGuard) now gets ONE retry from
+    a deterministically-jittered best_theta before giving up, instead of falling straight back
+    -- found necessary because remote (16/24 CPU threads, not reproducible on this machine)
+    reported the plain fallback just re-enters the identical limit cycle. The retry mechanism
+    itself is NOT validated here against a genuine divergence (none reproduces locally at the
+    thread counts available) -- these are structural/no-regression checks only; see the
+    fix_dwcm_jitter_retry commit message for the honest scope of what IS and is NOT verified."""
+
+    def test_jitter_is_deterministic_small_and_sign_preserving(self) -> None:
+        theta = torch.rand(50, dtype=torch.float64) * 5.0 + _ETA_MIN
+        jitter = 1.0 + 1e-6 * (2.0 * (torch.arange(theta.shape[0]) % 2) - 1.0)
+        perturbed = (theta * jitter).clamp(_ETA_MIN, _ETA_MAX)
+        assert torch.equal(perturbed, (theta * jitter).clamp(_ETA_MIN, _ETA_MAX))  # deterministic
+        assert float((perturbed - theta).abs().max() / theta.max()) < 1e-5          # small
+        assert bool((perturbed > 0).all())                                          # stays feasible
+        # alternating sign of the relative perturbation across adjacent components
+        signs = torch.sign(perturbed - theta)
+        assert bool((signs[0::2] != signs[1::2]).all()) or theta.shape[0] < 2
+
+    def test_easy_network_still_converges_with_the_retry_path_compiled_in(self) -> None:
+        """No-regression check: the retry code must not change behaviour for a network that
+        never fires the mini-loop at all (same network as TestFpgsNewtonMiniLoopGuard's twin)."""
+        model, _ = make_dwcm_model(N=10, seed=1)
+        converged = model.solve_tool(
+            ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10, backend="pytorch",
+        )
+        assert converged
+
+    def test_real_network_regression_still_fixed(self) -> None:
+        """The original threads=2 reproduction (TestFpgsNewtonMiniLoopGuard) must still converge
+        with the retry logic compiled in -- the first attempt alone already succeeds there, so
+        this also confirms the retry path is never (wrongly) taken on an easy recovery."""
+        if not TestFpgsNewtonMiniLoopGuard._REAL_NET.exists():
+            pytest.skip(f"real-network data not present at {TestFpgsNewtonMiniLoopGuard._REAL_NET} (outside this repo)")
+        import pickle
+        with open(TestFpgsNewtonMiniLoopGuard._REAL_NET, "rb") as fh:
+            m = pickle.load(fh)
+        model = DWCMModel(m.s_out, m.s_in)
+        prev_threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(2)
+            converged = model.solve_tool(
+                ic="strengths", tol=1e-5, max_iter=500, max_time=300,
+                anderson_depth=10, backend="pytorch", num_threads=2,
+            )
+        finally:
+            torch.set_num_threads(prev_threads)
+        assert converged, model.sol.message

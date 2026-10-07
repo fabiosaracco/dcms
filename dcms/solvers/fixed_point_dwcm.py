@@ -896,85 +896,109 @@ def solve_fixed_point_dwcm(
                             th, s_out, s_in, max_step, eta_lo=_ETA_MIN,
                         )
 
-                theta_nt = best_theta.clone()
-                _nt_and_g: list[torch.Tensor] = []
-                _nt_and_r: list[torch.Tensor] = []
-                for _ in range(_FPGS_NEWTON_STEPS):
-                    theta_nt_fp, F_nt = _nt_step(theta_nt)
-                    # Per-step floor (same as main loop)
-                    _nt_floor = (theta_nt * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
-                    theta_nt_fp = torch.maximum(theta_nt_fp, _nt_floor).clamp(
-                        _ETA_MIN, _ETA_MAX
-                    )
-                    nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
-                    if nt_res < tol:
-                        theta_nt = theta_nt_fp
-                        break
-                    # Anderson mixing within the mini-loop
-                    r_nt = theta_nt_fp - theta_nt
-                    r_nt_norm = r_nt.abs().max().item()
-                    if math.isfinite(r_nt_norm) and r_nt_norm < _ANDERSON_MAX_NORM:
-                        _nt_and_g.append(theta_nt_fp.clone())
-                        _nt_and_r.append(r_nt.clone())
-                    if len(_nt_and_g) > _FPGS_NEWTON_AND_DEPTH:
-                        _nt_and_g.pop(0)
-                        _nt_and_r.pop(0)
-                    if len(_nt_and_g) >= 2:
-                        theta_nt_next = _anderson_mixing(
-                            _nt_and_g, _nt_and_r, weights=_anderson_weights
-                        )
-                        eff_floor = torch.minimum(
-                            _nt_floor, theta_nt_fp
-                        )
-                        theta_nt_next = torch.maximum(theta_nt_next, eff_floor).clamp(
+                def _run_mini_loop(start: torch.Tensor) -> tuple[torch.Tensor, float]:
+                    """30 steps of theta-Newton + Anderson(_FPGS_NEWTON_AND_DEPTH) from
+                    `start`. Returns (theta_nt, nt_res_final) where nt_res_final is the
+                    ACTUAL final output's residual -- not the stale nt_res from one substep
+                    earlier, which belongs to theta_nt's PREVIOUS value unless the loop broke
+                    out on the tol check below -- computed with one extra _nt_step call."""
+                    theta_nt = start.clone()
+                    _nt_and_g: list[torch.Tensor] = []
+                    _nt_and_r: list[torch.Tensor] = []
+                    for _ in range(_FPGS_NEWTON_STEPS):
+                        theta_nt_fp, F_nt = _nt_step(theta_nt)
+                        # Per-step floor (same as main loop)
+                        _nt_floor = (theta_nt * _ANDERSON_THETA_FLOOR).clamp(min=_ETA_MIN)
+                        theta_nt_fp = torch.maximum(theta_nt_fp, _nt_floor).clamp(
                             _ETA_MIN, _ETA_MAX
                         )
-                    else:
-                        theta_nt_next = theta_nt_fp
-                    theta_nt = theta_nt_next
+                        nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
+                        if nt_res < tol:
+                            theta_nt = theta_nt_fp
+                            break
+                        # Anderson mixing within the mini-loop
+                        r_nt = theta_nt_fp - theta_nt
+                        r_nt_norm = r_nt.abs().max().item()
+                        if math.isfinite(r_nt_norm) and r_nt_norm < _ANDERSON_MAX_NORM:
+                            _nt_and_g.append(theta_nt_fp.clone())
+                            _nt_and_r.append(r_nt.clone())
+                        if len(_nt_and_g) > _FPGS_NEWTON_AND_DEPTH:
+                            _nt_and_g.pop(0)
+                            _nt_and_r.pop(0)
+                        if len(_nt_and_g) >= 2:
+                            theta_nt_next = _anderson_mixing(
+                                _nt_and_g, _nt_and_r, weights=_anderson_weights
+                            )
+                            eff_floor = torch.minimum(
+                                _nt_floor, theta_nt_fp
+                            )
+                            theta_nt_next = torch.maximum(theta_nt_next, eff_floor).clamp(
+                                _ETA_MIN, _ETA_MAX
+                            )
+                        else:
+                            theta_nt_next = theta_nt_fp
+                        theta_nt = theta_nt_next
+                    _nt_fp_final, _F_nt_final = _nt_step(theta_nt)
+                    nt_res_final = (
+                        (_F_nt_final.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
+                        if _v_nonzero.any() else 0.0
+                    )
+                    return theta_nt, nt_res_final
 
-                # Score the mini-loop's ACTUAL final output (not the stale nt_res from
-                # one substep earlier, which belongs to theta_nt's PREVIOUS value unless
-                # the loop broke out on the tol check above) before accepting it.
+                # Found empirically (2026-09-30, DWCM benchmark on a second machine): on a
+                # network stuck in a near-exact floating-point limit cycle, this mini-loop's
+                # own internal Anderson mixing can itself diverge -- observed growing
+                # 0.98 -> 2.8e4 -> ... -> 2.8e7 over 4 substeps under a thread count (hence
+                # float64 summation order) a different thread count did not trigger on the
+                # exact same network/recipe. The old code accepted theta_nt unconditionally,
+                # so a diverging mini-loop discarded 30 iterations of real progress and handed
+                # the main loop a far worse starting point than it had before the "rescue" --
+                # and also disarmed the main loop's own blowup guard right after (see below),
+                # so nothing caught it.
                 #
-                # Found empirically (2026-09-30, DWCM benchmark on a second machine):
-                # on a network stuck in a near-exact floating-point limit cycle, this
-                # mini-loop's own internal Anderson mixing can itself diverge -- observed
-                # growing 0.98 -> 2.8e4 -> 2.8e5 -> 2.8e6 -> 2.8e7 over 4 substeps under a
-                # thread-count (hence float64 summation order) that a different thread
-                # count did not trigger on the exact same network/recipe. The old code
-                # accepted theta_nt unconditionally as theta_next regardless, so a
-                # diverging mini-loop discarded 30 iterations of real progress and handed
-                # the main loop a far worse starting point than it had before the "rescue"
-                # -- and the very next line (_best_res_for_anderson = inf) also disarmed
-                # the main loop's own blowup guard for the following iteration, so nothing
-                # caught it. Falling back to best_theta on a worse-or-equal outcome costs
-                # nothing when the mini-loop succeeds (its own purpose is to beat the
-                # record, so success and "nt_res_final <= best_theta_res" coincide) and
-                # fixes the diverging case by simply not propagating it.
-                _nt_fp_final, _F_nt_final = _nt_step(theta_nt)
-                nt_res_final = (
-                    (_F_nt_final.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
-                    if _v_nonzero.any() else 0.0
-                )
-                # Use the same blowup tolerance the main loop already judges genuine
-                # divergence by (_ANDERSON_BLOWUP_FACTOR), not a strict "must already beat
-                # the record" bar -- the mini-loop's whole point is to make INCREMENTAL
-                # progress a stagnant main loop could not; rejecting anything that hasn't
-                # yet beaten best_theta_res outright would also discard real, useful partial
-                # progress on every normal (non-pathological) firing, not just the
-                # pathological one this guard exists for. A catastrophic divergence (the
-                # 0.98 -> 2.8e7 case) fails this by 5 orders of magnitude either way.
+                # First attempt, from best_theta exactly. Accept unless it's a genuine blowup
+                # (same _ANDERSON_BLOWUP_FACTOR tolerance the main loop already judges
+                # divergence by, not a strict "must already beat the record" bar -- the
+                # mini-loop's whole point is incremental progress a stagnant main loop could
+                # not make, and rejecting anything that hasn't yet beaten best_theta_res
+                # outright would also discard real, useful partial progress on every normal
+                # firing, not just the pathological one this guard exists for).
+                theta_nt, nt_res_final = _run_mini_loop(best_theta)
                 if math.isfinite(nt_res_final) and nt_res_final <= _ANDERSON_BLOWUP_FACTOR * best_theta_res:
                     theta_next = theta_nt
                 else:
-                    if verbose:
-                        print(
-                            f"[fpgs-newton] mini-loop correction diverged "
-                            f"(nt_res={nt_res_final:.3e} >> best={best_theta_res:.3e}) -- "
-                            f"falling back to best_theta instead of propagating it."
-                        )
-                    theta_next = best_theta.clone()
+                    # Found 2026-10-07 (remote benchmark, 16/24 CPU threads -- a thread count
+                    # we cannot reproduce locally): on a network stuck in a near-EXACT limit
+                    # cycle (not just near-exact), falling straight back to best_theta here
+                    # just re-enters the identical cycle, burns another _FPGS_NEWTON_RESET_WINDOW
+                    # iterations counting back up to 30, and repeats indefinitely until the
+                    # outer give-up check kills the run -- a plain rollback cannot escape a
+                    # genuine limit cycle any more than it could in the main loop itself (see
+                    # the DECM perturbed-restart design this mirrors: a deterministic trap
+                    # needs a deterministic symmetry break, not another identical attempt).
+                    # One retry from a DETERMINISTICALLY perturbed best_theta (fixed
+                    # alternating +-1e-6 relative jitter by component index -- not random, so
+                    # this stays reproducible and adds no new seed/RNG surface to the solver):
+                    # if that one also fails the same check, THEN fall back to best_theta
+                    # unperturbed, as before.
+                    _jitter = 1.0 + 1e-6 * (2.0 * (torch.arange(best_theta.shape[0]) % 2) - 1.0)
+                    theta_nt2, nt_res2 = _run_mini_loop((best_theta * _jitter).clamp(_ETA_MIN, _ETA_MAX))
+                    if math.isfinite(nt_res2) and nt_res2 <= _ANDERSON_BLOWUP_FACTOR * best_theta_res:
+                        theta_next = theta_nt2
+                        if verbose:
+                            print(
+                                f"[fpgs-newton] first mini-loop correction diverged "
+                                f"(nt_res={nt_res_final:.3e} >> best={best_theta_res:.3e}) -- "
+                                f"retry from a jittered start succeeded (nt_res={nt_res2:.3e})."
+                            )
+                    else:
+                        if verbose:
+                            print(
+                                f"[fpgs-newton] mini-loop correction diverged twice "
+                                f"(nt_res={nt_res_final:.3e} and {nt_res2:.3e} >> "
+                                f"best={best_theta_res:.3e}) -- falling back to best_theta."
+                            )
+                        theta_next = best_theta.clone()
                 # Reset blowup threshold so post-Newton residuals don't trigger
                 # a false blowup on the very next main-loop iteration.
                 _best_res_for_anderson = float("inf")

@@ -646,25 +646,54 @@ class TestFpgsNewtonMiniLoopGuard:
         assert converged
 
 
-class TestFpgsNewtonMiniLoopJitterRetry:
-    """2026-10-07: a diverging mini-loop (TestFpgsNewtonMiniLoopGuard) now gets ONE retry from
-    a deterministically-jittered best_theta before giving up, instead of falling straight back
-    -- found necessary because remote (16/24 CPU threads, not reproducible on this machine)
-    reported the plain fallback just re-enters the identical limit cycle. The retry mechanism
-    itself is NOT validated here against a genuine divergence (none reproduces locally at the
-    thread counts available) -- these are structural/no-regression checks only; see the
-    fix_dwcm_jitter_retry commit message for the honest scope of what IS and is NOT verified."""
+class TestFpgsNewtonMiniLoopRetryLadder:
+    """2026-10-07: a diverging mini-loop (TestFpgsNewtonMiniLoopGuard) now gets up to
+    `_FPGS_NEWTON_RETRY_MAX` attempts -- the first unperturbed, the rest from randomly
+    perturbed starts at geometrically escalating noise scale (mirroring DECM's own
+    validated perturbed-restart design: random, log-scale multiplicative noise, growing
+    by `_FPGS_NEWTON_RETRY_NOISE_GROWTH` per attempt) -- before giving up and falling back
+    to best_theta. Supersedes an earlier single-fixed-jitter retry (one retry, deterministic
+    +-1e-6 relative jitter) that remote's retest showed was not enough: it only took the
+    divergence from 2.8e6 down to 1.1e5, still far above the acceptance bar. The retry
+    ladder's actual escape behaviour is NOT validated here against a genuine divergence
+    (none reproduces locally at the thread counts available on this machine) -- these are
+    structural/no-regression/determinism checks only; see the commit message for the
+    honest scope of what IS and is NOT verified."""
 
-    def test_jitter_is_deterministic_small_and_sign_preserving(self) -> None:
+    def test_retry_noise_scale_escalates_and_draws_are_seed_reproducible(self) -> None:
+        from dcms.solvers.fixed_point_dwcm import (
+            _FPGS_NEWTON_RETRY_NOISE_BASE,
+            _FPGS_NEWTON_RETRY_NOISE_GROWTH,
+            _FPGS_NEWTON_RETRY_MAX,
+        )
+        # The intended per-attempt scale (the formula the solver uses) must be strictly
+        # increasing across retries -- this is a deterministic property of the formula
+        # itself, not of any particular random draw.
+        scales = [
+            _FPGS_NEWTON_RETRY_NOISE_BASE * (_FPGS_NEWTON_RETRY_NOISE_GROWTH ** a)
+            for a in range(_FPGS_NEWTON_RETRY_MAX - 1)
+        ]
+        assert scales == sorted(scales) and len(set(scales)) == len(scales)
+
         theta = torch.rand(50, dtype=torch.float64) * 5.0 + _ETA_MIN
-        jitter = 1.0 + 1e-6 * (2.0 * (torch.arange(theta.shape[0]) % 2) - 1.0)
-        perturbed = (theta * jitter).clamp(_ETA_MIN, _ETA_MAX)
-        assert torch.equal(perturbed, (theta * jitter).clamp(_ETA_MIN, _ETA_MAX))  # deterministic
-        assert float((perturbed - theta).abs().max() / theta.max()) < 1e-5          # small
-        assert bool((perturbed > 0).all())                                          # stays feasible
-        # alternating sign of the relative perturbation across adjacent components
-        signs = torch.sign(perturbed - theta)
-        assert bool((signs[0::2] != signs[1::2]).all()) or theta.shape[0] < 2
+
+        def _ladder(seed: int) -> list[torch.Tensor]:
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            starts = [theta.clone()]
+            for attempt in range(1, _FPGS_NEWTON_RETRY_MAX):
+                scale = _FPGS_NEWTON_RETRY_NOISE_BASE * (
+                    _FPGS_NEWTON_RETRY_NOISE_GROWTH ** (attempt - 1)
+                )
+                noise = (torch.randn(theta.shape, generator=gen) * scale).to(dtype=theta.dtype)
+                starts.append((theta * torch.exp(noise)).clamp(_ETA_MIN, _ETA_MAX))
+            return starts
+
+        ladder_a = _ladder(123)
+        ladder_b = _ladder(123)
+        for a, b in zip(ladder_a, ladder_b):
+            assert torch.equal(a, b)  # same seed -> identical ladder (reproducible)
+        assert bool((ladder_a[-1] > 0).all())  # stays feasible after clamp
 
     def test_easy_network_still_converges_with_the_retry_path_compiled_in(self) -> None:
         """No-regression check: the retry code must not change behaviour for a network that

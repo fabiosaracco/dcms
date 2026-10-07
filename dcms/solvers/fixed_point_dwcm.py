@@ -112,6 +112,18 @@ _FPGS_NEWTON_RESET_WINDOW: int = 30
 _FPGS_NEWTON_STEPS: int = 30
 _FPGS_NEWTON_AND_DEPTH: int = 5
 
+# Retry ladder for a diverging mini-loop correction (see the `if _fpgs_newton_fired:` block):
+# a single fixed +-1e-6 relative jitter retry was NOT enough on the real failure this targets
+# (ita_elections_dico1 at 16/24 CPU threads, 2026-10-07 remote report: the jittered retry's own
+# divergence improved ~20x, 2.8e6 -> 1.1e5, but stayed ~5 orders of magnitude above the accept
+# threshold) -- escalating RANDOM multiplicative noise, same shape as DECM's own validated
+# perturbed-restart ladder (see fixed_point_decm.py's `noise_base`/`noise_growth`/`max_stalls`),
+# replaces it. Values match DECM's own batch-recipe defaults for consistency, not because DWCM's
+# dynamics are known to need exactly these -- retune if the real failure case still isn't fixed.
+_FPGS_NEWTON_RETRY_NOISE_BASE: float = 2e-3
+_FPGS_NEWTON_RETRY_NOISE_GROWTH: float = 2.0
+_FPGS_NEWTON_RETRY_MAX: int = 5
+
 
 
 def _anderson_mixing(
@@ -311,6 +323,7 @@ def solve_fixed_point_dwcm(
     mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
     device: str = "cpu",
+    seed: int | None = None,
 ) -> SolverResult:
     """Fixed-point iteration for the DWCM.
 
@@ -375,10 +388,20 @@ def solve_fixed_point_dwcm(
             degeneracy-reduced path) and ``backend`` resolving to
             ``"pytorch"``. The returned ``SolverResult`` is always
             CPU/float64 regardless of ``device``.
+        seed: Seed for the mini-loop's retry-noise RNG (see
+            ``_FPGS_NEWTON_RETRY_NOISE_BASE`` and the ``if _fpgs_newton_fired:``
+            block) -- private, does not touch global RNG state, mirrors
+            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
+            parameter of the same name. ``None`` (default) is
+            unseeded/non-reproducible -- only relevant for instances that
+            actually hit a diverging mini-loop firing.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
     """
+    _mini_loop_gen = torch.Generator()
+    if seed is not None:
+        _mini_loop_gen.manual_seed(seed)
     if mult is not None:
         if variant != "theta-newton":
             raise NotImplementedError(
@@ -963,42 +986,57 @@ def solve_fixed_point_dwcm(
                 # not make, and rejecting anything that hasn't yet beaten best_theta_res
                 # outright would also discard real, useful partial progress on every normal
                 # firing, not just the pathological one this guard exists for).
-                theta_nt, nt_res_final = _run_mini_loop(best_theta)
-                if math.isfinite(nt_res_final) and nt_res_final <= _ANDERSON_BLOWUP_FACTOR * best_theta_res:
-                    theta_next = theta_nt
-                else:
-                    # Found 2026-10-07 (remote benchmark, 16/24 CPU threads -- a thread count
-                    # we cannot reproduce locally): on a network stuck in a near-EXACT limit
-                    # cycle (not just near-exact), falling straight back to best_theta here
-                    # just re-enters the identical cycle, burns another _FPGS_NEWTON_RESET_WINDOW
-                    # iterations counting back up to 30, and repeats indefinitely until the
-                    # outer give-up check kills the run -- a plain rollback cannot escape a
-                    # genuine limit cycle any more than it could in the main loop itself (see
-                    # the DECM perturbed-restart design this mirrors: a deterministic trap
-                    # needs a deterministic symmetry break, not another identical attempt).
-                    # One retry from a DETERMINISTICALLY perturbed best_theta (fixed
-                    # alternating +-1e-6 relative jitter by component index -- not random, so
-                    # this stays reproducible and adds no new seed/RNG surface to the solver):
-                    # if that one also fails the same check, THEN fall back to best_theta
-                    # unperturbed, as before.
-                    _jitter = 1.0 + 1e-6 * (2.0 * (torch.arange(best_theta.shape[0]) % 2) - 1.0)
-                    theta_nt2, nt_res2 = _run_mini_loop((best_theta * _jitter).clamp(_ETA_MIN, _ETA_MAX))
-                    if math.isfinite(nt_res2) and nt_res2 <= _ANDERSON_BLOWUP_FACTOR * best_theta_res:
-                        theta_next = theta_nt2
-                        if verbose:
-                            print(
-                                f"[fpgs-newton] first mini-loop correction diverged "
-                                f"(nt_res={nt_res_final:.3e} >> best={best_theta_res:.3e}) -- "
-                                f"retry from a jittered start succeeded (nt_res={nt_res2:.3e})."
-                            )
+                # Found 2026-10-07 (remote benchmark, 16/24 CPU threads -- a thread count we
+                # cannot reproduce locally): on a network stuck in a near-EXACT limit cycle
+                # (not just near-exact), falling straight back to best_theta here just
+                # re-enters the identical cycle, burns another _FPGS_NEWTON_RESET_WINDOW
+                # iterations counting back up to 30, and repeats indefinitely until the outer
+                # give-up check kills the run -- a plain rollback cannot escape a genuine
+                # limit cycle any more than it could in the main loop itself. A SINGLE fixed
+                # deterministic jitter (+-1e-6 relative, tried first) was not enough: remote's
+                # retest showed it only takes the divergence from 2.8e6 down to 1.1e5, still
+                # ~5 orders of magnitude above the acceptance bar. Escalating to the same
+                # perturbed-restart LADDER already validated in DECM's own solver (random,
+                # log-scale multiplicative noise, growing geometrically, several attempts
+                # before giving up) gives the symmetry break more room to actually clear the
+                # cycle instead of landing on another point of it.
+                for _attempt in range(_FPGS_NEWTON_RETRY_MAX):
+                    if _attempt == 0:
+                        _start = best_theta
+                        _noise_scale = 0.0
                     else:
-                        if verbose:
+                        _noise_scale = _FPGS_NEWTON_RETRY_NOISE_BASE * (
+                            _FPGS_NEWTON_RETRY_NOISE_GROWTH ** (_attempt - 1)
+                        )
+                        _noise = (
+                            torch.randn(best_theta.shape, generator=_mini_loop_gen) * _noise_scale
+                        ).to(device=best_theta.device, dtype=best_theta.dtype)
+                        _start = (best_theta * torch.exp(_noise)).clamp(_ETA_MIN, _ETA_MAX)
+                    theta_nt, nt_res_final = _run_mini_loop(_start)
+                    if math.isfinite(nt_res_final) and nt_res_final <= _ANDERSON_BLOWUP_FACTOR * best_theta_res:
+                        theta_next = theta_nt
+                        if verbose and _attempt > 0:
                             print(
-                                f"[fpgs-newton] mini-loop correction diverged twice "
-                                f"(nt_res={nt_res_final:.3e} and {nt_res2:.3e} >> "
-                                f"best={best_theta_res:.3e}) -- falling back to best_theta."
+                                f"[fpgs-newton] mini-loop correction diverged on attempt "
+                                f"{_attempt}/{_FPGS_NEWTON_RETRY_MAX} -- retry {_attempt + 1} "
+                                f"(noise_scale={_noise_scale:.1e}) succeeded "
+                                f"(nt_res={nt_res_final:.3e})."
                             )
-                        theta_next = best_theta.clone()
+                        break
+                    if verbose:
+                        print(
+                            f"[fpgs-newton] mini-loop correction attempt {_attempt + 1}/"
+                            f"{_FPGS_NEWTON_RETRY_MAX} diverged "
+                            f"(nt_res={nt_res_final:.3e} >> best={best_theta_res:.3e}, "
+                            f"noise_scale={_noise_scale:.1e})."
+                        )
+                else:
+                    if verbose:
+                        print(
+                            f"[fpgs-newton] mini-loop correction diverged on all "
+                            f"{_FPGS_NEWTON_RETRY_MAX} attempts -- falling back to best_theta."
+                        )
+                    theta_next = best_theta.clone()
                 # Reset blowup threshold so post-Newton residuals don't trigger
                 # a false blowup on the very next main-loop iteration.
                 _best_res_for_anderson = float("inf")
@@ -1041,6 +1079,7 @@ def solve_fixed_point_dwcm_degenerate(
     monitor: bool = False,
     weight_anderson: bool = True,
     device: str = "cpu",
+    seed: int | None = None,
 ) -> SolverResult:
     """Degeneracy-reduced theta-Newton solver for the DWCM.
 
@@ -1106,6 +1145,7 @@ def solve_fixed_point_dwcm_degenerate(
         mult=mult,
         weight_anderson=weight_anderson,
         device=device,
+        seed=seed,
     )
 
     def _expand(theta_m):

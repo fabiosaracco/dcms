@@ -1049,3 +1049,70 @@ class TestSolveToolAdvancedKwargs:
         with_gate = DECMModel(ko, ki, so, si)
         assert with_gate.solve_tool(ic=th0.clone(), block_newton_gate=0.05, **kw)
         assert with_gate.sol.iterations < 50
+
+
+class TestHubRootMethodIllinois:
+    """`hub_root_method="illinois"` (regula falsi) must give the same hub-eta roots as the default
+    60-halving bisection, and be fully opt-in (default stays "bisect")."""
+
+    @staticmethod
+    def _problem(k: int = 12, M: int = 40, seed: int = 0, with_mult: bool = True):
+        rng = np.random.default_rng(seed)
+        theta_self_all = rng.uniform(-1.0, 2.0, M)
+        theta_other = rng.uniform(-1.0, 2.0, M)
+        eta_other = rng.uniform(0.05, 3.0, M)
+        mult = rng.integers(1, 4, M).astype(float) if with_mult else None
+        hubs = np.sort(rng.choice(M, size=k, replace=False))
+        # targets generated from a known eta* per hub, so every root exists and is reachable
+        eta_star = rng.uniform(0.01, 2.0, k)
+        z = np.maximum(eta_star[:, None] + eta_other[None, :], 1e-6)
+        G = -1.0 / np.expm1(-z)
+        logit = -theta_self_all[hubs][:, None] - theta_other[None, :] - np.log(np.expm1(z))
+        W = G / (1.0 + np.exp(-logit))
+        r = np.arange(k)
+        if with_mult:
+            tot = (W * mult[None, :]).sum(1) - W[r, hubs]
+        else:
+            W[r, hubs] = 0.0
+            tot = W.sum(1)
+        s_all = np.zeros(M)
+        s_all[hubs] = tot
+        return dict(hub_indices=list(hubs), theta_self_all=theta_self_all, theta_other=theta_other,
+                    eta_other=eta_other, s_target_all=s_all, mult=mult), eta_star
+
+    @pytest.mark.parametrize("with_mult", [True, False])
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_same_roots_as_bisection(self, seed, with_mult) -> None:
+        from dcms.solvers.fixed_point_decm import _bisect_hub_eta_decm_batch
+        kw, eta_star = self._problem(seed=seed, with_mult=with_mult)
+        ref = _bisect_hub_eta_decm_batch(**kw)
+        out = _bisect_hub_eta_decm_batch(**kw, method="illinois")
+        assert np.max(np.abs(out - ref)) < 1e-9
+        assert np.max(np.abs(out - eta_star)) < 1e-6
+
+    def test_unreachable_hub_matches_bisection(self) -> None:
+        from dcms.solvers.fixed_point_decm import _bisect_hub_eta_decm_batch
+        kw, _ = self._problem(seed=3)
+        kw["s_target_all"] = kw["s_target_all"].copy()
+        kw["s_target_all"][kw["hub_indices"][0]] = 1e9      # unreachable under any eta in the bracket
+        ref = _bisect_hub_eta_decm_batch(**kw)
+        out = _bisect_hub_eta_decm_batch(**kw, method="illinois")
+        assert np.max(np.abs(out - ref)) < 1e-9
+
+    def test_unknown_method_raises(self) -> None:
+        from dcms.solvers.fixed_point_decm import _bisect_hub_eta_decm_batch
+        kw, _ = self._problem()
+        with pytest.raises(ValueError):
+            _bisect_hub_eta_decm_batch(**kw, method="newton")
+
+    def test_solver_converges_with_illinois_and_default_is_bisect(self) -> None:
+        import inspect
+        assert inspect.signature(solve_fixed_point_decm_degenerate).parameters["hub_root_method"].default == "bisect"
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        result = solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-8, max_iter=4000, hub_sk_threshold=0.25, hub_root_method="illinois",
+        )
+        assert result.converged, result.message
+        assert model.max_relative_error(result.best_theta) < CONV_TOL

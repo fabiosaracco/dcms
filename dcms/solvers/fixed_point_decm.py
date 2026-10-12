@@ -1305,6 +1305,7 @@ def _bisect_hub_eta_decm_batch(
     n_bisect: int = 60,
     mult: "np.ndarray | None" = None,
     negative_eta_scope: str = "unreachable_only",
+    method: str = "bisect",
 ) -> "np.ndarray":
     """Vectorized batch version of :func:`_bisect_hub_eta_decm`: solves η for
     every node in ``hub_indices`` simultaneously (each bisection step is one
@@ -1351,12 +1352,23 @@ def _bisect_hub_eta_decm_batch(
                          ``"all"``: every hub node in this batch gets the
                          negative bracket (broader, empirically noisier --
                          see decm-negative-eta-gauge branch notes).
+        method:         ``"bisect"`` (default): ``n_bisect`` plain halvings of
+                         the full bracket (bit-identical to all earlier
+                         versions). ``"illinois"``: Illinois-modified regula
+                         falsi on the same bracket, evaluating only the rows
+                         not yet converged (|f| <= 1e-14 * max(s, 1) or
+                         bracket < 1e-15); same root to ~1e-14 absolute in
+                         eta, ~3x fewer row-evaluations on real hub batches
+                         (q4, 131/435 hubs). ``n_bisect`` is ignored.
 
     Returns:
         Array of shape ``(k,)``: η* for each node in ``hub_indices``, in the
         same order.
     """
     import numpy as _np
+
+    if method not in ("bisect", "illinois"):
+        raise ValueError(f"unknown method: {method!r}")
 
     idx = _np.asarray(hub_indices, dtype=_np.int64)
     k = idx.shape[0]
@@ -1412,7 +1424,54 @@ def _bisect_hub_eta_decm_batch(
 
     eta_lo = eta_lo_init.copy()
     eta_hi = _np.full(k, _ETA_MAX)
-    unreachable = _f(eta_lo) <= 0.0
+    f_lo = _f(eta_lo)
+    unreachable = f_lo <= 0.0
+
+    if method == "illinois":
+        mult_row = None if mult is None else mult[None, :]
+
+        def _f_rows(eta_val: "_np.ndarray", sel: "_np.ndarray") -> "_np.ndarray":
+            z = _np.maximum(eta_val[:, None] + eta_other[None, :], _Z_G_CLAMP)
+            G = -1.0 / _np.expm1(-z)
+            log_q = -_np.log(_np.expm1(z))
+            p = 1.0 / (1.0 + _np.exp(-(-theta_self[sel][:, None] - theta_other_row + log_q)))
+            W = p * G
+            r = _np.arange(sel.shape[0])
+            if mult_row is not None:
+                total = (W * mult_row).sum(axis=1) - W[r, idx[sel]]
+            else:
+                W = W.copy()
+                W[r, idx[sel]] = 0.0
+                total = W.sum(axis=1)
+            return total - s_target[sel]
+
+        f_hi = _f(eta_hi)
+        result = eta_hi.copy()                       # f(hi) > 0: bisection also ends at ~hi
+        active = _np.where(~unreachable & (f_hi <= 0.0))[0]
+        side = _np.zeros(k, dtype=_np.int64)
+        for _ in range(80):
+            if active.size == 0:
+                break
+            lo_a, hi_a = eta_lo[active], eta_hi[active]
+            fl_a, fh_a = f_lo[active], f_hi[active]
+            x = (lo_a * fh_a - hi_a * fl_a) / (fh_a - fl_a)
+            x = _np.where(_np.isfinite(x) & (x > lo_a) & (x < hi_a), x, 0.5 * (lo_a + hi_a))
+            fx = _f_rows(x, active)
+            right = fx > 0.0                         # f decreasing: root to the right of x
+            sd = side[active]
+            eta_lo[active] = _np.where(right, x, lo_a)
+            eta_hi[active] = _np.where(right, hi_a, x)
+            f_lo[active] = _np.where(right, fx, _np.where(sd == -1, 0.5 * fl_a, fl_a))
+            f_hi[active] = _np.where(right, _np.where(sd == 1, 0.5 * fh_a, fh_a), fx)
+            side[active] = _np.where(right, 1, -1)
+            done = (_np.abs(fx) <= 1e-14 * _np.maximum(s_target[active], 1.0)) | (
+                (eta_hi[active] - eta_lo[active]) <= 1e-15 * _np.maximum(1.0, _np.abs(x))
+            )
+            result[active[done]] = x[done]
+            active = active[~done]
+        if active.size:
+            result[active] = 0.5 * (eta_lo[active] + eta_hi[active])
+        return _np.where(unreachable, eta_lo_init, result)
 
     for _ in range(n_bisect):
         eta_mid = 0.5 * (eta_lo + eta_hi)
@@ -1449,6 +1508,7 @@ def solve_fixed_point_decm(
     topo_weig: bool = False,
     hub_sk_threshold: float = 0.0,
     hub_bisect_max_sweeps: int = 3,
+    hub_root_method: str = "bisect",
     patience_rel_tol: float = 0.0,
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float | None = None,
@@ -1540,6 +1600,9 @@ def solve_fixed_point_decm(
                         last sweep exceeds 1e-13. Raise (e.g. 50) when a relaxed (negative-eta) hub sits next to a tight partner
                         (z = eta_out + eta_in ~ 1e-4): the alternation then converges very slowly and the hub's equations stay off by
                         ~1e-4 for hundreds of iterations (q4 group 1403).
+        hub_root_method: Root finder of the per-iteration hub-eta equation: ``"bisect"`` (default, 60 halvings, bit-identical to earlier
+                        versions) or ``"illinois"`` (regula falsi on the same bracket, same root to ~1e-14, ~3x cheaper on hub-heavy networks;
+                        see :func:`_bisect_hub_eta_decm_batch`).
         hub_sk_threshold: When > 0, nodes whose observed strength-to-degree
                         ratio ``s_i / k_hat_i`` exceeds this value are treated
                         as *hub nodes* and solved exactly each iteration via 1D
@@ -2415,6 +2478,7 @@ def solve_fixed_point_decm(
                     eta_other=_th_fp_np[3 * N:],
                     s_target_all=_s_out_np,
                     mult=_mult_np,
+                    method=hub_root_method,
                 )
                 _cur_eta_out = _th_fp_np[2 * N + _hub_out_idx_arr]
                 _new_eta_out = _damp_hub_step(
@@ -2429,6 +2493,7 @@ def solve_fixed_point_decm(
                     eta_other=_th_fp_np[2 * N:3 * N],
                     s_target_all=_s_in_np,
                     mult=_mult_np,
+                    method=hub_root_method,
                 )
                 _cur_eta_in = _th_fp_np[3 * N + _hub_in_idx_arr]
                 _new_eta_in = _damp_hub_step(
@@ -2994,6 +3059,7 @@ def solve_fixed_point_decm_degenerate(
     weight_anderson: bool = True,
     hub_sk_threshold: float = 0.0,
     hub_bisect_max_sweeps: int = 3,
+    hub_root_method: str = "bisect",
     patience_rel_tol: float = 0.0,
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float | None = None,
@@ -3161,6 +3227,7 @@ def solve_fixed_point_decm_degenerate(
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
         hub_bisect_max_sweeps=hub_bisect_max_sweeps,
+        hub_root_method=hub_root_method,
         patience_rel_tol=patience_rel_tol,
         block_newton_gate=block_newton_gate,
         block_newton_min_rel=block_newton_min_rel,

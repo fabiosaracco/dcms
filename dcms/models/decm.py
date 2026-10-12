@@ -603,6 +603,7 @@ class DECMModel:
         topo_weig: bool = False,
         hub_sk_threshold: float = 0.0,
         hub_bisect_max_sweeps: int = 3,
+        hub_root_method: str = "bisect",
         backtracking_gamma: float = 0.0,
         z_clamp: float = 1e-6,
         block_newton_gate: float = 0.0,
@@ -694,6 +695,8 @@ class DECMModel:
                            values above ~10 risk an unsafe Aitken
                            extrapolation of the sweep sequence, see
                            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm_degenerate`.
+            hub_root_method: ``"bisect"`` (default, 60 halvings per hub per sweep) or ``"illinois"`` (same root to ~1e-14, ~3x cheaper
+                           on hub-heavy networks such as q4/e1). See :func:`~dcms.solvers.fixed_point_decm._bisect_hub_eta_decm_batch`.
             backtracking_gamma: When > 0, enables a per-step backtracking
                            line search.  After each Newton step the residual
                            at the proposed iterate is evaluated; if it exceeds
@@ -914,6 +917,7 @@ class DECMModel:
                     topo_weig=topo_weig,
                     hub_sk_threshold=hub_sk_threshold,
                     hub_bisect_max_sweeps=hub_bisect_max_sweeps,
+                    hub_root_method=hub_root_method,
                     z_clamp=z_clamp,
                     block_newton_gate=block_newton_gate,
                     block_newton_min_rel=block_newton_min_rel,
@@ -953,6 +957,7 @@ class DECMModel:
                 topo_weig=topo_weig,
                 hub_sk_threshold=hub_sk_threshold,
                 hub_bisect_max_sweeps=hub_bisect_max_sweeps,
+                hub_root_method=hub_root_method,
                 backtracking_gamma=backtracking_gamma,
                 z_clamp=z_clamp,
                 block_newton_gate=block_newton_gate,

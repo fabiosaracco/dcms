@@ -608,6 +608,8 @@ class DECMModel:
         z_clamp: float = 1e-6,
         block_newton_gate: float = 0.0,
         block_newton_min_rel: float | None = None,
+        stall_block_newton_gate: float = 0.0,
+        stall_block_newton_first: bool = True,
         streak_fix_threshold: int = 0,
         streak_fix_n_sweeps: int = 5,
         streak_fix_n_bisect: int = 60,
@@ -736,6 +738,10 @@ class DECMModel:
                            memory) -- opt in per network, not globally, and
                            always pair it with ``block_newton_min_rel``.
                            Non-hub rows only, out side.
+            stall_block_newton_gate: 0.0 (default) = off. > 0: stall-ladder tier that switches the joint 2x2 block-Newton step on
+                           (with this gate) after the soft reset fails, before the bisection kick / noisy restart. Use together with
+                           ``patience_rel_tol`` > 0. See :func:`solve_fixed_point_decm`.
+            stall_block_newton_first: Order of the block-Newton and bisection-kick tiers when both are enabled (default: block-Newton first).
             block_newton_min_rel: With ``block_newton_gate > 0``: a row
                            whose relative residual is already below this
                            value keeps the scalar step instead (an s == k
@@ -921,6 +927,8 @@ class DECMModel:
                     z_clamp=z_clamp,
                     block_newton_gate=block_newton_gate,
                     block_newton_min_rel=block_newton_min_rel,
+                    stall_block_newton_gate=stall_block_newton_gate,
+                    stall_block_newton_first=stall_block_newton_first,
                     streak_fix_threshold=streak_fix_threshold,
                     streak_fix_n_sweeps=streak_fix_n_sweeps,
                     streak_fix_n_bisect=streak_fix_n_bisect,
@@ -962,6 +970,8 @@ class DECMModel:
                 z_clamp=z_clamp,
                 block_newton_gate=block_newton_gate,
                 block_newton_min_rel=block_newton_min_rel,
+                stall_block_newton_gate=stall_block_newton_gate,
+                stall_block_newton_first=stall_block_newton_first,
                 streak_fix_threshold=streak_fix_threshold,
                 streak_fix_n_sweeps=streak_fix_n_sweeps,
                 streak_fix_n_bisect=streak_fix_n_bisect,

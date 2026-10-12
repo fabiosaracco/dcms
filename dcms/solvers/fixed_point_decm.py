@@ -1512,6 +1512,8 @@ def solve_fixed_point_decm(
     patience_rel_tol: float = 0.0,
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float | None = None,
+    stall_block_newton_gate: float = 0.0,
+    stall_block_newton_first: bool = True,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
@@ -1591,6 +1593,13 @@ def solve_fixed_point_decm(
                         Newton step instead of two decoupled scalar steps (see :func:`_block_newton_deltas`). Targets the nearly saturated
                         rows (s ~ k, G ~ 1) where the scalar iteration contracts by ~1 - 1e-5 per step (q4/e1 plateau). ~0.05 selects only
                         those rows; non-hub rows only on the out side.
+        stall_block_newton_gate: Degeneracy-reduced path only. 0.0 (default) = off, ladder unchanged (bit-identical). > 0 adds a stall-ladder
+                        tier: after the soft reset fails within another ``patience`` window, the joint 2x2 block-Newton step is switched ON
+                        (gate = this value, ``block_newton_min_rel`` as usual) from ``best_theta`` and stays on for the rest of the run;
+                        if that also fails to set a record within ``patience``, the next tier follows (bisection kick if enabled, else
+                        the noisy restart). Needs ``patience_rel_tol`` > 0 on plateaus that creep down (see there).
+        stall_block_newton_first: Order of the two optional tiers when both are enabled: True (default) = block-Newton before the bisection
+                        kick, False = bisection kick first.
         block_newton_min_rel: With ``block_newton_gate > 0``: rows whose relative residual is already below this value are not stepped jointly
                         (they keep the scalar step). ``None`` (default) = ``0.1 * tol``; ``0.0`` = no restriction. Prevents the s == k rows,
                         whose solution lies at infinity, from marching along the soft direction (theta-c, eta+c) far beyond what their
@@ -2021,6 +2030,12 @@ def solve_fixed_point_decm(
     # Joint 2x2 step: rows already below 0.1*tol keep the scalar step (see _block_exclude); explicit 0.0 disables the restriction.
     _bn_min_rel = (0.1 * tol if block_newton_min_rel is None else float(block_newton_min_rel)) if block_newton_gate > 0.0 else 0.0
 
+    # Mutable (gate, min_rel) read by the step closures: a stall-ladder tier can switch the joint 2x2 step on mid-run.
+    _bn = [block_newton_gate, _bn_min_rel]
+    if stall_block_newton_gate > 0.0 and mult is None:
+        raise ValueError("stall_block_newton_gate requires the degeneracy-reduced path (mult given).")
+    _stall_bn_min_rel = 0.1 * tol if block_newton_min_rel is None else float(block_newton_min_rel)
+
     # Step function with bound arguments
     if mult is not None:
         if effective_chunk > 0:
@@ -2029,7 +2044,7 @@ def solve_fixed_point_decm(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     effective_chunk, max_step, mult,
-                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate, block_newton_min_rel=_bn_min_rel,
+                    hub_out_mask=hub_out_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
                 )
         else:
             def _step(th, hub_out_mask=None):
@@ -2037,7 +2052,7 @@ def solve_fixed_point_decm(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     max_step, mult,
-                    hub_out_mask=hub_out_mask, block_newton_gate=block_newton_gate, block_newton_min_rel=_bn_min_rel,
+                    hub_out_mask=hub_out_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
                 )
     elif _use_numba and variant == "theta-newton":
         def _step(th, hub_out_mask=None):  # mask unused: numba path keeps the old hub behaviour
@@ -2153,6 +2168,17 @@ def solve_fixed_point_decm(
     # (the kick tier is patience-stall-specific, not wired into the
     # blowup path). See `bisection_kick_iters` docstring for the rationale.
     _stall_tier = 0
+
+    def _stall_kind() -> str | None:
+        """Kind of the stall-ladder tier after the soft reset that is due next (None = the noisy restart)."""
+        extra = []
+        if stall_block_newton_gate > 0.0 and _bn[0] == 0.0:
+            extra.append("block_newton")
+        if bisection_kick_iters > 0:
+            extra.append("bisect")
+        if not stall_block_newton_first:
+            extra.reverse()
+        return extra[_stall_tier - 1] if 1 <= _stall_tier <= len(extra) else None
     # Argmax-identity streak tracking for `streak_fix_threshold` (see its
     # docstring) -- independent of `_stall_tier`/`iters_since_improve`,
     # since it tracks a different, finer-grained signal (which single
@@ -2748,7 +2774,21 @@ def solve_fixed_point_decm(
                     iters_since_improve = 0
                     _and_g.clear()
                     _and_r.clear()
-                elif _stall_tier == 1 and bisection_kick_iters > 0:
+                elif _stall_tier >= 1 and _stall_kind() == "block_newton":
+                    # Mode switch (not a kick): from now on the nearly saturated rows get the joint 2x2 (theta, eta) step.
+                    if verbose:
+                        print(
+                            f"[patience] soft reset failed -- block-Newton ON "
+                            f"(gate={stall_block_newton_gate}) from best={best_theta_res:.3e} at iter {n_iter}."
+                        )
+                    _bn[0] = stall_block_newton_gate
+                    _bn[1] = _stall_bn_min_rel
+                    _patience_restart_theta = best_theta.clone()
+                    _stall_tier += 1
+                    iters_since_improve = 0
+                    _and_g.clear()
+                    _and_r.clear()
+                elif _stall_tier >= 1 and _stall_kind() == "bisect":
                     # Tier 2 (NEW): the soft reset ALSO failed to beat the
                     # record within another `patience` window -- try a
                     # structured (not random) kick instead of jumping
@@ -2775,7 +2815,7 @@ def solve_fixed_point_decm(
                         _kick_result.to(device=_dev).to(dtype=_dtype) if _dev.type == "cpu"
                         else _kick_result.to(dtype=_dtype).to(device=_dev)
                     )
-                    _stall_tier = 2
+                    _stall_tier += 1
                     iters_since_improve = 0
                     _and_g.clear()
                     _and_r.clear()
@@ -3063,6 +3103,8 @@ def solve_fixed_point_decm_degenerate(
     patience_rel_tol: float = 0.0,
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float | None = None,
+    stall_block_newton_gate: float = 0.0,
+    stall_block_newton_first: bool = True,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -3231,6 +3273,8 @@ def solve_fixed_point_decm_degenerate(
         patience_rel_tol=patience_rel_tol,
         block_newton_gate=block_newton_gate,
         block_newton_min_rel=block_newton_min_rel,
+        stall_block_newton_gate=stall_block_newton_gate,
+        stall_block_newton_first=stall_block_newton_first,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,

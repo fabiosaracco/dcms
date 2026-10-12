@@ -1116,3 +1116,34 @@ class TestHubRootMethodIllinois:
         )
         assert result.converged, result.message
         assert model.max_relative_error(result.best_theta) < CONV_TOL
+
+
+class TestStallBlockNewtonTier:
+    """`stall_block_newton_gate > 0` adds a stall-ladder tier (soft reset -> block-Newton ON -> [bisection kick] -> noise); default off."""
+
+    @staticmethod
+    def _run(capsys, **kw):
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        theta0 = model.initial_theta("degrees")
+        solve_fixed_point_decm_degenerate(
+            theta0, model.k_out, model.k_in, model.s_out, model.s_in,
+            tol=1e-300, max_iter=200, patience=4, patience_rel_tol=0.5, verbose=True, seed=0, **kw,
+        )
+        return capsys.readouterr().out
+
+    def test_off_by_default(self, capsys) -> None:
+        out = self._run(capsys)
+        assert "[patience] stalled" in out and "block-Newton ON" not in out
+
+    def test_tier_fires_after_soft_reset(self, capsys) -> None:
+        out = self._run(capsys, stall_block_newton_gate=0.05)
+        assert "block-Newton ON" in out
+        assert out.index("soft reset (Anderson clear") < out.index("block-Newton ON")
+
+    def test_requires_degenerate_path(self) -> None:
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        with pytest.raises(ValueError):
+            solve_fixed_point_decm(
+                lambda th: th, model.initial_theta("degrees"), model.k_out, model.k_in, model.s_out, model.s_in,
+                tol=1e-8, max_iter=5, stall_block_newton_gate=0.05,
+            )

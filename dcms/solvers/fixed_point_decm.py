@@ -1537,6 +1537,7 @@ def solve_fixed_point_decm(
     streak_fix_n_bisect: int = 60,
     streak_fix_n_sweeps: int = 5,
     device: str = "cpu",
+    checkpoint_fn: Callable[[int, str, torch.Tensor, float], None] | None = None,
 ) -> SolverResult:
     """Alternating GS-Newton fixed-point solver for the DECM.
 
@@ -1858,6 +1859,10 @@ def solve_fixed_point_decm(
         diag_every:     Call ``diag_callback`` (and ``diag_state_callback``)
                         every this many iterations (default 1 = every
                         iteration). Irrelevant if both are ``None``.
+        checkpoint_fn:  ``None`` by default (no behaviour change). If given, called as ``checkpoint_fn(n_iter, event, best_theta, best_res)`` every time
+                        the solver restarts from ``best_theta`` (event = "soft_reset", "block_newton", "bisection_kick", "noisy_restart" or
+                        "blowup_rollback"), but only when the record changed since the last call (no duplicate saves). Lets a long run be resumed
+                        from the point the restarts return to (the degenerate wrapper passes the theta expanded to the N nodes).
         diag_state_callback: Read-only diagnostic hook, ``None`` by default
                         (no behaviour change when omitted). If given, called
                         as ``diag_state_callback(n_iter, theta, F_current)``
@@ -2207,8 +2212,18 @@ def solve_fixed_point_decm(
     # killed the recovery, escalating to a bigger-noise restart instead.
     _post_restart_reset = False
 
+    _ckpt_last_res = float("inf")
+
+    def _ckpt(event: str) -> None:
+        """Report `best_theta` to `checkpoint_fn` when a restart returns to it and the record changed since the last report."""
+        nonlocal _ckpt_last_res
+        if checkpoint_fn is not None and best_theta_res < _ckpt_last_res:
+            _ckpt_last_res = best_theta_res
+            checkpoint_fn(n_iter, event, best_theta.clone(), best_theta_res)
+
     def _perturbed_restart() -> tuple[torch.Tensor, bool]:
         """Build a noisy restart around `best_theta`; escalate + maybe give up."""
+        _ckpt("noisy_restart")
         nonlocal restarts, stalls_at_cap
         restarts += 1
         noise_mult = min(noise_growth ** (restarts - 1), noise_cap_mult)
@@ -2752,6 +2767,7 @@ def solve_fixed_point_decm(
             if patience > 0 and iters_since_improve >= patience:
                 if _stall_tier == 0:
                     # Tier 1 (cheapest): no-noise soft reset.
+                    _ckpt("soft_reset")
                     if verbose:
                         print(
                             f"[patience] stalled {patience} iters with no "
@@ -2776,6 +2792,7 @@ def solve_fixed_point_decm(
                     _and_r.clear()
                 elif _stall_tier >= 1 and _stall_kind() == "block_newton":
                     # Mode switch (not a kick): from now on the nearly saturated rows get the joint 2x2 (theta, eta) step.
+                    _ckpt("block_newton")
                     if verbose:
                         print(
                             f"[patience] soft reset failed -- block-Newton ON "
@@ -2789,6 +2806,7 @@ def solve_fixed_point_decm(
                     _and_g.clear()
                     _and_r.clear()
                 elif _stall_tier >= 1 and _stall_kind() == "bisect":
+                    _ckpt("bisection_kick")
                     # Tier 2 (NEW): the soft reset ALSO failed to beat the
                     # record within another `patience` window -- try a
                     # structured (not random) kick instead of jumping
@@ -2919,6 +2937,7 @@ def solve_fixed_point_decm(
                         )
                         break
                 elif _blowup_recovered:
+                    _ckpt("blowup_rollback")
                     # Isolated/first blowup since the last improvement: leave
                     # the existing, cheap recovery alone (no noise) -- on
                     # hub-heavy networks this fires often and normally
@@ -3125,6 +3144,7 @@ def solve_fixed_point_decm_degenerate(
     streak_fix_n_bisect: int = 60,
     streak_fix_n_sweeps: int = 5,
     device: str = "cpu",
+    checkpoint_fn: Callable[[int, str, torch.Tensor, float], None] | None = None,
 ) -> SolverResult:
     """Degeneracy-reduced alternating GS-Newton solver for the DECM.
 
@@ -3223,6 +3243,11 @@ def solve_fixed_point_decm_degenerate(
         ]
     )
 
+    def _checkpoint_fn_g(n_iter_: int, event: str, theta_m: torch.Tensor, res_: float) -> None:
+        """Expand the group-level best_theta to the N nodes before handing it to the user's ``checkpoint_fn``."""
+        if checkpoint_fn is not None:
+            checkpoint_fn(n_iter_, event, theta_m.reshape(4, M)[:, group_of].reshape(-1).clone(), res_)
+
     init_best_theta_g = None
     if init_best_theta is not None:
         _ibt = (
@@ -3295,6 +3320,7 @@ def solve_fixed_point_decm_degenerate(
         streak_fix_n_bisect=streak_fix_n_bisect,
         streak_fix_n_sweeps=streak_fix_n_sweeps,
         device=device,
+        checkpoint_fn=_checkpoint_fn_g,
     )
 
     def _expand(theta_m):

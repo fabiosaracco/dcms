@@ -1147,3 +1147,23 @@ class TestStallBlockNewtonTier:
                 lambda th: th, model.initial_theta("degrees"), model.k_out, model.k_in, model.s_out, model.s_in,
                 tol=1e-8, max_iter=5, stall_block_newton_gate=0.05,
             )
+
+
+class TestCheckpointOnRestart:
+    """`checkpoint_dir` / `checkpoint_fn`: the best_theta the restarts return to is saved (N-node layout), nothing changes otherwise."""
+
+    def test_saved_at_restart_in_node_layout_and_trajectory_unchanged(self, tmp_path) -> None:
+        import torch as _t
+        kw = dict(tol=1e-300, max_iter=120, patience=4, patience_rel_tol=0.5, seed=0, stall_block_newton_gate=0.05)
+        m1, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        m1.solve_tool(ic="degrees", multi_start=False, checkpoint_dir=str(tmp_path), **kw)
+        files = sorted(tmp_path.glob("ckpt_*.pt"))
+        assert files, "no checkpoint written"
+        c = _t.load(files[0])
+        assert c["theta"].numel() == 4 * m1.N and c["event"] in {"soft_reset", "block_newton", "bisection_kick", "noisy_restart", "blowup_rollback"}
+        assert m1.max_relative_error(c["theta"]) == pytest.approx(c["mre"], rel=1e-6)   # the saved theta is the record it claims
+        mres = [float(_t.load(f)["mre"]) for f in files]
+        assert mres == sorted(mres, reverse=True)           # each save is a strictly better record
+        m2, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
+        m2.solve_tool(ic="degrees", multi_start=False, **kw)
+        assert m1.sol.mre == m2.sol.mre and m1.sol.iterations == m2.sol.iterations

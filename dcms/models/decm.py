@@ -610,6 +610,7 @@ class DECMModel:
         block_newton_min_rel: float | None = None,
         stall_block_newton_gate: float = 0.0,
         stall_block_newton_first: bool = True,
+        checkpoint_dir: str | None = None,
         streak_fix_threshold: int = 0,
         streak_fix_n_sweeps: int = 5,
         streak_fix_n_bisect: int = 60,
@@ -742,6 +743,10 @@ class DECMModel:
                            (with this gate) after the soft reset fails, before the bisection kick / noisy restart. Use together with
                            ``patience_rel_tol`` > 0. See :func:`solve_fixed_point_decm`.
             stall_block_newton_first: Order of the block-Newton and bisection-kick tiers when both are enabled (default: block-Newton first).
+            checkpoint_dir: ``None`` (default) = off. A directory: every time the solver restarts from its best iterate (soft reset,
+                           block-Newton switch, bisection kick, noisy restart, blowup rollback) and the record improved since the last save,
+                           ``ckpt_<iteration>_<event>.pt`` is written there with ``theta`` (N-node layout, usable as ``ic=``), ``mre``,
+                           ``iteration`` and ``event``. Lets a long run be resumed from the point the restarts return to.
             block_newton_min_rel: With ``block_newton_gate > 0``: a row
                            whose relative residual is already below this
                            value keeps the scalar step instead (an s == k
@@ -899,6 +904,17 @@ class DECMModel:
             remaining = max_time - (_time.perf_counter() - t_global_start)
             return max(remaining, 0.0)
 
+        _ckpt_fn = None
+        if checkpoint_dir is not None:
+            import os as _os
+
+            _os.makedirs(checkpoint_dir, exist_ok=True)
+
+            def _ckpt_fn(n_iter, event, theta, mre):
+                _path = _os.path.join(checkpoint_dir, f"ckpt_{n_iter:07d}_{event}.pt")
+                _torch.save(dict(theta=theta.detach().cpu(), mre=float(mre), iteration=int(n_iter), event=event), _path + ".tmp")
+                _os.replace(_path + ".tmp", _path)
+
         def _run_once(ic_name: str, theta0_override=None):
             theta0 = (
                 _torch.as_tensor(theta0_override, dtype=_torch.float64)
@@ -929,6 +945,7 @@ class DECMModel:
                     block_newton_min_rel=block_newton_min_rel,
                     stall_block_newton_gate=stall_block_newton_gate,
                     stall_block_newton_first=stall_block_newton_first,
+                    checkpoint_fn=_ckpt_fn,
                     streak_fix_threshold=streak_fix_threshold,
                     streak_fix_n_sweeps=streak_fix_n_sweeps,
                     streak_fix_n_bisect=streak_fix_n_bisect,
@@ -972,6 +989,7 @@ class DECMModel:
                 block_newton_min_rel=block_newton_min_rel,
                 stall_block_newton_gate=stall_block_newton_gate,
                 stall_block_newton_first=stall_block_newton_first,
+                checkpoint_fn=_ckpt_fn,
                 streak_fix_threshold=streak_fix_threshold,
                 streak_fix_n_sweeps=streak_fix_n_sweeps,
                 streak_fix_n_bisect=streak_fix_n_bisect,

@@ -1514,6 +1514,7 @@ def solve_fixed_point_decm(
     block_newton_min_rel: float | None = None,
     stall_block_newton_gate: float = 0.0,
     stall_block_newton_first: bool = True,
+    stall_block_newton_off_mre: float = 0.0,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
@@ -1599,6 +1600,8 @@ def solve_fixed_point_decm(
                         (gate = this value, ``block_newton_min_rel`` as usual) from ``best_theta`` and stays on for the rest of the run;
                         if that also fails to set a record within ``patience``, the next tier follows (bisection kick if enabled, else
                         the noisy restart). Needs ``patience_rel_tol`` > 0 on plateaus that creep down (see there).
+        stall_block_newton_off_mre: With a block-Newton gate active (static or stall tier): once the record falls below this MRE the joint step is switched
+                        OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). 0.0 (default) = never off.
         stall_block_newton_first: Order of the two optional tiers when both are enabled: True (default) = block-Newton before the bisection
                         kick, False = bisection kick first.
         block_newton_min_rel: With ``block_newton_gate > 0``: rows whose relative residual is already below this value are not stepped jointly
@@ -2037,6 +2040,7 @@ def solve_fixed_point_decm(
 
     # Mutable (gate, min_rel) read by the step closures: a stall-ladder tier can switch the joint 2x2 step on mid-run.
     _bn = [block_newton_gate, _bn_min_rel]
+    _bn_stall_used = [False]   # stall tier already fired (so switching the gate off again does not re-arm it)
     if stall_block_newton_gate > 0.0 and mult is None:
         raise ValueError("stall_block_newton_gate requires the degeneracy-reduced path (mult given).")
     _stall_bn_min_rel = 0.1 * tol if block_newton_min_rel is None else float(block_newton_min_rel)
@@ -2177,7 +2181,7 @@ def solve_fixed_point_decm(
     def _stall_kind() -> str | None:
         """Kind of the stall-ladder tier after the soft reset that is due next (None = the noisy restart)."""
         extra = []
-        if stall_block_newton_gate > 0.0 and _bn[0] == 0.0:
+        if stall_block_newton_gate > 0.0 and _bn[0] == 0.0 and not _bn_stall_used[0]:
             extra.append("block_newton")
         if bisection_kick_iters > 0:
             extra.append("bisect")
@@ -2732,6 +2736,11 @@ def solve_fixed_point_decm(
             if res_norm < best_theta_res:
                 best_theta_res = res_norm
                 best_theta = theta.clone()
+                if stall_block_newton_off_mre > 0.0 and _bn[0] > 0.0 and best_theta_res < stall_block_newton_off_mre:
+                    _bn[0] = 0.0
+                    _bn_stall_used[0] = True
+                    if verbose:
+                        print(f"[patience] block-Newton OFF (record {best_theta_res:.3e} < {stall_block_newton_off_mre:.1e}) at iter {n_iter}.")
                 progressed_since_restart = True
                 if res_norm < _stall_ref * (1.0 - patience_rel_tol):
                     # A SIGNIFICANT record (beats the reference by more than patience_rel_tol; any improvement when it is 0).
@@ -2799,6 +2808,7 @@ def solve_fixed_point_decm(
                             f"(gate={stall_block_newton_gate}) from best={best_theta_res:.3e} at iter {n_iter}."
                         )
                     _bn[0] = stall_block_newton_gate
+                    _bn_stall_used[0] = True
                     _bn[1] = _stall_bn_min_rel
                     _patience_restart_theta = best_theta.clone()
                     _stall_tier += 1
@@ -3124,6 +3134,7 @@ def solve_fixed_point_decm_degenerate(
     block_newton_min_rel: float | None = None,
     stall_block_newton_gate: float = 0.0,
     stall_block_newton_first: bool = True,
+    stall_block_newton_off_mre: float = 0.0,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -3300,6 +3311,7 @@ def solve_fixed_point_decm_degenerate(
         block_newton_min_rel=block_newton_min_rel,
         stall_block_newton_gate=stall_block_newton_gate,
         stall_block_newton_first=stall_block_newton_first,
+        stall_block_newton_off_mre=stall_block_newton_off_mre,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,

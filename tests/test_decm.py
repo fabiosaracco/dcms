@@ -1140,6 +1140,10 @@ class TestStallBlockNewtonTier:
         assert "block-Newton ON" in out
         assert out.index("soft reset (Anderson clear") < out.index("block-Newton ON")
 
+    def test_off_mre_switches_gate_off_once_and_does_not_rearm(self, capsys) -> None:
+        out = self._run(capsys, stall_block_newton_gate=0.05, stall_block_newton_off_mre=1e300)
+        assert out.count("block-Newton ON") == 1 and out.count("block-Newton OFF") == 1
+
     def test_requires_degenerate_path(self) -> None:
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         with pytest.raises(ValueError):

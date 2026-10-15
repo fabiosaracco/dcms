@@ -1600,7 +1600,7 @@ def solve_fixed_point_decm(
                         (gate = this value, ``block_newton_min_rel`` as usual) from ``best_theta`` and stays on for the rest of the run;
                         if that also fails to set a record within ``patience``, the next tier follows (bisection kick if enabled, else
                         the noisy restart). Needs ``patience_rel_tol`` > 0 on plateaus that creep down (see there).
-        stall_block_newton_off_mre: With a block-Newton gate active (static or stall tier): once the record falls below this MRE the joint step is switched
+        stall_block_newton_off_mre: With a block-Newton gate active (static or stall tier): once the record falls below this MRE (provided the joint step was switched on above it: q4 turns it on at 2e-5 and needs it) the joint step is switched
                         OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). 0.0 (default) = never off.
         stall_block_newton_first: Order of the two optional tiers when both are enabled: True (default) = block-Newton before the bisection
                         kick, False = bisection kick first.
@@ -2040,6 +2040,7 @@ def solve_fixed_point_decm(
 
     # Mutable (gate, min_rel) read by the step closures: a stall-ladder tier can switch the joint 2x2 step on mid-run.
     _bn = [block_newton_gate, _bn_min_rel]
+    _bn_on_res = [float('inf')]   # record at which the joint step was switched on (off_mre acts only if that was above it)
     _bn_stall_used = [False]   # stall tier already fired (so switching the gate off again does not re-arm it)
     if stall_block_newton_gate > 0.0 and mult is None:
         raise ValueError("stall_block_newton_gate requires the degeneracy-reduced path (mult given).")
@@ -2736,7 +2737,7 @@ def solve_fixed_point_decm(
             if res_norm < best_theta_res:
                 best_theta_res = res_norm
                 best_theta = theta.clone()
-                if stall_block_newton_off_mre > 0.0 and _bn[0] > 0.0 and best_theta_res < stall_block_newton_off_mre:
+                if stall_block_newton_off_mre > 0.0 and _bn[0] > 0.0 and _bn_on_res[0] > stall_block_newton_off_mre > best_theta_res:
                     _bn[0] = 0.0
                     _bn_stall_used[0] = True
                     if verbose:
@@ -2809,6 +2810,7 @@ def solve_fixed_point_decm(
                         )
                     _bn[0] = stall_block_newton_gate
                     _bn_stall_used[0] = True
+                    _bn_on_res[0] = best_theta_res
                     _bn[1] = _stall_bn_min_rel
                     _patience_restart_theta = best_theta.clone()
                     _stall_tier += 1

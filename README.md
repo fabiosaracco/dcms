@@ -688,8 +688,10 @@ converged = model.solve_tool(
     streak_fix_n_bisect=60, # bisection halvings per sweep (see §2.8)
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
     blowup_factor=None,     # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner (see §2.6)
-    patience=750,           # restart from best_theta+noise after this many iters with no improvement (see §2.6)
-    patience_rel_tol=0.0,   # >0: only a record improvement by more than this fraction resets patience (see §2.8)
+    patience=250,           # stall ladder after this many iters without a significant record (see §2.6); was 750
+    patience_rel_tol=0.01,  # only a record improvement by more than this fraction resets patience (0 = any; see §2.8)
+    stall_block_newton_gate=None,   # None = 0.05 (reduced path): ladder tier 2 switches block-Newton on after the soft reset fails
+    stall_block_newton_off_mre=2e-4, # block-Newton switched off again once the record is below this (only if it was on above it)
     noise_base=1e-4,        # scale of the first perturbed restart's (multiplicative) noise (see §2.6)
     noise_cap_mult=16.0,    # noise scale saturates at noise_base * noise_cap_mult (see §2.6)
     noise_growth=2.0,       # noise growth rate per consecutive failed restart (see §2.6)

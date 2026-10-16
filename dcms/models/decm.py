@@ -608,17 +608,17 @@ class DECMModel:
         z_clamp: float = 1e-6,
         block_newton_gate: float = 0.0,
         block_newton_min_rel: float | None = None,
-        stall_block_newton_gate: float = 0.0,
+        stall_block_newton_gate: float | None = None,
         stall_block_newton_first: bool = True,
-        stall_block_newton_off_mre: float = 0.0,
+        stall_block_newton_off_mre: float = 2e-4,
         checkpoint_dir: str | None = None,
         streak_fix_threshold: int = 0,
         streak_fix_n_sweeps: int = 5,
         streak_fix_n_bisect: int = 60,
         reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
-        patience: int = 750,
-        patience_rel_tol: float = 0.0,
+        patience: int = 250,
+        patience_rel_tol: float = 0.01,
         noise_base: float = 1e-4,
         noise_cap_mult: float = 16.0,
         noise_growth: float = 2.0,
@@ -740,10 +740,10 @@ class DECMModel:
                            memory) -- opt in per network, not globally, and
                            always pair it with ``block_newton_min_rel``.
                            Non-hub rows only, out side.
-            stall_block_newton_gate: 0.0 (default) = off. > 0: stall-ladder tier that switches the joint 2x2 block-Newton step on
+            stall_block_newton_gate: ``None`` (default) = 0.05 on the degeneracy-reduced path, 0 (off) otherwise; 0.0 = off. > 0: stall-ladder tier that switches the joint 2x2 block-Newton step on
                            (with this gate) after the soft reset fails, before the bisection kick / noisy restart. Use together with
                            ``patience_rel_tol`` > 0. See :func:`solve_fixed_point_decm`.
-            stall_block_newton_off_mre: Switch the stall-tier block-Newton OFF once the record is below this MRE (0 = never).
+            stall_block_newton_off_mre: Switch the stall-tier block-Newton OFF once the record is below this MRE (0 = never; default 2e-4; acts only if the step was switched on above it).
             stall_block_newton_first: Order of the block-Newton and bisection-kick tiers when both are enabled (default: block-Newton first).
             checkpoint_dir: ``None`` (default) = off. A directory: every time the solver restarts from its best iterate (soft reset,
                            block-Newton switch, bisection kick, noisy restart, blowup rollback) and the record improved since the last save,
@@ -810,13 +810,13 @@ class DECMModel:
                            between; an isolated, self-recovering blowup is
                            left alone. Set ``patience <= 0`` to disable and
                            get the old fail-fast behaviour (stop immediately
-                           on stagnation). Default 750 (validated end-to-end
-                           on a real N=15168 instance -- see README
-                           "Checkpointed multi-chunk runs"). Inert (zero
+                           on stagnation). Default 250 (was 750; with
+                           ``patience_rel_tol=0.01`` and the block-Newton
+                           tier, q4 -29% time, e1 now converges). Inert (zero
                            effect on the result) for instances that never
                            stagnate or blow up.
             patience_rel_tol: Relative-improvement threshold of the stall
-                           criterion. Default 0.0 (previous behaviour: ANY
+                           criterion. Default 0.01 (0.0 = previous behaviour: ANY
                            strictly smaller residual resets the ``patience``
                            counter). With a value > 0 (e.g. 0.01) only a
                            record that beats the reference by more than that
@@ -890,6 +890,9 @@ class DECMModel:
             reduce_degeneracy and variant == "theta-newton"
             and backend != "numba" and backtracking_gamma == 0.0
         )
+        if stall_block_newton_gate is None:
+            # default: block-Newton stall tier on the degeneracy-reduced path only (the joint step needs it)
+            stall_block_newton_gate = 0.05 if _use_reduced else 0.0
         if reduce_degeneracy and not _use_reduced:
             print(
                 "reduce_degeneracy=True requires variant='theta-newton', "

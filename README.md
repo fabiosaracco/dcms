@@ -419,6 +419,8 @@ Pass an explicit value to override this — but the two directions call for oppo
 
 **With `verbose=True`, every intervention prints a message** — `[blowup] ...` when the guard trips (one line for an isolated rollback, another when it escalates), and `[perturbed-restart] restart #N ...` for both stagnation- and blowup-triggered noisy restarts — so an unattended run's log shows exactly when and why the trajectory was redirected, not just silent MRE fluctuation.
 
+**Stall ladder (solve_tool defaults, 2026-10):** a *significant* record = beating the reference by more than `patience_rel_tol` (0.1). After `patience` (250) iterations without one: (1) soft reset from `best_theta` with Anderson cleared; (2) block-Newton switched ON (`stall_block_newton_gate`, 0.05; switched OFF again once the record is below `stall_block_newton_off_mre`, 2e-4, if it was switched on above it); (3) optional bisection kick (`bisection_kick_iters`, off); (4) noisy restarts, then STOP after `max_stalls`. The standalone solver functions keep the old defaults (patience 750, `patience_rel_tol=0`, block-Newton tier off). Validated from scratch with one recipe: q4 3091 it, e1 2009 it, q2 1244 it, e2 1535 it (the old defaults never converged them within 6-10 h), and 2-8x fewer iterations on c2/c3/c4/e4; unchanged on q6/e6/e5/q3/e3. Not converged: q1.
+
 **Status:** on by default (`DECMModel.solve_tool()` and the standalone `solve_fixed_point_decm[_degenerate]`). Inert for well-behaved instances that never stagnate or blow up — no default-value tuning is needed to get the old behaviour on easy networks. Set `patience<=0` to fully disable and restore the old fail-fast-on-stagnation behaviour.
 
 ```python
@@ -426,7 +428,7 @@ model = DECMModel(k_out, k_in, s_out, s_in)
 model.solve_tool(
     max_iter=20000,
     blowup_factor=None,   # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner
-    patience=750,        # restart after 750 iterations with no record improvement
+    patience=250,        # stall ladder after 250 iterations without a significant record (solve_tool default; solver default 750)
     noise_base=1e-2,      # first restart's noise scale (multiplicative, see above)
     noise_cap_mult=16.0,  # noise saturates at noise_base * 16
     noise_growth=2.0,     # noise doubles per consecutive failed restart; lower (e.g. 1.2-1.5) if escalation overshoots
@@ -486,7 +488,7 @@ converged = model.solve_tool(
     streak_fix_n_sweeps=5,     # phi-fixed bisection sweeps per fix (default)
     streak_fix_n_bisect=60,    # bisection halvings per sweep (default)
     hub_bisect_max_sweeps=10,  # raise only if a relaxed hub / tight-partner pair converges slowly
-    patience_rel_tol=0.01,     # only a >1% record improvement resets the stagnation counter
+    patience_rel_tol=0.1,      # only a >10% record improvement resets the stagnation counter (solve_tool default)
 )
 ```
 

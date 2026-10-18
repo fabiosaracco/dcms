@@ -618,7 +618,7 @@ class DECMModel:
         reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
         patience: int = 250,
-        patience_rel_tol: float = 0.01,
+        patience_rel_tol: float = 0.1,
         noise_base: float = 1e-4,
         noise_cap_mult: float = 16.0,
         noise_growth: float = 2.0,
@@ -811,12 +811,12 @@ class DECMModel:
                            left alone. Set ``patience <= 0`` to disable and
                            get the old fail-fast behaviour (stop immediately
                            on stagnation). Default 250 (was 750; with
-                           ``patience_rel_tol=0.01`` and the block-Newton
-                           tier, q4 -29% time, e1 now converges). Inert (zero
+                           ``patience_rel_tol=0.1`` and the block-Newton
+                           tier: q2, e1, e2 now converge, c2/c3/c4/e4 2-8x fewer iterations). Inert (zero
                            effect on the result) for instances that never
                            stagnate or blow up.
             patience_rel_tol: Relative-improvement threshold of the stall
-                           criterion. Default 0.01 (0.0 = previous behaviour: ANY
+                           criterion. Default 0.1 (0.0 = previous behaviour: ANY
                            strictly smaller residual resets the ``patience``
                            counter). With a value > 0 (e.g. 0.01) only a
                            record that beats the reference by more than that

@@ -689,7 +689,7 @@ converged = model.solve_tool(
     reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
     blowup_factor=None,     # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner (see §2.6)
     patience=250,           # stall ladder after this many iters without a significant record (see §2.6); was 750
-    patience_rel_tol=0.01,  # only a record improvement by more than this fraction resets patience (0 = any; see §2.8)
+    patience_rel_tol=0.1,   # only a record improvement by more than this fraction resets patience (0 = any; see §2.8)
     stall_block_newton_gate=None,   # None = 0.05 (reduced path): ladder tier 2 switches block-Newton on after the soft reset fails
     stall_block_newton_off_mre=2e-4, # block-Newton switched off again once the record is below this (only if it was on above it)
     noise_base=1e-4,        # scale of the first perturbed restart's (multiplicative) noise (see §2.6)

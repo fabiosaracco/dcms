@@ -391,7 +391,7 @@ print(result.converged, result.mre, result.message)  # message reports "N=... ->
 
 Even with Anderson acceleration and the blowup guard (§2.1), some hub-heavy instances get stuck at a **quasi-fixed point**: progress halts for hundreds of iterations, or the Anderson blowup guard keeps tripping and rolling back to the same point without ever improving on it. Plain rollback-and-retry alone cannot escape a genuine trap — the deterministic Newton/Anderson dynamics just reproduce the same trajectory. The fix is to occasionally add noise:
 
-- **Stagnation:** if `best_theta_res` hasn't improved for `patience` consecutive iterations, restart from `best_theta` plus Gaussian noise instead of continuing from the stuck iterate.
+- **Stagnation:** if `best_theta_res` has not set a *significant* record (more than `patience_rel_tol` better than the reference) for `patience` consecutive iterations, the solver climbs a stall ladder instead of continuing from the stuck iterate: soft reset from `best_theta`, then block-Newton ON, then (optionally) a bisection kick, then restarts from `best_theta` plus Gaussian noise (see the *Stall ladder* paragraph below).
 - **Repeated blowup:** the existing blowup guard's plain rollback-to-`best_theta` is left untouched for an *isolated* blowup (common and self-resolving on hub-heavy networks — see `blowup_factor` below). Only if the guard trips **again with no record improvement in between** does it escalate to the same noisy restart — this is the "quasi-fixed-point trap" case, not routine Anderson housekeeping.
 
 Both triggers share **one** escalation counter: noise scale starts at `noise_base` and doubles on each consecutive restart that fails to improve the record (`noise_base × min(2^(restarts-1), noise_cap_mult)`), capped at `noise_base × noise_cap_mult`, and resets to `noise_base` only on a genuine improvement. (An earlier, external version of this mechanism kept blowup-retries and stagnation-retries on separate counters, one of them with a *fixed*, non-escalating noise scale — that combination produced a real infinite loop, 59 consecutive chunks converging on the exact same stuck point, on the network below. A single shared, always-escalating counter is what actually fixed it.) Give up (`converged=False`) after `max_stalls` restarts *at the noise cap* in a row without improving the record — i.e. only once the strongest available kick has been tried repeatedly and still hasn't helped; restarts made while still escalating don't count toward this limit.
@@ -437,7 +437,7 @@ model.solve_tool(
 )
 ```
 
-**Validated on a real hard instance:** DECM on the same empirical online social network as above (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750` (750 iterations translated from the value validated in the external checkpointed-runner prototype, §3.10.1) — one repeated-blowup restart and four stagnation restarts fired, and the run converged after 9 460 iterations to MRE=9.45×10⁻⁶, with no manual intervention.
+**Validated on a real hard instance:** DECM on the same empirical online social network as above (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750` (the then-default, translated from the value validated in the external checkpointed-runner prototype, §3.10.1; `solve_tool` now defaults to `patience=250` with `patience_rel_tol=0.1` and the block-Newton stall tier, which was added later and was not part of this run) — one repeated-blowup restart and four stagnation restarts fired, and the run converged after 9 460 iterations to MRE=9.45×10⁻⁶, with no manual intervention.
 
 ---
 
@@ -1037,7 +1037,7 @@ For DCM, DWCM and DECM pass an array of shape (2N,), (2N,) and (4N,) respectivel
 
 ### 3.10.1 Checkpointed multi-chunk runs surviving a real crash/preemption
 
-Stagnation and repeated-blowup recovery are now **built into the DECM solver itself** (§2.6) — a single unattended `solve_tool()`/`solve_fixed_point_decm[_degenerate]` call handles those on its own via `patience`/`noise_base`/`noise_cap_mult`/`max_stalls`, no external orchestration needed.
+Stagnation and repeated-blowup recovery are now **built into the DECM solver itself** (§2.6) — a single unattended `solve_tool()`/`solve_fixed_point_decm[_degenerate]` call handles those on its own via the stall ladder (`patience`/`patience_rel_tol`, block-Newton tier, then `noise_base`/`noise_cap_mult`/`max_stalls`), no external orchestration needed.
 
 What a single in-process call *cannot* survive is an actual **crash, timeout, or preemption** of the process itself — a real concern for instances that need tens of thousands of iterations (hours) unattended. For that, run in **chunks** — `max_iter` iterations at a time, checkpointing state to disk after each chunk, so a killed process never loses more than one chunk of progress:
 
@@ -1050,7 +1050,7 @@ for chunk in range(n_chunks):
         ..., theta0=theta,
         init_best_theta=global_best_theta, init_best_res=best_mre,
         max_iter=chunk_iters,
-        # patience/noise_base/noise_cap_mult/max_stalls: leave at their
+        # patience/patience_rel_tol/noise_base/noise_cap_mult/max_stalls: leave at their
         # defaults, or pass explicitly -- they apply within EACH chunk,
         # independently of the cross-chunk record tracked here.
     )
@@ -1065,7 +1065,7 @@ for chunk in range(n_chunks):
 
 `init_best_theta` / `init_best_res` exist specifically for this: each chunked call is otherwise a *fresh* invocation with no memory of the record set by earlier chunks — its own in-call best-tracking (and now, stagnation/blowup recovery) can only fall back to a chunk-local best, which may already be far worse than the true historical record. Passing the previous chunk's record back in keeps everything anchored to the true global best across chunk boundaries.
 
-**Validated on a real hard instance:** DECM on an empirical online social network (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750`, converged after 9 460 iterations to MRE=9.45×10⁻⁶ with no manual intervention — first as a chunked+checkpointed prototype (an earlier iteration of this same recovery idea, before it moved into the solver itself), then reproduced with the built-in mechanism (§2.6).
+**Validated on a real hard instance:** DECM on an empirical online social network (N=15 168, M=3 003 after degeneracy reduction, §2.5, several hub nodes), run unattended from scratch with `anderson_depth=10`, `hub_sk_threshold=5.0`, `patience=750` (the then-default; see the *Stall ladder* paragraph in §2.6 for the current `solve_tool` defaults), converged after 9 460 iterations to MRE=9.45×10⁻⁶ with no manual intervention — first as a chunked+checkpointed prototype (an earlier iteration of this same recovery idea, before it moved into the solver itself), then reproduced with the built-in mechanism (§2.6).
 
 ### 3.11 Network generator (`dcms/utils/wng.py`)
 

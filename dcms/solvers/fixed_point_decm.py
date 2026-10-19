@@ -1515,6 +1515,7 @@ def solve_fixed_point_decm(
     stall_block_newton_gate: float = 0.0,
     stall_block_newton_first: bool = True,
     stall_block_newton_off_mre: float = 0.0,
+    stall_block_newton_revert: bool = True,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
     mult: torch.Tensor | None = None,
@@ -1600,6 +1601,9 @@ def solve_fixed_point_decm(
                         (gate = this value, ``block_newton_min_rel`` as usual) from ``best_theta`` and stays on for the rest of the run;
                         if that also fails to set a record within ``patience``, the next tier follows (bisection kick if enabled, else
                         the noisy restart). Needs ``patience_rel_tol`` > 0 on plateaus that creep down (see there).
+        stall_block_newton_revert: With the block-Newton stall tier: if the ladder moves past it (no significant record within another
+                        ``patience`` window after it was switched on), the joint step is switched OFF again before the next tier, so the
+                        noisy restarts run with the scalar step (on q1 the joint step kept on made every restart blow up). Default True.
         stall_block_newton_off_mre: With a block-Newton gate active (static or stall tier): once the record falls below this MRE (provided the joint step was switched on above it: q4 turns it on at 2e-5 and needs it) the joint step is switched
                         OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). 0.0 (default) = never off.
         stall_block_newton_first: Order of the two optional tiers when both are enabled: True (default) = block-Newton before the bisection
@@ -2178,6 +2182,13 @@ def solve_fixed_point_decm(
     # (the kick tier is patience-stall-specific, not wired into the
     # blowup path). See `bisection_kick_iters` docstring for the rationale.
     _stall_tier = 0
+
+    def _revert_stall_bn() -> None:
+        """The block-Newton stall tier had its window and set no significant record: back to the scalar step."""
+        if stall_block_newton_revert and _bn_stall_used[0] and _bn[0] > 0.0 and block_newton_gate == 0.0:
+            _bn[0] = 0.0
+            if verbose:
+                print(f"[patience] block-Newton OFF (no significant record within patience) at iter {n_iter}.")
 
     def _stall_kind() -> str | None:
         """Kind of the stall-ladder tier after the soft reset that is due next (None = the noisy restart)."""
@@ -2818,6 +2829,7 @@ def solve_fixed_point_decm(
                     _and_g.clear()
                     _and_r.clear()
                 elif _stall_tier >= 1 and _stall_kind() == "bisect":
+                    _revert_stall_bn()
                     _ckpt("bisection_kick")
                     # Tier 2 (NEW): the soft reset ALSO failed to beat the
                     # record within another `patience` window -- try a
@@ -2852,6 +2864,7 @@ def solve_fixed_point_decm(
                 else:
                     # Tier 3 (last resort, was tier 2 before the kick):
                     # escalating noisy restart.
+                    _revert_stall_bn()
                     _patience_restart_theta, _give_up = _perturbed_restart()
                     iters_since_improve = 0
                     # A restart is itself a fresh start: give the resulting
@@ -3137,6 +3150,7 @@ def solve_fixed_point_decm_degenerate(
     stall_block_newton_gate: float = 0.0,
     stall_block_newton_first: bool = True,
     stall_block_newton_off_mre: float = 0.0,
+    stall_block_newton_revert: bool = True,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -3314,6 +3328,7 @@ def solve_fixed_point_decm_degenerate(
         stall_block_newton_gate=stall_block_newton_gate,
         stall_block_newton_first=stall_block_newton_first,
         stall_block_newton_off_mre=stall_block_newton_off_mre,
+        stall_block_newton_revert=stall_block_newton_revert,
         z_clamp=z_clamp,
         init_best_theta=init_best_theta_g,
         init_best_res=init_best_res,

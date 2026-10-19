@@ -611,6 +611,7 @@ class DECMModel:
         stall_block_newton_gate: float | None = None,
         stall_block_newton_first: bool = True,
         stall_block_newton_off_mre: float = 2e-4,
+        stall_block_newton_revert: bool = True,
         checkpoint_dir: str | None = None,
         streak_fix_threshold: int = 0,
         streak_fix_n_sweeps: int = 5,
@@ -744,6 +745,7 @@ class DECMModel:
                            (with this gate) after the soft reset fails, before the bisection kick / noisy restart. Use together with
                            ``patience_rel_tol`` > 0. See :func:`solve_fixed_point_decm`.
             stall_block_newton_off_mre: Switch the stall-tier block-Newton OFF once the record is below this MRE (0 = never; default 2e-4; acts only if the step was switched on above it).
+            stall_block_newton_revert: Switch the stall-tier block-Newton off again if it sets no significant record within its patience window (default True).
             stall_block_newton_first: Order of the block-Newton and bisection-kick tiers when both are enabled (default: block-Newton first).
             checkpoint_dir: ``None`` (default) = off. A directory: every time the solver restarts from its best iterate (soft reset,
                            block-Newton switch, bisection kick, noisy restart, blowup rollback) and the record improved since the last save,
@@ -951,6 +953,7 @@ class DECMModel:
                     stall_block_newton_gate=stall_block_newton_gate,
                     stall_block_newton_first=stall_block_newton_first,
                     stall_block_newton_off_mre=stall_block_newton_off_mre,
+                    stall_block_newton_revert=stall_block_newton_revert,
                     checkpoint_fn=_ckpt_fn,
                     streak_fix_threshold=streak_fix_threshold,
                     streak_fix_n_sweeps=streak_fix_n_sweeps,
@@ -996,6 +999,7 @@ class DECMModel:
                 stall_block_newton_gate=stall_block_newton_gate,
                 stall_block_newton_first=stall_block_newton_first,
                 stall_block_newton_off_mre=stall_block_newton_off_mre,
+                stall_block_newton_revert=stall_block_newton_revert,
                 checkpoint_fn=_ckpt_fn,
                 streak_fix_threshold=streak_fix_threshold,
                 streak_fix_n_sweeps=streak_fix_n_sweeps,

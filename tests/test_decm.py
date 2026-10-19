@@ -1142,11 +1142,18 @@ class TestStallBlockNewtonTier:
 
     def test_off_mre_not_applied_if_switched_on_below_threshold(self, capsys) -> None:
         out = self._run(capsys, stall_block_newton_gate=0.05, stall_block_newton_off_mre=1e300)
-        assert out.count("block-Newton ON") == 1 and "block-Newton OFF" not in out
+        assert out.count("block-Newton ON") == 1 and "block-Newton OFF (record" not in out
 
     def test_off_mre_switches_static_gate_off_once(self, capsys) -> None:
         out = self._run(capsys, block_newton_gate=0.05, stall_block_newton_off_mre=1e300)
         assert out.count("block-Newton OFF") == 1
+
+    def test_block_newton_reverted_if_tier_fails(self, capsys) -> None:
+        out = self._run(capsys, stall_block_newton_gate=0.05)
+        if "block-Newton ON" in out and "[perturbed-restart]" in out:
+            assert "block-Newton OFF (no significant record" in out
+        out = self._run(capsys, stall_block_newton_gate=0.05, stall_block_newton_revert=False)
+        assert "block-Newton OFF (no significant record" not in out
 
     def test_requires_degenerate_path(self) -> None:
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)

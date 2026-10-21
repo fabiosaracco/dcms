@@ -206,7 +206,7 @@ assert len({r.tag for r in RECIPES}) == 19, f"expected 19 unique recipes, got {l
 # asking, not as a settled answer.
 RECOMMENDED_FRESH_START: dict = dict(
     anderson_depth=3, streak_fix_threshold=50, hub_sk_threshold=5.0, z_clamp=1e-6,
-    block_newton_gate=0.05, block_newton_min_rel=None,   # None -> 0.1*tol, the safer paired default
+    block_newton_gate=0.05, block_newton_min_rel=0.0,   # 0.0 = no restriction. None (-> 0.1*tol) makes q5 FAIL from zero (2026-10-21, first bad commit 5042396): with 0.0 q5 converges in 2606 it at HEAD, 1845 it at 3a01702
 )
 
 

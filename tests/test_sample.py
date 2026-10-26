@@ -219,6 +219,35 @@ class TestDECMSample:
         m = self._fitted()
         assert np.array_equal(m.sample(seed=9), m.sample(seed=9))
 
+    def test_invalid_method(self):
+        with pytest.raises(ValueError):
+            self._fitted().sample(seed=0, method="nope")
+
+    def test_grouped_format(self):
+        m = self._fitted()
+        edges = m.sample(seed=0, method="grouped")
+        assert isinstance(edges, np.ndarray) and edges.shape[1] == 3
+        assert np.issubdtype(edges.dtype, np.integer)
+        assert (edges[:, 2] > 0).all()
+        assert np.all(edges[:, 0] != edges[:, 1])
+        assert len({(a, b) for a, b, _ in edges}) == len(edges)   # distinct ordered pairs
+        assert np.array_equal(edges, m.sample(seed=0, method="grouped"))
+
+    def test_grouped_matches_pij(self):
+        """Empirical link frequencies of the grouped sampler match the DECM link probabilities."""
+        m = self._fitted()
+        n = 3000
+        freq = np.zeros((m.N, m.N))
+        for e in m.sample_many(n, seed=1, n_jobs=1, method="grouped"):
+            freq[e[:, 0], e[:, 1]] += 1
+        freq /= n
+        P = np.array(m.pij_matrix(m.sol.best_theta))
+        np.fill_diagonal(P, 0.0)
+        ok = (P > 0.01) & (P < 0.99)
+        z = np.abs(freq - P)[ok] / np.sqrt(P[ok] * (1 - P[ok]) / n)
+        assert z.max() < 5.0
+        assert freq[np.eye(m.N, dtype=bool)].sum() == 0
+
 
 # ---------------------------------------------------------------------------
 # sample_many tests (all four models)

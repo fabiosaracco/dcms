@@ -725,7 +725,7 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ,η)‖` |
 | `model.max_relative_error(theta)` | float | Max relative error over all 4N non-zero constraints |
 | `model.initial_theta(method)` | `(4N,)` tensor | Initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DECM (see §3.5) |
+| `model.sample(seed, chunk_size, method)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DECM; `method="grouped"` is an exact, much faster sampler (see §3.5) |
 | `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted DECM (see §3.6) |
 
 `initial_theta` methods for DECM:
@@ -790,6 +790,10 @@ After deduplication the edge probability is `P(A_ij = 1) = 1 − exp(−p_ij)`, 
 > **Note**: this is *not* the Chung–Lu approximation.  Chung–Lu would skip step 3, giving `P ≈ x_i y_j` rather than `x_i y_j/(1+x_i y_j)`.  The acceptance step in step 3 ensures the exact DCM probabilities are respected; only the Poisson-to-Bernoulli conversion introduces a second-order error.
 
 Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chunk_size` controls peak RAM in that path.
+
+#### Grouped exact sampler for DECM (`method="grouped"`)
+
+`DECMModel.sample(method="grouped")` (and `sample_many(..., method="grouped")`) draws from the **same** distribution as the default O(N²) sampler, exploiting that nodes with identical constraints (k_out, k_in, s_out, s_in) have identical fitted parameters. For two groups a, b all ordered pairs between them are i.i.d. Bernoulli(p_ab), so the number of links of a group pair is drawn from a Binomial(n_ab, p_ab), the links are placed on distinct uniformly chosen pairs, and the weights are geometric as usual. Cost O(M² + L), with M the number of groups. On the 19 empirical networks N²/M² ranges from 18 to 438 (e.g. N=107 056, M=5 117: 3 s instead of ~530 s per sample). No gain when all nodes are distinct. Realizations differ from the default sampler for the same seed (same law, different random stream).
 
 #### Parallel batch sampling with `sample_many()`
 

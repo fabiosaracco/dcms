@@ -1088,8 +1088,25 @@ class DECMModel:
             return np.empty((0, 3), dtype=int)
         return np.vstack(parts)
 
+    def _sample_grouped(self, seed: int | None = None) -> "np.ndarray":
+        """Exact degeneracy-grouped sampler (see :mod:`dcms.utils.grouped_sampling`)."""
+        import numpy as np
+        from dcms.utils.grouped_sampling import group_model, sample_grouped
+        if self.sol is None:
+            raise RuntimeError("Call solve_tool() first.")
+        cache = getattr(self, "_grouped_cache", None)
+        if cache is None or cache[0] is not self.sol:
+            g = group_model(self)
+            if g["dev"] > 1e-8:
+                raise RuntimeError(
+                    "Parameters are not constant within groups of identical constraints "
+                    f"(max deviation {g['dev']:.1e}); use method='exact'.")
+            cache = (self.sol, g)
+            self._grouped_cache = cache
+        return sample_grouped(cache[1], np.random.default_rng(seed))
+
     def sample(self, seed: int | None = None,
-               chunk_size: int = 512) -> "np.ndarray":
+               chunk_size: int = 512, method: str = "exact") -> "np.ndarray":
         """Sample a weighted directed network from the fitted DECM.
 
         Two-step procedure using the exact DECM distribution:
@@ -1105,9 +1122,21 @@ class DECMModel:
                P(w_ij = k | A_ij = 1) = (1 − β_ij) β_ij^{k−1},   k = 1, 2, …
                β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
 
+        ``method="grouped"`` draws from the same distribution at cost
+        O(M² + L) instead of O(N²), M being the number of groups of nodes with
+        identical constraints (k_out, k_in, s_out, s_in), which share the same
+        fitted parameters: link counts per group pair are binomial, links are
+        placed on distinct uniformly chosen pairs of the pair, weights are
+        geometric as above.  Typically 50-170x faster on large empirical
+        networks (M ≪ N); no gain if all nodes are distinct.
+
         Args:
             seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time.
+            chunk_size: Number of source rows processed at a time
+                (``method="exact"`` only).
+            method: ``"exact"`` (default, per-pair Bernoulli, O(N²)) or
+                ``"grouped"``.  The two give the same distribution but not the
+                same realization for a given seed.
 
         Returns:
             ``np.ndarray`` of shape ``(L, 3)`` with integer columns
@@ -1116,11 +1145,16 @@ class DECMModel:
 
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
+            ValueError: if ``method`` is not ``"exact"`` or ``"grouped"``.
         """
+        if method == "grouped":
+            return self._sample_grouped(seed=seed)
+        if method != "exact":
+            raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
         return self._sample_raw(seed=seed, chunk_size=chunk_size)
 
     def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1) -> list:
+                    n_jobs: int = -1, method: str = "exact") -> list:
         """Generate ``n`` independent samples in parallel.
 
         Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
@@ -1137,6 +1171,7 @@ class DECMModel:
             n: Number of independent samples to draw.
             seed: Master seed from which per-sample seeds are derived.
             n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
+            method: ``"exact"`` (default) or ``"grouped"``, see :meth:`sample`.
 
         Returns:
             List of ``n`` NumPy arrays, one per sample.
@@ -1146,12 +1181,17 @@ class DECMModel:
         """
         import numpy as np
         from concurrent.futures import ThreadPoolExecutor
+        if method not in ("exact", "grouped"):
+            raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
+        draw = self._sample_grouped if method == "grouped" else self._sample_raw
+        if method == "grouped":
+            self._sample_grouped(seed=0)   # build the group cache before the threads start
         seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
         if n_jobs == 1:
-            return [self._sample_raw(seed=s) for s in seeds]
+            return [draw(seed=s) for s in seeds]
         max_workers = None if n_jobs < 0 else n_jobs
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            return list(ex.map(self._sample_raw, seeds))
+            return list(ex.map(lambda s: draw(seed=s), seeds))
 
     def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
         """Compute the DECM p-value of each observed weight in an edge list.

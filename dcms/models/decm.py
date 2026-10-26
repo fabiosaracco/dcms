@@ -1106,7 +1106,7 @@ class DECMModel:
         return sample_grouped(cache[1], np.random.default_rng(seed))
 
     def sample(self, seed: int | None = None,
-               chunk_size: int = 512, method: str = "exact") -> "np.ndarray":
+               chunk_size: int = 512, method: str = "grouped") -> "np.ndarray":
         """Sample a weighted directed network from the fitted DECM.
 
         Two-step procedure using the exact DECM distribution:
@@ -1134,9 +1134,9 @@ class DECMModel:
             seed: Random seed for reproducibility.
             chunk_size: Number of source rows processed at a time
                 (``method="exact"`` only).
-            method: ``"exact"`` (default, per-pair Bernoulli, O(N²)) or
-                ``"grouped"``.  The two give the same distribution but not the
-                same realization for a given seed.
+            method: ``"grouped"`` (default) or ``"exact"`` (per-pair
+                Bernoulli, O(N²)).  The two give the same distribution but not
+                the same realization for a given seed.
 
         Returns:
             ``np.ndarray`` of shape ``(L, 3)`` with integer columns
@@ -1154,7 +1154,7 @@ class DECMModel:
         return self._sample_raw(seed=seed, chunk_size=chunk_size)
 
     def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1, method: str = "exact") -> list:
+                    n_jobs: int = -1, method: str = "grouped") -> list:
         """Generate ``n`` independent samples in parallel.
 
         Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
@@ -1171,7 +1171,7 @@ class DECMModel:
             n: Number of independent samples to draw.
             seed: Master seed from which per-sample seeds are derived.
             n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
-            method: ``"exact"`` (default) or ``"grouped"``, see :meth:`sample`.
+            method: ``"grouped"`` (default) or ``"exact"``, see :meth:`sample`.
 
         Returns:
             List of ``n`` NumPy arrays, one per sample.

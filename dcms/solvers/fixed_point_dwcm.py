@@ -123,6 +123,9 @@ _FPGS_NEWTON_AND_DEPTH: int = 5
 _FPGS_NEWTON_RETRY_NOISE_BASE: float = 2e-3
 _FPGS_NEWTON_RETRY_NOISE_GROWTH: float = 2.0
 _FPGS_NEWTON_RETRY_MAX: int = 5
+# After this many consecutive firings in which ALL retries diverged, the mini-loop is disabled for the rest of the run: falling back to
+# best_theta just re-enters the same cycle, so further firings only add up to _FPGS_NEWTON_RETRY_MAX * _FPGS_NEWTON_STEPS wasted steps each.
+_FPGS_NEWTON_MAX_FAILED_FIRINGS: int = 3
 
 
 
@@ -398,6 +401,8 @@ def solve_fixed_point_dwcm(
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.
     """
+    _mini_loop_failed = 0          # consecutive firings in which every retry diverged
+    _mini_loop_disabled = False
     _mini_loop_gen = torch.Generator()
     if seed is not None:
         _mini_loop_gen.manual_seed(seed)
@@ -798,6 +803,7 @@ def solve_fixed_point_dwcm(
                     if (
                         _fpgs_stagnation_count >= _FPGS_NEWTON_RESET_WINDOW
                         and res_norm > tol
+                        and not _mini_loop_disabled
                     ):
                         _fpgs_newton_fired = True
                         # Reset for fresh tracking after Newton correction.
@@ -1014,6 +1020,7 @@ def solve_fixed_point_dwcm(
                     theta_nt, nt_res_final = _run_mini_loop(_start)
                     if math.isfinite(nt_res_final) and nt_res_final <= _ANDERSON_BLOWUP_FACTOR * best_theta_res:
                         theta_next = theta_nt
+                        _mini_loop_failed = 0
                         if verbose and _attempt > 0:
                             print(
                                 f"[fpgs-newton] mini-loop correction diverged on attempt "
@@ -1036,6 +1043,14 @@ def solve_fixed_point_dwcm(
                             f"{_FPGS_NEWTON_RETRY_MAX} attempts -- falling back to best_theta."
                         )
                     theta_next = best_theta.clone()
+                    _mini_loop_failed += 1
+                    if _mini_loop_failed >= _FPGS_NEWTON_MAX_FAILED_FIRINGS:
+                        _mini_loop_disabled = True
+                        if verbose:
+                            print(
+                                f"[fpgs-newton] {_mini_loop_failed} consecutive firings with every retry diverged "
+                                f"-- mini-loop disabled for the rest of this run."
+                            )
                 # Reset blowup threshold so post-Newton residuals don't trigger
                 # a false blowup on the very next main-loop iteration.
                 _best_res_for_anderson = float("inf")

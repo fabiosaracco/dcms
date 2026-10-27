@@ -906,6 +906,22 @@ class TestBlockNewton:
         b = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, block_newton_gate=1e-300)      # nothing is below this gate
         assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
+    def test_in_hub_rows_keep_the_scalar_theta_step(self) -> None:
+        """hub_in_mask excludes in-side hub rows from the joint step (theta_in must equal the scalar step there), as hub_out_mask does for out."""
+        theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
+        th = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(7))
+        th[2 * M:] = th[2 * M:].clamp(min=1.0)
+        hub = torch.zeros(M, dtype=torch.bool); hub[:2] = True
+        allout = torch.ones(M, dtype=torch.bool)       # the in side is evaluated after the out update: keep the out side scalar in all runs
+        kw = dict(hub_out_mask=allout)
+        scalar = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, **kw)[0]
+        joint = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, block_newton_gate=1e9, **kw)[0]
+        masked = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, block_newton_gate=1e9, hub_in_mask=hub, **kw)[0]
+        assert not torch.equal(joint[M:2 * M][hub], scalar[M:2 * M][hub])         # without the mask the hub rows do get the joint step
+        assert torch.equal(masked[M:2 * M][hub], scalar[M:2 * M][hub])
+        chunk = _decm_step_chunked_weighted(th, ko, ki, so, si, *zs, 4, 5.0, mult, block_newton_gate=1e9, hub_in_mask=hub, **kw)[0]
+        assert torch.allclose(chunk[M:2 * M], masked[M:2 * M], rtol=1e-9, atol=1e-12)
+
     def test_dense_and_chunked_agree_with_the_gate_on(self) -> None:
         theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
         th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(11))

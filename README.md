@@ -460,6 +460,8 @@ model.solve_tool(
 )
 ```
 
+**What has been tested:** `device="mps"` on Apple Silicon was run during development and is exercised by `tests/test_device.py` (all four models, small problem, `tol=1e-3`, compared with the CPU solution). `device="cuda"` is the same torch code path (a device string, float32) and is **potentially working but has never been run**: no CUDA hardware was available, so its tests are skipped here and are the first thing to run on a machine with an NVIDIA GPU. Note for qDECM: its topology stage uses `tol * 1e-3`, which for `tol < ~1e-3` is below the float32 plateau (~2e-7), so on a non-CPU device it reports `converged=False` (with a good solution) unless `tol >= 1e-3`.
+
 **Status:** available on all four models (DCM, DWCM, qDECM, DECM), including DECM's chunked degeneracy-reduced step (used automatically once `M` exceeds `DECM_LARGE_N_THRESHOLD=2000` — i.e. every large real network). DECM's stagnation-recovery mechanisms (hub bisection, perturbed restart, §2.6) remain internally CPU-only by design and interoperate transparently with a non-CPU main-loop `device` — theta is moved to/from the right device automatically at each boundary, with no action needed from the caller.
 
 ---

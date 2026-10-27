@@ -500,6 +500,7 @@ def _decm_step_dense_weighted(
     max_step: float,
     mult: torch.Tensor,
     hub_out_mask: "torch.Tensor | None" = None,
+    hub_in_mask: "torch.Tensor | None" = None,
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -666,7 +667,7 @@ def _decm_step_dense_weighted(
         delta_theta_in, delta_eta_in, gated_in = _block_newton_deltas(
             k_in_hat2 - k_in, s_in_hat2 - s_in, H_k_in2, Bp_in, Cp_in, E_in, H_s_in2,
             block_newton_gate, max_step, delta_theta_in, delta_eta_in,
-            exclude=_block_exclude(None, k_in_hat2 - k_in, s_in_hat2 - s_in, k_in, s_in, block_newton_min_rel),
+            exclude=_block_exclude(hub_in_mask, k_in_hat2 - k_in, s_in_hat2 - s_in, k_in, s_in, block_newton_min_rel),
         )
 
     # ------- Update η_in (with z-floor) -------
@@ -934,6 +935,7 @@ def _decm_step_chunked_weighted(
     max_step: float,
     mult: torch.Tensor,
     hub_out_mask: "torch.Tensor | None" = None,
+    hub_in_mask: "torch.Tensor | None" = None,
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1178,7 +1180,7 @@ def _decm_step_chunked_weighted(
         delta_theta_in, delta_eta_in, gated_in = _block_newton_deltas(
             k_in_hat2 - k_in, s_in_hat2 - s_in, H_k_in2, Bp_in, Cp_in, E_in, H_s_in2,
             block_newton_gate, max_step, delta_theta_in, delta_eta_in,
-            exclude=_block_exclude(None, k_in_hat2 - k_in, s_in_hat2 - s_in, k_in, s_in, block_newton_min_rel),
+            exclude=_block_exclude(hub_in_mask, k_in_hat2 - k_in, s_in_hat2 - s_in, k_in, s_in, block_newton_min_rel),
         )
 
     # ------- Update η_in (with z-floor line-search) -------
@@ -1995,23 +1997,23 @@ def solve_fixed_point_decm(
     # Step function with bound arguments
     if mult is not None:
         if effective_chunk > 0:
-            def _step(th, hub_out_mask=None):
+            def _step(th, hub_out_mask=None, hub_in_mask=None):
                 return _decm_step_chunked_weighted(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     effective_chunk, max_step, mult,
-                    hub_out_mask=hub_out_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
+                    hub_out_mask=hub_out_mask, hub_in_mask=hub_in_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
                 )
         else:
-            def _step(th, hub_out_mask=None):
+            def _step(th, hub_out_mask=None, hub_in_mask=None):
                 return _decm_step_dense_weighted(
                     th, k_out, k_in, s_out, s_in,
                     zero_k_out, zero_k_in, zero_s_out, zero_s_in,
                     max_step, mult,
-                    hub_out_mask=hub_out_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
+                    hub_out_mask=hub_out_mask, hub_in_mask=hub_in_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
                 )
     elif _use_numba and variant == "theta-newton":
-        def _step(th, hub_out_mask=None):  # mask unused: numba path keeps the old hub behaviour
+        def _step(th, hub_out_mask=None, hub_in_mask=None):  # mask unused: numba path keeps the old hub behaviour
             to_ = th[:N].numpy()
             ti_ = th[N:2*N].numpy()
             eo_ = th[2*N:3*N].numpy()
@@ -2035,7 +2037,7 @@ def solve_fixed_point_decm(
     if mult is not None:
         pass  # _step already bound to _decm_step_dense_weighted above
     elif effective_chunk > 0:
-        def _step(th, hub_out_mask=None):
+        def _step(th, hub_out_mask=None, hub_in_mask=None):
             return _decm_step_chunked(
                 th, k_out, k_in, s_out, s_in,
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
@@ -2043,7 +2045,7 @@ def solve_fixed_point_decm(
                 hub_out_mask=hub_out_mask,
             )
     else:
-        def _step(th, hub_out_mask=None):
+        def _step(th, hub_out_mask=None, hub_in_mask=None):
             return _decm_step_dense(
                 th, k_out, k_in, s_out, s_in,
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
@@ -2350,7 +2352,7 @@ def solve_fixed_point_decm(
         _step_raw = _step
 
         def _step(th, _step_raw=_step_raw):
-            theta_new, F_current = _step_raw(th, hub_out_mask=_hub_out_mask)
+            theta_new, F_current = _step_raw(th, hub_out_mask=_hub_out_mask, hub_in_mask=_hub_in_mask)
             theta_new = torch.cat([
                 theta_new[: 2 * N],
                 torch.where(_hub_eta_mask, th[2 * N :], theta_new[2 * N :]),

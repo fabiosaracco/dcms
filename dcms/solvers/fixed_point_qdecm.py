@@ -477,11 +477,7 @@ def _solve_qdecm_weights_reduced(
                             theta_fp[N + _hj] = max(_new_theta, -_ETA_MAX)
                             _beta_in_fp[_hj] = _new_beta
 
-                # All hub constraints satisfied → zero their F_current entries
-                for _hi in _hub_out_idx:
-                    F_current[_hi] = 0.0
-                for _hj in _hub_in_idx:
-                    F_current[N + _hj] = 0.0
+                # F_current keeps the hub entries: the convergence test (MRE) covers EVERY constraint, hubs included.
 
             # --- Convergence check using the step-computed residual ---
             # Relative: MRE = max|F_i|/target_i

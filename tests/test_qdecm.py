@@ -417,7 +417,7 @@ class TestDegeneracyReduction:
         qm = qDECMModel(k_out, k_in, s_out, s_in)
         assert qm.solve_tool(tol=1e-6, max_iter=3000, hub_sk_threshold=5.0)
         th = torch.as_tensor(qm.sol.best_theta)
-        assert qm.max_relative_error(th[:2 * N], th[2 * N:]) < 1e-3          # hub rows are solved by bisection, others to tol
+        assert qm.max_relative_error(th[:2 * N], th[2 * N:]) < 2e-6          # the convergence test covers the hub rows too (tol=1e-6)
 
     def test_removed_options_are_rejected(self) -> None:
         k_out, k_in, s_out, s_in = self._degenerate_network()

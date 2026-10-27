@@ -1088,22 +1088,33 @@ class DECMModel:
             return np.empty((0, 3), dtype=int)
         return np.vstack(parts)
 
-    def _sample_grouped(self, seed: int | None = None) -> "np.ndarray":
-        """Exact degeneracy-grouped sampler (see :mod:`dcms.utils.grouped_sampling`)."""
-        import numpy as np
-        from dcms.utils.grouped_sampling import group_model, sample_grouped
+    def _grouped_sampler_state(self):
+        """Group the nodes once per fitted solution; ``None`` if the parameters are not constant within groups."""
+        from dcms.utils.grouped_sampling import group_model
         if self.sol is None:
             raise RuntimeError("Call solve_tool() first.")
         cache = getattr(self, "_grouped_cache", None)
         if cache is None or cache[0] is not self.sol:
             g = group_model(self)
-            if g["dev"] > 1e-8:
-                raise RuntimeError(
-                    "Parameters are not constant within groups of identical constraints "
-                    f"(max deviation {g['dev']:.1e}); use method='exact'.")
-            cache = (self.sol, g)
+            cache = (self.sol, g if g["dev"] <= 1e-8 else None, g["dev"])
             self._grouped_cache = cache
-        return sample_grouped(cache[1], np.random.default_rng(seed))
+        return cache
+
+    def _sample_grouped(self, seed: int | None = None) -> "np.ndarray":
+        """Exact degeneracy-grouped sampler (see :mod:`dcms.utils.grouped_sampling`).
+
+        Falls back to the per-pair sampler, with a warning, when the fitted parameters are not constant within
+        groups of identical constraints (e.g. a model solved with ``reduce_degeneracy=False``)."""
+        import warnings
+        import numpy as np
+        from dcms.utils.grouped_sampling import sample_grouped
+        _, g, dev = self._grouped_sampler_state()
+        if g is None:
+            warnings.warn(
+                f"Parameters are not constant within groups of identical constraints (max deviation {dev:.1e}); "
+                "falling back to method='exact'.", stacklevel=3)
+            return self._sample_raw(seed=seed)
+        return sample_grouped(g, np.random.default_rng(seed))
 
     def sample(self, seed: int | None = None,
                chunk_size: int = 512, method: str = "grouped") -> "np.ndarray":
@@ -1185,7 +1196,7 @@ class DECMModel:
             raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
         draw = self._sample_grouped if method == "grouped" else self._sample_raw
         if method == "grouped":
-            self._sample_grouped(seed=0)   # build the group cache before the threads start
+            self._grouped_sampler_state()   # build the group cache before the threads start
         seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
         if n_jobs == 1:
             return [draw(seed=s) for s in seeds]

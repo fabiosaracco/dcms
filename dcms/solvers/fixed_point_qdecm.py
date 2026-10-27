@@ -55,6 +55,7 @@ import datetime
 import math
 import sys
 import time
+import functools
 import warnings
 from typing import Callable
 
@@ -933,7 +934,7 @@ def _qdecm_step_dense_weighted(
     return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
 
 
-def solve_fixed_point_qdecm(
+def _solve_fixed_point_qdecm_impl(
     residual_fn: Callable[[torch.Tensor], torch.Tensor],
     theta0: "ArrayLike",  # type: ignore[name-defined]
     s_out: "ArrayLike",  # type: ignore[name-defined]
@@ -1761,6 +1762,17 @@ def solve_fixed_point_qdecm(
         peak_ram_bytes=peak_ram,
         message=message,
     )
+
+
+@functools.wraps(_solve_fixed_point_qdecm_impl)
+def solve_fixed_point_qdecm(*args, **kwargs):
+    """Sets the module-level z clamp for the call and restores it afterwards (see ``z_clamp``)."""
+    global _Z_G_CLAMP, _Z_NEWTON_FLOOR
+    saved = (_Z_G_CLAMP, _Z_NEWTON_FLOOR)
+    try:
+        return _solve_fixed_point_qdecm_impl(*args, **kwargs)
+    finally:
+        _Z_G_CLAMP, _Z_NEWTON_FLOOR = saved
 
 
 def solve_fixed_point_qdecm_degenerate(

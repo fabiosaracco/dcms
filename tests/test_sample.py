@@ -233,6 +233,21 @@ class TestDECMSample:
         assert len({(a, b) for a, b, _ in edges}) == len(edges)   # distinct ordered pairs
         assert np.array_equal(edges, m.sample(seed=0, method="grouped"))
 
+    def test_grouped_falls_back_when_parameters_not_constant_in_groups(self):
+        import copy
+        from dcms.utils.grouped_sampling import group_model
+        m = self._fitted()
+        g = group_model(m)
+        grp = int(np.flatnonzero(g["n_g"] > 1)[0])
+        node = int(g["members"][g["start"][grp]])
+        th = np.array(m.sol.best_theta, dtype=np.float64)
+        th[node] += 1e-3
+        m.sol = copy.copy(m.sol)
+        m.sol.best_theta = th
+        with pytest.warns(UserWarning, match="not constant within groups"):
+            edges = m.sample(seed=0)
+        assert np.array_equal(edges, m.sample(seed=0, method="exact"))
+
     def test_grouped_matches_pij(self):
         """Empirical link frequencies of the grouped sampler match the DECM link probabilities."""
         m = self._fitted()

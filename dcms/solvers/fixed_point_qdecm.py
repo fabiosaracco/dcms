@@ -1091,7 +1091,7 @@ def _solve_fixed_point_qdecm_impl(
             f"(dcms/models/qdecm.py) still hard-code 1e-8, so for pairs between the two "
             f"values the solver's equations would differ from the residual it is judged "
             f"by. Use the default 1e-8.",
-            stacklevel=2,
+            stacklevel=3,
         )
     global _Z_G_CLAMP, _Z_NEWTON_FLOOR
     _Z_G_CLAMP = z_clamp

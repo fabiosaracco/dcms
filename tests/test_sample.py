@@ -361,3 +361,16 @@ class TestSampleManyDECM:
     def test_no_self_loops(self):
         for arr in self.m.sample_many(3, seed=1):
             assert np.all(arr[:, 0] != arr[:, 1])
+
+
+class TestDistinctPlacement:
+    def test_distinct_values_in_range_including_full_and_singleton_blocks(self):
+        from dcms.utils.grouped_sampling import _distinct
+        rng = np.random.default_rng(0)
+        n_ab = np.array([1, 1, 2, 5, 5, 40, 1000, 7])
+        c = np.array([1, 1, 2, 3, 5, 30, 4, 4])
+        ids, vals = _distinct(rng, n_ab, c)
+        assert np.array_equal(np.bincount(ids, minlength=len(c)), c)
+        for k in range(len(c)):
+            v = vals[ids == k]
+            assert len(set(v.tolist())) == c[k] and v.min() >= 0 and v.max() < n_ab[k]

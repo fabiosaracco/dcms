@@ -53,8 +53,4 @@ def test_current_ladder_matches_solve_tool_defaults():
     from network_recipes import CURRENT_LADDER
     params = inspect.signature(DECMModel.solve_tool).parameters
     for key, value in CURRENT_LADDER.items():
-        default = params[key].default
-        if key == "stall_block_newton_gate":
-            assert default is None and value == 0.05      # None = 0.05 on the degeneracy-reduced path
-        else:
-            assert default == value, (key, default, value)
+        assert params[key].default == value, (key, params[key].default, value)

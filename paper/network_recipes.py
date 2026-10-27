@@ -78,7 +78,7 @@ class Recipe:
 # dico0/1/2/3 -- with NO per-network tuning beyond this single shared recipe.
 # ---------------------------------------------------------------------------------------------
 _BATCH_KW = dict(
-    anderson_depth=10, hub_sk_threshold=5.0, backtracking_gamma=0.0, z_clamp=1e-6, noise_base=2e-3,
+    anderson_depth=10, hub_sk_threshold=5.0, z_clamp=1e-6, noise_base=2e-3,
 )
 _BATCH_NOTE = (
     "Standard batch recipe (decm_dico_calculator_batch2608.py), fresh ic='degrees', multi_start=True, "
@@ -108,7 +108,7 @@ RECIPES: list[Recipe] = [
 
     # ---------------------------------------------------------------------- crisi_dico2 (c2)
     Recipe("c2", "crisi", 2, "crisi_dico2_decm_and_10_gamma_0.0_hub_5.pkl", 15168, "partial",
-           dict(anderson_depth=10, hub_sk_threshold=5.0, backtracking_gamma=0.0), True, "",
+           dict(anderson_depth=10, hub_sk_threshold=5.0), True, "",
            "Filename encodes anderson_depth=10/backtracking_gamma=0.0/hub_sk_threshold=5.0 "
            "(a parameter-sweep script from the same 2026-07 era as the batch recipe); "
            "z_clamp/noise_base not recorded in the filename -- left at the package defaults "
@@ -216,7 +216,7 @@ CURRENT_LADDER: dict = dict(     # = the solve_tool defaults at commit 4a1f492 (
 # Benchmark v2 (19/19 networks x 3 models converged, MRE <= 1e-5, benchmark_19/results_v2): every DECM network
 # converged at the first attempt with `general` (fresh ic='degrees', multi_start=False, seed 0), under CURRENT_LADDER.
 BENCHMARK_V2_GENERAL: dict = dict(
-    anderson_depth=10, hub_sk_threshold=5.0, backtracking_gamma=0.0, z_clamp=1e-6, noise_base=2e-3,
+    anderson_depth=10, hub_sk_threshold=5.0, z_clamp=1e-6, noise_base=2e-3,
     multi_start=False, seed=0,        # as measured: a single attempt from ic='degrees' (pass ic='degrees' and a reduced-path model)
     **CURRENT_LADDER,
 )

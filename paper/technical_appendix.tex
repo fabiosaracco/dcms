@@ -173,8 +173,8 @@ k^{\mathrm{in}}_i = \sum_{j\ne i} \frac{x_j y_i}{1+x_j y_i}.
 The map $\theta\mapsto p_{ij}(\theta)$ is unconstrained on all of $\R$ (no
 feasibility boundary): $x_i,y_i>0$ for any finite $\theta$, and $p_{ij}\in
 (0,1)$ automatically. This is the only one of the four models with no
-feasibility region to track, and it converges reliably with the plainest
-solver variant (Sec.~\ref{sec:fpgs}) at every scale tested.
+feasibility region to track, and it converges reliably with the plain
+$\theta$-Newton iteration (Sec.~\ref{sec:newton}) at every scale tested.
 
 \subsection{DWCM --- Directed Weighted Configuration Model}
 \label{sec:dwcm}
@@ -218,7 +218,7 @@ Separability is the entire point of this construction: because $p_{ij}$
 does not depend on $\beta$, the weight step (Eq.~\ref{eq:qdecm}) is itself
 exactly DWCM's fixed-point structure (Eq.~\ref{eq:dwcm}) with $\beta\beta$
 replaced by $p_{ij}$ in the numerator, so every DWCM solver and robustness
-mechanism (Secs.~\ref{sec:fpgs}--\ref{sec:hub}) applies unmodified. This
+mechanism (Secs.~\ref{sec:anderson}--\ref{sec:hub}) applies unmodified. This
 makes qDECM the cheapest of the three weighted models to solve robustly,
 at the cost of being an \emph{approximation}: it does not reproduce the
 exact maximum-entropy ensemble under the joint (degree, strength)
@@ -267,9 +267,10 @@ reason Secs.~\ref{sec:hub}--\ref{sec:block-newton} exist.
 % ==================================================================
 
 All four models reduce to the root-finding problem of
-Eq.~\ref{eq:generic-constraint}; the package solves it with two families of
-fixed-point iterations (Secs.~\ref{sec:fpgs}--\ref{sec:newton}),
-accelerated by Anderson mixing, and --- for the harder models, principally
+Eq.~\ref{eq:generic-constraint}; the package solves it with a single
+iteration, a $\theta$-space Newton step (Sec.~\ref{sec:newton})
+accelerated by Anderson mixing (Sec.~\ref{sec:anderson}), run on the degeneracy-reduced system
+(Sec.~\ref{sec:degeneracy}), and --- for the harder models, principally
 DECM --- five additional mechanisms (Secs.~\ref{sec:hub}--\ref{sec:block-newton})
 that were each added in response to a specific, reproducible failure mode
 on real heavy-tailed networks. Every solver returns the best (lowest
@@ -283,29 +284,10 @@ which is the acceptance criterion throughout this appendix
 ($\mathrm{MRE}\le\mathrm{tol}$, default $\mathrm{tol}=10^{-5}$ for the
 validation runs of Sec.~\ref{sec:validation}).
 
-\subsection{FP-GS: Gauss-Seidel fixed-point iteration with Anderson acceleration}
-\label{sec:fpgs}
+\subsection{Anderson acceleration}
+\label{sec:anderson}
 
-Every constraint equation in Sec.~\ref{sec:models} can be solved for its
-own multiplier in closed form, giving an update map $\theta \mapsto
-g(\theta)$; e.g.\ for the DCM,
-\begin{equation}
-x_i^{\mathrm{new}} = k^{\mathrm{out}}_i \Big/ \sum_{j\ne i} \frac{y_j}{1+x_i y_j}.
-\end{equation}
-Updating $\theta_{\mathrm{out}}$ first and using the \emph{fresh} values
-when updating $\theta_{\mathrm{in}}$ (Gauss--Seidel ordering, as opposed to
-Jacobi/simultaneous updates) lowers the spectral radius $\rho$ of the
-map's Jacobian and is strictly faster; convergence is local and linear
-with rate $\rho$ whenever $\rho<1$. On power-law degree/strength sequences
-a minority of hub nodes have $\rho\ge1$ under the plain map (most sharply
-for DWCM/qDECM's weight step, where $\rho$ grows with $(1-\beta_i\beta_j)^{-1}$
-as $\beta\to1$) and plain FP-GS oscillates or diverges on exactly those
-nodes --- the motivation for both the Newton reformulation of
-Sec.~\ref{sec:newton} and, for the most extreme hubs, the exact bisection
-of Sec.~\ref{sec:hub}.
-
-\textbf{Anderson($m$) acceleration.} Given the last $m$ fixed-point
-residuals $r_k = g(\theta_k)-\theta_k$, Anderson mixing finds the affine
+Let $g(\theta)=\theta+\Delta\theta$ be one Newton step of Sec.~\ref{sec:newton}. Given the last $m$ residuals $r_k = g(\theta_k)-\theta_k$, Anderson mixing finds the affine
 combination of the last $m$ map outputs that minimizes the mixed
 residual's norm,
 \begin{equation}
@@ -325,7 +307,7 @@ history is discarded and the run falls back to a plain (un-mixed) step for
 that iteration --- the first line of defence against the divergence modes
 that motivate Sec.~\ref{sec:decm-robustness}.
 
-\subsection{$\theta$-Newton: coordinate-wise Newton with Anderson acceleration}
+\subsection{$\theta$-Newton: coordinate-wise Newton step}
 \label{sec:newton}
 
 Rather than solving $\theta=g(\theta)$, treat
@@ -339,7 +321,7 @@ Newton step per multiplier, holding every other coordinate fixed:
 \end{equation}
 clipped to $|\Delta\theta^{(a)}_i|\le \texttt{max\_step}$ to bound the step
 size near hubs, and applied Gauss--Seidel style (fresh values feed
-forward within the same sweep) exactly as in Sec.~\ref{sec:fpgs}. For the
+forward within the same sweep) with the out-multipliers updated first. For the
 DCM's out-degree equation the diagonal Jacobian entry is
 $\partial F^{\mathrm{out}}_i/\partial\theta_{\mathrm{out},i} =
 -\sum_{j\ne i} p_{ij}(1-p_{ij})$, always strictly negative, giving a step
@@ -360,9 +342,8 @@ pass 2 updates $(\theta_{\mathrm{in}},\eta_{\mathrm{in}})$ from column sums
 using the pass-1 output --- the residual reported for the iteration is
 always evaluated at the pass's \emph{input} $\theta$, so it reflects the
 previous iteration's correction honestly, never an artificially zeroed
-in-progress value. Anderson acceleration (Sec.~\ref{sec:fpgs}) applies
-identically on top of this map. This variant is the package's reference
-method for every model at every scale, and the only one used for DECM.
+in-progress value. Anderson acceleration (Sec.~\ref{sec:anderson}) applies
+identically on top of this map. This is the package's only iteration, used for every model at every scale.
 
 \textbf{The $z$-floor.} Whenever a model's equations contain a term of the
 form $1/(1-z_{ij})$ or $1/\expm(\pm z_{ij})$ (DWCM, qDECM's weight step,
@@ -449,8 +430,8 @@ $\eta_{\mathrm{out},i}+\eta_{\mathrm{in},j}$), the shift
 $\theta_{\mathrm{out}}\mapsto\theta_{\mathrm{out}}+c,\ \theta_{\mathrm{in}}\mapsto\theta_{\mathrm{in}}-c$
 leaves every $p_{ij}$ (and, for the analogous $\eta$-shift, every
 $W_{ij}$) exactly unchanged. DECM has two independent such directions.
-Consequently the full and degeneracy-reduced solvers are not expected to
-land on bit-identical raw $\theta$ even when both are converged to machine
+Consequently two solutions of the same instance are not expected to
+land on identical raw $\theta$ even when both are converged to machine
 precision; any comparison between two solutions of the same instance must
 be made through a gauge-invariant quantity ($p_{ij}$ and/or $\mathbb
 E[W_{ij}]$), never raw $\theta$.
@@ -481,7 +462,7 @@ simultaneously an out-hub and an in-hub, all out-hubs are bisected first
 against the current in-side values, then all in-hubs against the fresh
 out-side values, for \texttt{hub\_bisect\_max\_sweeps} (default 3) total
 Gauss--Seidel passes to reach mutual consistency; Anderson mixing
-(Sec.~\ref{sec:fpgs}) excludes hub components from its residual history
+(Sec.~\ref{sec:anderson}) excludes hub components from its residual history
 and overwrites them with the bisection value after every mixed step, so
 hub multipliers are never corrupted by an extrapolated mixing coefficient.
 
@@ -500,7 +481,7 @@ Newton step on the same iteration.
 \subsection{DECM stagnation and blowup recovery}
 \label{sec:decm-robustness}
 
-Even with Secs.~\ref{sec:fpgs}--\ref{sec:hub}, some hub-heavy DECM
+Even with Secs.~\ref{sec:anderson}--\ref{sec:hub}, some hub-heavy DECM
 instances stall at a \emph{quasi-fixed point}: the deterministic
 Newton/Anderson dynamics reproduce the same trajectory indefinitely, so a
 plain rollback-and-retry cannot escape it. Two triggers share one
@@ -512,7 +493,7 @@ escalation ladder:
 \emph{relative} fraction --- guarding against a record that creeps down by
 a negligible amount every iteration without ever formally stalling).
 \item \textbf{Repeated blowup}: an isolated Anderson blowup
-(Sec.~\ref{sec:fpgs}) is left to its cheap rollback; only if it recurs with
+(Sec.~\ref{sec:anderson}) is left to its cheap rollback; only if it recurs with
 no record improvement in between does it escalate to the same ladder.
 \end{itemize}
 The ladder itself has three tiers, each attempted only after the previous
@@ -652,13 +633,6 @@ are processed in chunks of 512 to keep peak memory at $O(\mathrm{chunk}\times N)
 rather than $O(N^2)$, with results proven identical to the dense path up
 to floating-point summation order.
 
-\textbf{Backends.} Every solver accepts \texttt{backend $\in$ \{"auto",
-"pytorch", "numba"\}}; \texttt{"auto"} selects PyTorch for $N\le100000$
-and a parallel Numba JIT kernel above that (peak RAM was found
-empirically indistinguishable between the two backends at every scale
-tested; the crossover is purely a wall-clock optimization, $\sim13$--$14\%$
-faster on Numba only above $N\approx100000$).
-
 \textbf{GPU/device.} All four models' degeneracy-reduced solvers accept a
 \texttt{device} string (\texttt{"cpu"} default float64, or
 \texttt{"mps"}/\texttt{"cuda"} float32 --- MPS has no float64 support at
@@ -703,7 +677,7 @@ media data, $N$ ranging from a few hundred to $\sim10^5$ nodes, several
 with extreme strength-to-degree hubs ($s/k$ up to $\sim150$) --- is fully
 solved by DECM (the exact, most demanding model) to $\mathrm{MRE}\le10^{-5}$
 using the mechanisms of this appendix; DWCM and qDECM, structurally easier
-per Sec.~\ref{sec:qdecm}, converge the same set with Secs.~\ref{sec:fpgs}--\ref{sec:hub}
+per Sec.~\ref{sec:qdecm}, converge the same set with Secs.~\ref{sec:anderson}--\ref{sec:hub}
 alone. The two hardest instances in the set required
 Sec.~\ref{sec:block-newton}'s mechanism specifically: one converged from a
 $3.52\times10^{-5}$ plateau in 46 iterations with
@@ -722,9 +696,10 @@ documentation in narrative/API-reference form, and \texttt{tests/} gives
 executable, machine-checked specifications of every claim above (constraint
 equations solved to a known synthetic ground truth; the block-Newton step
 verified against a finite-difference Newton solve to $1.6\times10^{-7}$
-relative error; the degeneracy reduction verified to reproduce the
-unreduced per-node solution to machine precision on synthetic
-degenerate instances).
+relative error; the degeneracy reduction verified, at random points and with
+groups of multiplicity $>1$, to give a group-level residual identical to
+the per-node residual of the expanded parameters, and the expanded
+solutions to satisfy the original per-node equations).
 
 % ==================================================================
 \begin{thebibliography}{9}

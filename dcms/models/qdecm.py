@@ -733,7 +733,9 @@ class qDECMModel:
         else:
             self.ic_topo = _torch.as_tensor(ic_topo, dtype=_torch.float64)
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-        _sol_topo = solve_fixed_point_dcm(self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, device=device)
+        # The topology is solved tighter than the weights: the weight system is built on p_ij, and a topology only converged to `tol`
+        # leaves it inconsistent enough to stall the weight step on crisi_dico4 / quirinale_dico4 (stagnation at 1e-5..3e-5).
+        _sol_topo = solve_fixed_point_dcm(self.ic_topo, self.k_out, self.k_in, tol=tol * 1e-3, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, device=device)
 
         if len(_sol_topo.message)>0:
             print(f'Topology: {_sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True

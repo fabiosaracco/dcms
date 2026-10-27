@@ -33,8 +33,11 @@ def _distinct(rng, n_ab, c):
     """For each block k draw c[k] distinct integers in [0, n_ab[k]); returns (block id, value) arrays."""
     ids, vals = [], []
     full = c == n_ab                       # every pair of the block is a link: no randomness (covers singleton-singleton blocks)
-    for k in np.flatnonzero(full):
-        ids.append(np.full(int(c[k]), k, dtype=np.int64)); vals.append(np.arange(int(c[k]), dtype=np.int64))
+    fk = np.flatnonzero(full)
+    if len(fk):
+        cf = c[fk]
+        ids.append(np.repeat(fk, cf).astype(np.int64))
+        vals.append((np.arange(cf.sum()) - np.repeat(np.cumsum(cf) - cf, cf)).astype(np.int64))
     dense = (c * 2 > n_ab) & ~full
     for k in np.flatnonzero(dense):
         v = rng.choice(int(n_ab[k]), size=int(c[k]), replace=False)

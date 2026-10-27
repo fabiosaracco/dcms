@@ -1130,6 +1130,46 @@ class DECMModel:
             raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
         return self._sample_raw(seed=seed, chunk_size=chunk_size)
 
+    def sample_many(self, n: int, seed: int | None = None,
+                    n_jobs: int = -1, method: str = "grouped") -> list:
+        """Generate ``n`` independent samples in parallel.
+
+        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
+        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
+        works the same as with the list returned by :meth:`sample`.
+
+        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
+        the GIL during random-number generation and array operations, giving
+        near-linear speedup up to the number of physical cores.  Note that
+        DECM uses an O(N²) sampler (link probabilities are not rank-1), so the
+        per-sample cost is higher than for DCM/DWCM/qDECM.
+
+        Args:
+            n: Number of independent samples to draw.
+            seed: Master seed from which per-sample seeds are derived.
+            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
+            method: ``"grouped"`` (default) or ``"exact"``, see :meth:`sample`.
+
+        Returns:
+            List of ``n`` NumPy arrays, one per sample.
+
+        Raises:
+            RuntimeError: if :meth:`solve_tool` has not been called yet.
+        """
+        import numpy as np
+        from concurrent.futures import ThreadPoolExecutor
+        if method not in ("exact", "grouped"):
+            raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
+        draw = self._sample_grouped if method == "grouped" else self._sample_raw
+        if method == "grouped":
+            self._grouped_sampler_state()   # build the group cache before the threads start
+        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
+        if n_jobs == 1:
+            return [draw(seed=s) for s in seeds]
+        max_workers = None if n_jobs < 0 else n_jobs
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(lambda s: draw(seed=s), seeds))
+
     def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
         """Compute the DECM p-value of each observed weight in an edge list.
 

@@ -790,9 +790,9 @@ Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chu
 
 #### Grouped exact sampler for DECM (`method="grouped"`, the default)
 
-`DECMModel.sample(method="grouped")` (the default) draws from the **same** distribution as the default O(N²) sampler, exploiting that nodes with identical constraints (k_out, k_in, s_out, s_in) have identical fitted parameters. For two groups a, b all ordered pairs between them are i.i.d. Bernoulli(p_ab), so the number of links of a group pair is drawn from a Binomial(n_ab, p_ab), the links are placed on distinct uniformly chosen pairs, and the weights are geometric as usual. Cost O(M² + L), with M the number of groups. On the 19 empirical networks N²/M² ranges from 18 to 438 (e.g. N=107 056, M=5 117: 3 s instead of ~530 s per sample). No gain when all nodes are distinct. Pass `method="exact"` for the per-pair O(N²) sampler. Realizations differ between the two for the same seed (same law, different random stream).
+`DECMModel.sample(method="grouped")` (the default; also `sample_many(..., method=...)`) draws from the **same** distribution as the default O(N²) sampler, exploiting that nodes with identical constraints (k_out, k_in, s_out, s_in) have identical fitted parameters. For two groups a, b all ordered pairs between them are i.i.d. Bernoulli(p_ab), so the number of links of a group pair is drawn from a Binomial(n_ab, p_ab), the links are placed on distinct uniformly chosen pairs, and the weights are geometric as usual. Cost O(M² + L), with M the number of groups. On the 19 empirical networks N²/M² ranges from 18 to 438 (e.g. N=107 056, M=5 117: 3 s instead of ~530 s per sample). No gain when all nodes are distinct. Pass `method="exact"` for the per-pair O(N²) sampler. Realizations differ between the two for the same seed (same law, different random stream).
 
-#### Parallel batch sampling with `sample_many()` (DCM, DWCM, qDECM)
+#### Parallel batch sampling with `sample_many()`
 
 `sample_many()` uses `ThreadPoolExecutor` to generate samples in parallel.  NumPy releases the GIL during random-number generation and array operations, so threading provides near-linear speedup up to the number of physical cores.  Both `sample()` and `sample_many()` return NumPy arrays directly (no `list` conversion), eliminating the main GIL-holding bottleneck.
 
@@ -804,7 +804,7 @@ Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chu
 | qDECM | ~37 ms | ~5 ms | ~7× |
 | DWCM | ~83 ms | ~11 ms | ~7× |
 
-`DECMModel` has no `sample_many()`: with the grouped sampler threads give no speedup (measured 0.8–1.0× on `crisi_dico2` and `ita_elections_dico4`), so draw samples with a plain loop over `model.sample(seed=...)`, or in separate processes.
+DECM (8 logical cores): `crisi_dico2` (N = 15 168), grouped sampler, 0.6 s per sample and 3.2× with 8 threads; exact O(N²) sampler on `ita_elections_dico4` (N = 9 010), 2.4 s per sample and 3.6×.
 
 #### Memory estimates for large networks
 

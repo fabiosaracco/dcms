@@ -58,7 +58,7 @@ _ANDERSON_MAX_NORM: float = 1e6
 _ANDERSON_BLOWUP_FACTOR: float = 50.0
 _Q_MAX: float = 0.9999
 
-_Z_G_CLAMP: float = 1e-6      # project-wide default (2026-09-25): solver, model residual, targeted fix and bisection kick all use it
+_Z_G_CLAMP: float = 1e-6      # project-wide default (2026-09-25): solver, model residual and targeted fix all use it
 _Z_NEWTON_FLOOR: float = _Z_G_CLAMP
 _Z_NEWTON_FRAC: float = 0.5
 
@@ -1513,8 +1513,7 @@ def solve_fixed_point_decm(
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float | None = None,
     stall_block_newton_gate: float = 0.0,
-    stall_block_newton_first: bool = True,
-    stall_block_newton_off_mre: float = 0.0,
+    stall_block_newton_off_mre: float = 2e-4,
     stall_block_newton_revert: bool = True,
     backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
@@ -1529,9 +1528,6 @@ def solve_fixed_point_decm(
     noise_growth: float = 2.0,
     max_stalls: int = 5,
     seed: int | None = None,
-    bisection_kick_iters: int = 0,
-    bisection_kick_n_bisect: int = 30,
-    bisection_kick_device: str = "cpu",
     diag_callback: Callable[[int, int, float], None] | None = None,
     diag_every: int = 1,
     diag_state_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
@@ -1599,15 +1595,12 @@ def solve_fixed_point_decm(
         stall_block_newton_gate: Degeneracy-reduced path only. 0.0 (default) = off, ladder unchanged (bit-identical). > 0 adds a stall-ladder
                         tier: after the soft reset fails within another ``patience`` window, the joint 2x2 block-Newton step is switched ON
                         (gate = this value, ``block_newton_min_rel`` as usual) from ``best_theta`` and stays on for the rest of the run;
-                        if that also fails to set a record within ``patience``, the next tier follows (bisection kick if enabled, else
-                        the noisy restart). Needs ``patience_rel_tol`` > 0 on plateaus that creep down (see there).
+                        if that also fails to set a record within ``patience``, the noisy restart follows. Needs ``patience_rel_tol`` > 0 on plateaus that creep down (see there).
         stall_block_newton_revert: With the block-Newton stall tier: if the ladder moves past it (no significant record within another
                         ``patience`` window after it was switched on), the joint step is switched OFF again before the next tier, so the
                         noisy restarts run with the scalar step (on q1 the joint step kept on made every restart blow up). Default True.
         stall_block_newton_off_mre: With a block-Newton gate active (static or stall tier): once the record falls below this MRE (provided the joint step was switched on above it: q4 turns it on at 2e-5 and needs it) the joint step is switched
-                        OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). 0.0 (default) = never off.
-        stall_block_newton_first: Order of the two optional tiers when both are enabled: True (default) = block-Newton before the bisection
-                        kick, False = bisection kick first.
+                        OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). A static ``block_newton_gate`` (on from the start) counts as switched on above any threshold, so it is switched off as soon as the record falls below this value. Default 2e-4 (same as ``solve_tool``); 0.0 = never off.
         block_newton_min_rel: With ``block_newton_gate > 0``: rows whose relative residual is already below this value are not stepped jointly
                         (they keep the scalar step). ``None`` (default) = ``0.1 * tol``; ``0.0`` = no restriction. Prevents the s == k rows,
                         whose solution lies at infinity, from marching along the soft direction (theta-c, eta+c) far beyond what their
@@ -1657,8 +1650,8 @@ def solve_fixed_point_decm(
                         real stagnation on the hub-heavy N=28156 network
                         ita_election_dico3, and the one every production
                         run has used); the model's residual
-                        (``max_relative_error``), the targeted streak fix
-                        and the bisection kick use the same constant, so
+                        (``max_relative_error``) and the targeted streak fix
+                        use the same constant, so
                         the solver is judged by the equations it solves.
                         The previous default was 1e-8; there is no general
                         rule for picking another value -- see the DECM
@@ -1788,7 +1781,7 @@ def solve_fixed_point_decm(
         max_stalls:     Give up (stop, ``converged=False``) after this many
                         restarts *at the noise cap* in a row without
                         improving the record -- i.e. only once the strongest
-                        available kick has been tried ``max_stalls`` times
+                        available perturbation has been tried ``max_stalls`` times
                         and still hasn't helped. Restarts made while still
                         escalating (noise below the cap) don't count toward
                         this limit. Default 5.
@@ -1799,49 +1792,6 @@ def solve_fixed_point_decm(
                         actually hit a perturbed restart; well-behaved
                         instances that never stagnate or blow up are
                         unaffected and fully deterministic regardless.
-        bisection_kick_iters: Stagnation recovery now has THREE tiers
-                        instead of two. Tier 1 (unchanged): a single
-                        no-noise soft reset from ``best_theta``. Tier 2
-                        (NEW, this is it): if tier 1 ALSO fails to beat the
-                        record within another ``patience`` window, run
-                        ``bisection_kick_iters`` outer sweeps of exact
-                        coordinate bisection + Anderson mixing (see
-                        :func:`_bisection_kick`) from ``best_theta`` and
-                        resume Newton from wherever that lands -- NOT
-                        expected to itself find a better point (empirically
-                        it usually doesn't, see
-                        decm_bisection_degenerate_benchmark memory,
-                        2026-09-09 section), the point is to displace the
-                        trajectory somewhere Newton's own dynamics can then
-                        make fresh progress from, which is qualitatively
-                        different from a random kick. Tier 3 (unchanged,
-                        was tier 2): the existing noisy ``_perturbed_restart``,
-                        now only reached if tier 2 ALSO fails.
-                        ``bisection_kick_iters=0`` (default) disables tier 2
-                        entirely, falling straight back to the original
-                        two-tier behaviour (soft reset, then noise) --
-                        this is a deliberate default: validated on exactly
-                        one real network so far (crisi_dico1, 2 manual
-                        cycles, real cumulative improvement each time:
-                        4.42e-05 -> 2.99e-05 -> 2.52e-05) and not yet
-                        proven as a general default. Pick a value
-                        empirically per network for now (315 worked for
-                        crisi_dico1 at M=5936).
-        bisection_kick_n_bisect: Bisection steps per stage per kick
-                        iteration (see :func:`_bisection_kick`). Capped at
-                        30 automatically when ``bisection_kick_device`` is
-                        not "cpu" (float32 exhausts its precision before 30
-                        halvings; more steps would just be wasted).
-        bisection_kick_device: ``"cpu"`` (default, float64, exact but
-                        slow -- see decm_bisection_degenerate_benchmark
-                        memory for the O(M^2)-per-step cost analysis) or a
-                        torch device string like ``"mps"``/``"cuda"``
-                        (float32 only, ~10x faster on the one GPU measured
-                        so far, Apple MPS) to run just the kick sub-phase
-                        on GPU while the surrounding Newton iterations stay
-                        on CPU/float64 -- data is moved to/from the kick
-                        device only for the duration of each kick, at
-                        negligible cost relative to the kick itself.
         diag_callback:  Read-only diagnostic hook, ``None`` by default (no
                         behaviour change whatsoever when omitted -- not
                         even an extra branch cost worth mentioning). If
@@ -1867,7 +1817,7 @@ def solve_fixed_point_decm(
                         every this many iterations (default 1 = every
                         iteration). Irrelevant if both are ``None``.
         checkpoint_fn:  ``None`` by default (no behaviour change). If given, called as ``checkpoint_fn(n_iter, event, best_theta, best_res)`` every time
-                        the solver restarts from ``best_theta`` (event = "soft_reset", "block_newton", "bisection_kick", "noisy_restart" or
+                        the solver restarts from ``best_theta`` (event = "soft_reset", "block_newton", "noisy_restart" or
                         "blowup_rollback"), but only when the record changed since the last call (no duplicate saves). Lets a long run be resumed
                         from the point the restarts return to (the degenerate wrapper passes the theta expanded to the N nodes).
         diag_state_callback: Read-only diagnostic hook, ``None`` by default
@@ -1906,36 +1856,30 @@ def solve_fixed_point_decm(
                         triggered a persistent post-fix blowup cascade on
                         c1 -- most likely explained by that overreach, not
                         by anything specific to the node tested). O(M) not
-                        O(M^2) -- cheap enough to fire often, unlike the
-                        whole-network ``bisection_kick_iters``. Clears
+                        O(M^2) -- cheap enough to fire often. Clears
                         Anderson history and resets the streak counter
-                        after firing. Does NOT replace ``patience``/
-                        ``bisection_kick_iters`` -- runs alongside them,
-                        since it targets a different, finer-grained
-                        trigger. Untested end-to-end as of this writing
-                        (prototype for a live experiment).
+                        after firing. Does NOT replace ``patience`` -- runs
+                        alongside it, since it targets a different,
+                        finer-grained trigger. quirinale_dico1 converges
+                        with ``streak_fix_threshold=10``.
         streak_fix_n_bisect: Bisection halvings per stage in
                         :func:`_targeted_bisection_fix` (default 60,
                         CPU/float64, cheap since only ``streak_fix_
                         threshold``-triggered single-group subsets are
-                        touched -- no GPU/precision tradeoff needed here
-                        unlike ``bisection_kick_n_bisect``).
+                        touched).
         streak_fix_n_sweeps: Gauss-Seidel sweeps per fix (default 5).
         device:         ``"cpu"`` (default, float64) or a torch device
                         string like ``"mps"``/``"cuda"`` (float32 -- MPS
                         has no float64 support, and CUDA float64 is slow
-                        enough that float32 is the practical choice too,
-                        same precedent as ``_bisection_kick``). Only
+                        enough that float32 is the practical choice too). Only
                         supported together with ``mult`` (the degeneracy
                         -reduced path) and ``backend`` resolving to
                         ``"pytorch"`` -- the raw per-node
                         dense/chunked/numba paths stay CPU-only. Covers
                         the main Newton/Anderson loop and its dense-
-                        weighted step; ``bisection_kick_device`` and the
-                        (CPU-only by design) targeted streak-fix remain
-                        independently configured and safely interoperate
-                        regardless of this setting (their inputs/outputs
-                        are converted at the boundary). The returned
+                        weighted step; the (CPU-only by design) targeted
+                        streak-fix interoperates with any setting (its
+                        inputs/outputs are converted at the boundary). The returned
                         ``SolverResult`` is always CPU/float64 regardless
                         of ``device``.
 
@@ -2174,13 +2118,9 @@ def solve_fixed_point_decm(
     _stall_ref: float = best_theta_res     # reference record of the stall criterion (see patience_rel_tol)
     # 0/1/2: how far the current stagnation episode has escalated since the
     # last genuine improvement -- 0 = nothing tried yet (do the cheap
-    # no-noise soft reset next), 1 = soft reset already tried (do the
-    # bisection kick next, if `bisection_kick_iters > 0`; otherwise skip
-    # straight to noise), 2 = kick already tried too (only noise left).
-    # Mirrors the isolated-vs-repeated blowup escalation below, which
-    # still jumps straight from "isolated" to noisy restart on repeat
-    # (the kick tier is patience-stall-specific, not wired into the
-    # blowup path). See `bisection_kick_iters` docstring for the rationale.
+    # no-noise soft reset next), 1 = soft reset already tried (switch the
+    # block-Newton step on, if `stall_block_newton_gate > 0` and it is not
+    # on yet; otherwise go straight to noise), 2 = only noise left.
     _stall_tier = 0
 
     def _revert_stall_bn() -> None:
@@ -2190,16 +2130,6 @@ def solve_fixed_point_decm(
             if verbose:
                 print(f"[patience] block-Newton OFF (no significant record within patience) at iter {n_iter}.")
 
-    def _stall_kind() -> str | None:
-        """Kind of the stall-ladder tier after the soft reset that is due next (None = the noisy restart)."""
-        extra = []
-        if stall_block_newton_gate > 0.0 and _bn[0] == 0.0 and not _bn_stall_used[0]:
-            extra.append("block_newton")
-        if bisection_kick_iters > 0:
-            extra.append("bisect")
-        if not stall_block_newton_first:
-            extra.reverse()
-        return extra[_stall_tier - 1] if 1 <= _stall_tier <= len(extra) else None
     # Argmax-identity streak tracking for `streak_fix_threshold` (see its
     # docstring) -- independent of `_stall_tier`/`iters_since_improve`,
     # since it tracks a different, finer-grained signal (which single
@@ -2250,8 +2180,7 @@ def solve_fixed_point_decm(
         noise_scale = noise_base * noise_mult
         # torch.from_numpy always gives a CPU tensor -- move it onto
         # best_theta's own device/dtype before combining. Order depends on
-        # the target device (float64 can never touch MPS, even transiently
-        # -- see _bisection_kick's _to_dev_dtype docstring for why).
+        # the target device (float64 can never touch MPS, even transiently).
         noise = torch.from_numpy(
             _restart_rng.normal(scale=noise_scale, size=tuple(best_theta.shape))
         )
@@ -2586,9 +2515,8 @@ def solve_fixed_point_decm(
                     ]).clip(min=-_ETA_MAX)
                     _th_fp_np[_hub_eta_pos] = _np_hub.clip(_xe, _floor, _ETA_MAX)
                 _xs = []
-        # See _bisection_kick's _to_dev_dtype for why the order must depend
-        # on the target device (float64 can never touch MPS, even
-        # transiently) -- here the source is always CPU/float64 (from the
+        # The order must depend on the target device (float64 can never touch
+        # MPS, even transiently) -- here the source is always CPU/float64 (from the
         # numpy round-trip above), so only the "target is non-cpu" direction
         # (dtype first, then device) can actually be exercised, but both are
         # handled for robustness.
@@ -2811,7 +2739,7 @@ def solve_fixed_point_decm(
                     iters_since_improve = 0
                     _and_g.clear()
                     _and_r.clear()
-                elif _stall_tier >= 1 and _stall_kind() == "block_newton":
+                elif _stall_tier == 1 and stall_block_newton_gate > 0.0 and _bn[0] == 0.0 and not _bn_stall_used[0]:
                     # Mode switch (not a kick): from now on the nearly saturated rows get the joint 2x2 (theta, eta) step.
                     _ckpt("block_newton")
                     if verbose:
@@ -2828,42 +2756,8 @@ def solve_fixed_point_decm(
                     iters_since_improve = 0
                     _and_g.clear()
                     _and_r.clear()
-                elif _stall_tier >= 1 and _stall_kind() == "bisect":
-                    _revert_stall_bn()
-                    _ckpt("bisection_kick")
-                    # Tier 2 (NEW): the soft reset ALSO failed to beat the
-                    # record within another `patience` window -- try a
-                    # structured (not random) kick instead of jumping
-                    # straight to noise. See `bisection_kick_iters`
-                    # docstring for why this isn't expected to itself find
-                    # a better point.
-                    if verbose:
-                        print(
-                            f"[patience] soft reset also failed -- bisection "
-                            f"kick ({bisection_kick_iters} iters, device="
-                            f"{bisection_kick_device!r}) from "
-                            f"best={best_theta_res:.3e} at iter {n_iter}."
-                        )
-                    # _bisection_kick always returns CPU/float64 -- convert
-                    # back to this loop's own device/dtype (a no-op when
-                    # device="cpu"). Order depends on the target device (see
-                    # _bisection_kick's own _to_dev_dtype docstring).
-                    _kick_result = _bisection_kick(
-                        best_theta, k_out, k_in, s_out, s_in, mult, weight_anderson,
-                        n_iters=bisection_kick_iters, n_bisect=bisection_kick_n_bisect,
-                        anderson_depth=anderson_depth, device=bisection_kick_device,
-                    )
-                    _patience_restart_theta = (
-                        _kick_result.to(device=_dev).to(dtype=_dtype) if _dev.type == "cpu"
-                        else _kick_result.to(dtype=_dtype).to(device=_dev)
-                    )
-                    _stall_tier += 1
-                    iters_since_improve = 0
-                    _and_g.clear()
-                    _and_r.clear()
                 else:
-                    # Tier 3 (last resort, was tier 2 before the kick):
-                    # escalating noisy restart.
+                    # Last tier: escalating noisy restart.
                     _revert_stall_bn()
                     _patience_restart_theta, _give_up = _perturbed_restart()
                     iters_since_improve = 0
@@ -3081,10 +2975,9 @@ def solve_fixed_point_decm(
                 # _targeted_bisection_fix is CPU/float64-only internally and
                 # always returns CPU/float64 -- convert back to this loop's
                 # own device/dtype (a no-op when device="cpu", the default).
-                # Order depends on the target device -- see _bisection_kick's
-                # _to_dev_dtype docstring (float64 can never touch MPS, even
-                # transiently, so "target is cpu" and "target is non-cpu"
-                # need opposite .to() call orders).
+                # Order depends on the target device (float64 can never touch
+                # MPS, even transiently, so "target is cpu" and "target is
+                # non-cpu" need opposite .to() call orders).
                 _fix_result = _targeted_bisection_fix(
                     theta_next, k_out, k_in, s_out, s_in, mult, _fix_group, _fix_side,
                     n_sweeps=streak_fix_n_sweeps, n_bisect=streak_fix_n_bisect,
@@ -3148,8 +3041,7 @@ def solve_fixed_point_decm_degenerate(
     block_newton_gate: float = 0.0,
     block_newton_min_rel: float | None = None,
     stall_block_newton_gate: float = 0.0,
-    stall_block_newton_first: bool = True,
-    stall_block_newton_off_mre: float = 0.0,
+    stall_block_newton_off_mre: float = 2e-4,
     stall_block_newton_revert: bool = True,
     z_clamp: float = 1e-6,
     init_best_theta: torch.Tensor | None = None,
@@ -3161,9 +3053,6 @@ def solve_fixed_point_decm_degenerate(
     noise_growth: float = 2.0,
     max_stalls: int = 5,
     seed: int | None = None,
-    bisection_kick_iters: int = 0,
-    bisection_kick_n_bisect: int = 30,
-    bisection_kick_device: str = "cpu",
     diag_callback: Callable[[int, int, float], None] | None = None,
     diag_every: int = 1,
     diag_state_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
@@ -3326,7 +3215,6 @@ def solve_fixed_point_decm_degenerate(
         block_newton_gate=block_newton_gate,
         block_newton_min_rel=block_newton_min_rel,
         stall_block_newton_gate=stall_block_newton_gate,
-        stall_block_newton_first=stall_block_newton_first,
         stall_block_newton_off_mre=stall_block_newton_off_mre,
         stall_block_newton_revert=stall_block_newton_revert,
         z_clamp=z_clamp,
@@ -3339,9 +3227,6 @@ def solve_fixed_point_decm_degenerate(
         noise_growth=noise_growth,
         max_stalls=max_stalls,
         seed=seed,
-        bisection_kick_iters=bisection_kick_iters,
-        bisection_kick_n_bisect=bisection_kick_n_bisect,
-        bisection_kick_device=bisection_kick_device,
         diag_callback=diag_callback,
         diag_every=diag_every,
         diag_state_callback=diag_state_callback,
@@ -3373,268 +3258,6 @@ def solve_fixed_point_decm_degenerate(
         best_mre=result_g.best_mre,
     )
 
-def _bisection_kick(
-    theta: torch.Tensor,
-    k_out: torch.Tensor,
-    k_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    mult: torch.Tensor | None,
-    weight_anderson: bool,
-    n_iters: int,
-    n_bisect: int = 30,
-    anderson_depth: int = 10,
-    device: str = "cpu",
-) -> torch.Tensor:
-    """Run ``n_iters`` outer sweeps of exact coordinate bisection (+ Anderson
-    mixing), self-contained and GPU-capable, as a structured "kick" for
-    :func:`solve_fixed_point_decm`'s stall recovery (see its ``patience``
-    docstring's Tier 2). Historically this mirrored a standalone
-    coordinate/bisection solver (``solve_fixed_point_decm_bisection``,
-    removed 2026-09-29 as unused dead weight -- see git history) but was
-    deliberately kept as a separate, self-contained implementation even
-    then, since device support needed threading through code that solver's
-    own private helpers depended on and that was CPU-only float64. That
-    separation is why this function survives its removal unchanged: it
-    can run on GPU/float32 on its own.
-
-    On CUDA/MPS this must run in float32 (MPS has no float64 support at
-    all; CUDA float64 is slow enough that float32 is the practical choice
-    here too) and ``n_bisect`` is capped at 30 -- beyond that, float32
-    exhausts its precision and further halvings are wasted (see
-    decm_bisection_degenerate_benchmark memory, GPU-kick section, for the
-    empirical basis: ~10x speedup on MPS measured 2026-09-08).
-
-    Returns the resulting theta on CPU, float64, same length as the input
-    (M or N depending on whether the caller already reduced to
-    degeneracy groups) -- a drop-in replacement for ``best_theta`` at the
-    call site.
-    """
-    M = k_out.shape[0]
-    dev = torch.device(device)
-    kick_dtype = torch.float64 if dev.type == "cpu" else torch.float32
-    if dev.type != "cpu":
-        n_bisect = min(n_bisect, 30)
-
-    # NOTE: device and dtype conversions must be split into two .to() calls,
-    # in an order that depends on the TARGET device -- a float64 tensor can
-    # never touch MPS even transiently (not even mid-conversion), so:
-    #   - target device "cpu": device first, then dtype (safe even if the
-    #     source is already on MPS -- e.g. the caller's own main solve loop
-    #     now runs on MPS -- since that only ever leaves MPS while already
-    #     float32, then converts to float64 once safely on CPU).
-    #   - target device non-"cpu" (mps/cuda): dtype first, then device (safe
-    #     even if the source is CPU/float64, since the dtype conversion to
-    #     float32 happens while still on CPU, before ever touching MPS).
-    # Combining both into one .to(device=, dtype=) call is NOT equivalent to
-    # either split order and fails in exactly the cases these two orders are
-    # each designed to avoid.
-    def _to_dev_dtype(x: torch.Tensor) -> torch.Tensor:
-        if dev.type == "cpu":
-            return x.to(device=dev).to(dtype=kick_dtype)
-        return x.to(dtype=kick_dtype).to(device=dev)
-
-    theta_d = _to_dev_dtype(theta)
-    k_out_d = _to_dev_dtype(k_out)
-    k_in_d = _to_dev_dtype(k_in)
-    s_out_d = _to_dev_dtype(s_out)
-    s_in_d = _to_dev_dtype(s_in)
-    mult_d = _to_dev_dtype(mult) if mult is not None else None
-    anderson_weights = (
-        torch.cat([mult_d, mult_d, mult_d, mult_d])
-        if (mult_d is not None and weight_anderson) else None
-    )
-    zero_k_out = k_out_d == 0
-    zero_k_in = k_in_d == 0
-    zero_s_out = s_out_d == 0
-    zero_s_in = s_in_d == 0
-    v_targets = torch.cat([k_out_d, k_in_d, s_out_d, s_in_d])
-    v_nonzero = v_targets > 0
-    z_clamp = _Z_G_CLAMP
-    v_safe = v_targets.clamp(min=1e-30 if kick_dtype == torch.float32 else 1e-300)
-
-    # Fully self-contained bisection-stage closures, EVERY tensor creation
-    # explicitly on `dev` -- deliberately NOT calling the module's shared
-    # `_bisect_*_decm_all(_weighted)` helpers, which hardcode
-    # `dtype=torch.float64` with no `device=` and so break immediately on
-    # any non-CPU device (verified 2026-09-09: `RuntimeError: ... at least
-    # two devices, mps:0 and cpu`) -- fixing those in place would touch
-    # code the CPU-only bisection solver depends on and that is already
-    # tested (269 tests); safer to duplicate the (short) bisection loop
-    # here than risk that surface.
-    def _bisect(direction_theta_or_eta, cand_lo, cand_hi, f):
-        lo = torch.full((M,), cand_lo, dtype=kick_dtype, device=dev)
-        hi = torch.full((M,), cand_hi, dtype=kick_dtype, device=dev)
-        for _ in range(n_bisect):
-            mid = 0.5 * (lo + hi)
-            go_lo = f(mid) > 0.0
-            lo = torch.where(go_lo, mid, lo)
-            hi = torch.where(go_lo, hi, mid)
-        return 0.5 * (lo + hi)
-
-    def _bisect_theta_out(theta_in, eta_out, eta_in, target):
-        eta = eta_out[:, None] + eta_in[None, :]
-        eta_safe = eta.clamp(min=z_clamp)
-        log_q = -torch.log(torch.expm1(eta_safe))
-        if mult_d is None:
-            def f(cand):
-                logit_p = -cand[:, None] - theta_in[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                P = P.clone(); P.fill_diagonal_(0.0)
-                return P.sum(1) - target
-        else:
-            def f(cand):
-                logit_p = -cand[:, None] - theta_in[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                return (P * mult_d[None, :]).sum(1) - P.diagonal() - target
-        return _bisect(None, -_THETA_MAX, _THETA_MAX, f)
-
-    def _bisect_theta_in(theta_out, eta_out, eta_in, target):
-        eta = eta_out[:, None] + eta_in[None, :]
-        eta_safe = eta.clamp(min=z_clamp)
-        log_q = -torch.log(torch.expm1(eta_safe))
-        if mult_d is None:
-            def f(cand):
-                logit_p = -theta_out[:, None] - cand[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                P = P.clone(); P.fill_diagonal_(0.0)
-                return P.sum(0) - target
-        else:
-            def f(cand):
-                logit_p = -theta_out[:, None] - cand[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                return (P * mult_d[:, None]).sum(0) - P.diagonal() - target
-        return _bisect(None, -_THETA_MAX, _THETA_MAX, f)
-
-    def _bisect_eta_out(theta_out, theta_in, eta_in, target):
-        if mult_d is None:
-            def f(cand):
-                z = cand[:, None] + eta_in[None, :]
-                z_safe = z.clamp(min=z_clamp)
-                G = -1.0 / torch.expm1(-z_safe)
-                log_q = -torch.log(torch.expm1(z_safe))
-                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                W = P * G
-                W = W.clone(); W.fill_diagonal_(0.0)
-                return W.sum(1) - target
-        else:
-            def f(cand):
-                z = cand[:, None] + eta_in[None, :]
-                z_safe = z.clamp(min=z_clamp)
-                G = -1.0 / torch.expm1(-z_safe)
-                log_q = -torch.log(torch.expm1(z_safe))
-                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                W = P * G
-                return (W * mult_d[None, :]).sum(1) - W.diagonal() - target
-        return _bisect(None, _ETA_MIN, _ETA_MAX, f)
-
-    def _bisect_eta_in(theta_out, theta_in, eta_out, target):
-        if mult_d is None:
-            def f(cand):
-                z = eta_out[:, None] + cand[None, :]
-                z_safe = z.clamp(min=z_clamp)
-                G = -1.0 / torch.expm1(-z_safe)
-                log_q = -torch.log(torch.expm1(z_safe))
-                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                W = P * G
-                W = W.clone(); W.fill_diagonal_(0.0)
-                return W.sum(0) - target
-        else:
-            def f(cand):
-                z = eta_out[:, None] + cand[None, :]
-                z_safe = z.clamp(min=z_clamp)
-                G = -1.0 / torch.expm1(-z_safe)
-                log_q = -torch.log(torch.expm1(z_safe))
-                logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-                P = torch.sigmoid(logit_p)
-                W = P * G
-                return (W * mult_d[:, None]).sum(0) - W.diagonal() - target
-        return _bisect(None, _ETA_MIN, _ETA_MAX, f)
-
-    def _residual(theta_vec: torch.Tensor) -> torch.Tensor:
-        theta_out = theta_vec[:M]; theta_in = theta_vec[M:2*M]
-        eta_out = theta_vec[2*M:3*M]; eta_in = theta_vec[3*M:]
-        eta = eta_out[:, None] + eta_in[None, :]
-        eta_safe = eta.clamp(min=z_clamp)
-        G = -1.0 / torch.expm1(-eta_safe)
-        log_q = -torch.log(torch.expm1(eta_safe))
-        logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-        P = torch.sigmoid(logit_p)
-        W = P * G
-        if mult_d is None:
-            P = P.clone(); P.fill_diagonal_(0.0)
-            W = W.clone(); W.fill_diagonal_(0.0)
-            k_out_hat = P.sum(1); k_in_hat = P.sum(0)
-            s_out_hat = W.sum(1); s_in_hat = W.sum(0)
-        else:
-            P_diag = P.diagonal(); W_diag = W.diagonal()
-            k_out_hat = (P * mult_d[None, :]).sum(1) - P_diag
-            k_in_hat = (P * mult_d[:, None]).sum(0) - P_diag
-            s_out_hat = (W * mult_d[None, :]).sum(1) - W_diag
-            s_in_hat = (W * mult_d[:, None]).sum(0) - W_diag
-        return torch.cat([k_out_hat - k_out_d, k_in_hat - k_in_d, s_out_hat - s_out_d, s_in_hat - s_in_d])
-
-    and_g: list[torch.Tensor] = []
-    and_r: list[torch.Tensor] = []
-    best_res = float("inf")
-    best_theta_kick = theta_d.clone()
-
-    for _ in range(n_iters):
-        theta_out = theta_d[:M]; theta_in = theta_d[M:2*M]
-        eta_out = theta_d[2*M:3*M]; eta_in = theta_d[3*M:]
-
-        theta_out_new = _bisect_theta_out(theta_in, eta_out, eta_in, k_out_d)
-        theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
-        eta_out_new = _bisect_eta_out(theta_out_new, theta_in, eta_in, s_out_d)
-        eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
-        theta_in_new = _bisect_theta_in(theta_out_new, eta_out_new, eta_in, k_in_d)
-        theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
-        eta_in_new = _bisect_eta_in(theta_out_new, theta_in_new, eta_out_new, s_in_d)
-        eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
-
-        theta_raw = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
-        theta_next = theta_raw
-
-        if anderson_depth > 1:
-            r_k = theta_raw - theta_d
-            and_g.append(theta_raw.clone())
-            and_r.append(r_k.clone())
-            if len(and_g) > anderson_depth:
-                and_g.pop(0)
-                and_r.pop(0)
-            if len(and_g) >= 2:
-                theta_mixed = _anderson_mixing(and_g, and_r, weights=anderson_weights)
-                theta_mixed[:M] = theta_mixed[:M].clamp(-_THETA_MAX, _THETA_MAX)
-                theta_mixed[M:2*M] = theta_mixed[M:2*M].clamp(-_THETA_MAX, _THETA_MAX)
-                theta_mixed[2*M:3*M] = theta_mixed[2*M:3*M].clamp(_ETA_MIN, _ETA_MAX)
-                theta_mixed[3*M:] = theta_mixed[3*M:].clamp(_ETA_MIN, _ETA_MAX)
-                F_mixed = _residual(theta_mixed)
-                res_mixed = (
-                    (F_mixed.abs()[v_nonzero] / v_safe[v_nonzero]).max().item()
-                    if v_nonzero.any() else 0.0
-                )
-                if math.isfinite(res_mixed) and res_mixed <= _ANDERSON_BLOWUP_FACTOR * max(best_res, 1e-30):
-                    theta_next = theta_mixed
-                else:
-                    and_g.clear()
-                    and_r.clear()
-                    theta_next = theta_raw
-
-        F = _residual(theta_next)
-        rel = F.abs() / v_safe
-        rel = torch.where(v_nonzero, rel, torch.zeros_like(rel))
-        res_norm = rel.max().item()
-        if res_norm < best_res:
-            best_res = res_norm
-            best_theta_kick = theta_next.clone()
-        theta_d = theta_next
-
-    return best_theta_kick.to(device="cpu").to(dtype=torch.float64)
-
-
 def _targeted_bisection_fix(
     theta: torch.Tensor,
     k_out: torch.Tensor,
@@ -3650,14 +3273,13 @@ def _targeted_bisection_fix(
     """Exact coordinate bisection restricted to ``target_idx`` groups AND
     to only the ``side`` ("out" or "in") that the triggering argmax
     actually flagged -- surgical, cheap (O(K*M) not O(M^2), K =
-    len(target_idx)) alternative to :func:`_bisection_kick`'s
-    whole-network sweep, for the prototype case where one (or a few)
+    len(target_idx)) alternative to a whole-network sweep, for the prototype case where one (or a few)
     node(s) have been identified (via the argmax-streak diagnostic, see
     decm_low_degree_precision_floor memory) as monopolizing the
     worst-violated equation for many consecutive iterations while the
     rest of the network is free to keep moving on its own. CPU/float64
     only -- K is expected to be tiny (single digits), so there is no
-    GPU/chunking benefit here unlike :func:`_bisection_kick`.
+    GPU/chunking benefit.
 
     ``side="out"`` solves ONLY ``target_idx``'s (theta_out, eta_out) pair
     (the k_out/s_out equations) against the CURRENT (frozen) theta_in/

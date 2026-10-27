@@ -518,9 +518,7 @@ no record improvement in between does it escalate to the same ladder.
 The ladder itself has three tiers, each attempted only after the previous
 one has also failed to beat the record: (1) a free soft reset (clear
 Anderson history, one plain Newton step from the best iterate, no noise);
-(2) an optional structured ``kick'' of \texttt{bisection\_kick\_iters}
-outer sweeps of exact per-node coordinate bisection (self-contained,
-GPU-capable, independent of Sec.~\ref{sec:hub}'s hub-only machinery); (3) a
+(2) an optional switch to the joint block-Newton step (\texttt{stall\_block\_newton\_gate}); (3) a
 perturbed restart from the best iterate with multiplicative,
 log-scale Gaussian noise, $\theta_i \mathrel{*}= \exp\mathcal N(0,\sigma)$,
 $\sigma$ starting at \texttt{noise\_base} and doubling on each further

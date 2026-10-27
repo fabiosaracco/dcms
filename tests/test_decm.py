@@ -1016,7 +1016,7 @@ class TestBlockNewtonMinRel:
 class TestSolveToolAdvancedKwargs:
     """`DECMModel.solve_tool()` must expose the solver's own recovery/precision knobs
     (streak_fix_*, hub_bisect_max_sweeps, patience_rel_tol, block_newton_gate/min_rel,
-    bisection_kick_*) -- added 2026-09-29 after an audit found solve_tool() silently
+    stall_block_newton_*) -- added 2026-09-29 after an audit found solve_tool() silently
     missing every one of them, meaning the public API could not reproduce the actual
     recipe that converged the hardest real networks (see decm_b2_block_newton_2026_09_28
     memory)."""
@@ -1027,8 +1027,7 @@ class TestSolveToolAdvancedKwargs:
             ic="degrees", tol=CONV_TOL, max_iter=4000, anderson_depth=10,
             hub_bisect_max_sweeps=5, block_newton_gate=0.02, block_newton_min_rel=1e-6,
             streak_fix_threshold=3, streak_fix_n_sweeps=4, streak_fix_n_bisect=20,
-            patience_rel_tol=0.0, bisection_kick_iters=0, bisection_kick_n_bisect=10,
-            bisection_kick_device="cpu",
+            patience_rel_tol=0.0,
         )
         assert converged, f"not converged with every new kwarg set: {model.sol.residuals[-1]:.3e}"
 
@@ -1119,7 +1118,7 @@ class TestHubRootMethodIllinois:
 
 
 class TestStallBlockNewtonTier:
-    """`stall_block_newton_gate > 0` adds a stall-ladder tier (soft reset -> block-Newton ON -> [bisection kick] -> noise); default off."""
+    """`stall_block_newton_gate > 0` adds a stall-ladder tier (soft reset -> block-Newton ON -> noise); default off."""
 
     @staticmethod
     def _run(capsys, **kw):
@@ -1175,7 +1174,7 @@ class TestCheckpointOnRestart:
         files = sorted(tmp_path.glob("ckpt_*.pt"))
         assert files, "no checkpoint written"
         c = _t.load(files[0])
-        assert c["theta"].numel() == 4 * m1.N and c["event"] in {"soft_reset", "block_newton", "bisection_kick", "noisy_restart", "blowup_rollback"}
+        assert c["theta"].numel() == 4 * m1.N and c["event"] in {"soft_reset", "block_newton", "noisy_restart", "blowup_rollback"}
         assert m1.max_relative_error(c["theta"]) == pytest.approx(c["mre"], rel=1e-6)   # the saved theta is the record it claims
         mres = [float(_t.load(f)["mre"]) for f in files]
         assert mres == sorted(mres, reverse=True)           # each save is a strictly better record

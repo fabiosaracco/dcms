@@ -1051,7 +1051,7 @@ def _solve_fixed_point_qdecm_impl(
                      residual judges.
         device:      ``"cpu"`` (default, float64) or a torch device string
                      like ``"mps"``/``"cuda"`` (float32 -- see DECM's
-                     ``_bisection_kick`` for the precedent). Only supported
+                     the same float32 precedent as DECM). Only supported
                      together with ``mult`` (the degeneracy-reduced path)
                      and ``backend`` resolving to ``"pytorch"``. The
                      returned ``SolverResult`` is always CPU/float64

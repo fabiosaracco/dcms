@@ -199,11 +199,31 @@ RECIPES: list[Recipe] = [
 assert len({r.tag for r in RECIPES}) == 19, f"expected 19 unique recipes, got {len(RECIPES)}"
 
 
+# ---------------------------------------------------------------------------------------------
+# Stagnation-ladder settings. `DECMModel.solve_tool` defaults changed on 2026-10-18..21 (patience 750 -> 250,
+# patience_rel_tol 0 -> 0.1, block-Newton stall tier on, switched off again below 2e-4): the recipes
+# below were recorded under the OLD ladder, so `reproduce_network` pins it explicitly instead of
+# silently running them under the new defaults; the validated benchmark recipes pin the NEW one.
+# ---------------------------------------------------------------------------------------------
+LEGACY_LADDER: dict = dict(
+    patience=750, patience_rel_tol=0.0, stall_block_newton_gate=0.0,
+)
+CURRENT_LADDER: dict = dict(     # = the solve_tool defaults at commit 4a1f492 (benchmark v2); written out so they cannot drift
+    patience=250, patience_rel_tol=0.1, stall_block_newton_gate=0.05, stall_block_newton_off_mre=2e-4,
+    stall_block_newton_revert=True, block_newton_min_rel=None,
+)
+
+# Benchmark v2 (19/19 networks x 3 models converged, MRE <= 1e-5, benchmark_19/results_v2): every DECM network
+# converged at the first attempt with `general` (fresh ic='degrees', multi_start=False, seed 0), under CURRENT_LADDER.
+BENCHMARK_V2_GENERAL: dict = dict(
+    anderson_depth=10, hub_sk_threshold=5.0, backtracking_gamma=0.0, z_clamp=1e-6, noise_base=2e-3,
+    **CURRENT_LADDER,
+)
+
 # A recipe known (2026-09-28 A/B testing, see decm_branch_merged_2026_09_28 memory) to converge
 # CLEANLY from a fresh ic='degrees' start on at least q5 and q6 above, faster than how they were
-# first (historically) solved. Not yet swept across all 19 -- offered as the current best
-# starting guess for the "does it converge from zero, unattended" question point 5 is really
-# asking, not as a settled answer.
+# first (historically) solved. Superseded by BENCHMARK_V2_GENERAL, which converged all 19 from zero
+# (benchmark v2, 2026-10); kept for the record.
 RECOMMENDED_FRESH_START: dict = dict(
     anderson_depth=3, streak_fix_threshold=50, hub_sk_threshold=5.0, z_clamp=1e-6,
     block_newton_gate=0.05, block_newton_min_rel=0.0,   # 0.0 = no restriction. None (-> 0.1*tol) makes q5 FAIL from zero (2026-10-21, first bad commit 5042396): with 0.0 q5 converges in 2606 it at HEAD, 1845 it at 3a01702
@@ -266,11 +286,11 @@ def reproduce_network(tag: str, max_iter: int = 300_000, max_time: float = 0.0, 
         ic = torch.as_tensor(torch.load(open(ckpt, "rb"), weights_only=False), dtype=torch.float64)
 
     print(f"[{recipe.tag}] {recipe.net_tag} (N={recipe.N}), fresh_ic={recipe.fresh_ic}, "
-          f"confidence={recipe.confidence}\n  kwargs={recipe.solve_tool_kwargs}")
+          f"confidence={recipe.confidence}\n  kwargs={ {**LEGACY_LADDER, **recipe.solve_tool_kwargs} }")
     t0 = time.perf_counter()
     converged = model.solve_tool(
         ic=ic, tol=TOL, max_iter=max_iter, max_time=max_time, verbose=verbose,
-        **recipe.solve_tool_kwargs,
+        **{**LEGACY_LADDER, **recipe.solve_tool_kwargs},     # historical recipes keep the ladder they were recorded under
     )
     dt = time.perf_counter() - t0
     print(f"[{recipe.tag}] converged={converged} iters={model.sol.iterations} "

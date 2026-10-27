@@ -253,7 +253,8 @@ class TestDECMSample:
         m = self._fitted()
         n = 3000
         freq = np.zeros((m.N, m.N))
-        for e in m.sample_many(n, seed=1, n_jobs=1, method="grouped"):
+        for i in range(n):
+            e = m.sample(seed=i)
             freq[e[:, 0], e[:, 1]] += 1
         freq /= n
         P = np.array(m.pij_matrix(m.sol.best_theta))
@@ -265,7 +266,7 @@ class TestDECMSample:
 
 
 # ---------------------------------------------------------------------------
-# sample_many tests (all four models)
+# sample_many tests (DCM, DWCM, qDECM; DECM has none: threads give no speedup with the grouped sampler)
 # ---------------------------------------------------------------------------
 
 import numpy as np
@@ -336,27 +337,6 @@ class TestSampleManyQDECM:
     def test_n_jobs_1(self):
         samples = self.m.sample_many(3, seed=0, n_jobs=1)
         assert len(samples) == 3
-
-    def test_no_self_loops(self):
-        for arr in self.m.sample_many(3, seed=1):
-            assert np.all(arr[:, 0] != arr[:, 1])
-
-
-class TestSampleManyDECM:
-    @pytest.fixture(autouse=True)
-    def _model(self):
-        from dcms.models.decm import DECMModel
-        k_out, k_in, s_out, s_in = _setup()
-        m = DECMModel(k_out, k_in, s_out, s_in)
-        m.solve_tool(tol=1e-6)
-        self.m = m
-
-    def test_returns_list_of_arrays(self):
-        samples = self.m.sample_many(4, seed=0)
-        assert len(samples) == 4
-        for s in samples:
-            assert isinstance(s, np.ndarray)
-            assert s.ndim == 2 and s.shape[1] == 3
 
     def test_no_self_loops(self):
         for arr in self.m.sample_many(3, seed=1):

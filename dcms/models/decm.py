@@ -35,7 +35,6 @@ Reference:
 """
 from __future__ import annotations
 
-import functools
 import math
 import time as _time
 from typing import Union
@@ -609,7 +608,6 @@ class DECMModel:
         block_newton_gate: float = 0.0,
         block_newton_min_rel: float | None = None,
         stall_block_newton_gate: float | None = None,
-        stall_block_newton_first: bool = True,
         stall_block_newton_off_mre: float = 2e-4,
         stall_block_newton_revert: bool = True,
         checkpoint_dir: str | None = None,
@@ -624,9 +622,6 @@ class DECMModel:
         noise_cap_mult: float = 16.0,
         noise_growth: float = 2.0,
         max_stalls: int = 5,
-        bisection_kick_iters: int = 0,
-        bisection_kick_n_bisect: int = 30,
-        bisection_kick_device: str = "cpu",
         seed: int | None = None,
         device: str = "cpu",
     ) -> bool:
@@ -742,13 +737,12 @@ class DECMModel:
                            always pair it with ``block_newton_min_rel``.
                            Non-hub rows only, out side.
             stall_block_newton_gate: ``None`` (default) = 0.05 on the degeneracy-reduced path, 0 (off) otherwise; 0.0 = off. > 0: stall-ladder tier that switches the joint 2x2 block-Newton step on
-                           (with this gate) after the soft reset fails, before the bisection kick / noisy restart. Use together with
+                           (with this gate) after the soft reset fails, before the noisy restart. Use together with
                            ``patience_rel_tol`` > 0. See :func:`solve_fixed_point_decm`.
             stall_block_newton_off_mre: Switch the stall-tier block-Newton OFF once the record is below this MRE (0 = never; default 2e-4; acts only if the step was switched on above it).
             stall_block_newton_revert: Switch the stall-tier block-Newton off again if it sets no significant record within its patience window (default True).
-            stall_block_newton_first: Order of the block-Newton and bisection-kick tiers when both are enabled (default: block-Newton first).
             checkpoint_dir: ``None`` (default) = off. A directory: every time the solver restarts from its best iterate (soft reset,
-                           block-Newton switch, bisection kick, noisy restart, blowup rollback) and the record improved since the last save,
+                           block-Newton switch, noisy restart, blowup rollback) and the record improved since the last save,
                            ``ckpt_<iteration>_<event>.pt`` is written there with ``theta`` (N-node layout, usable as ``ic=``), ``mre``,
                            ``iteration`` and ``event``. Lets a long run be resumed from the point the restarts return to.
             block_newton_min_rel: With ``block_newton_gate > 0``: a row
@@ -847,24 +841,6 @@ class DECMModel:
             max_stalls:    Give up (``converged=False``) after this many
                            restarts *at the noise cap* in a row without
                            improving the record. Default 5.
-            bisection_kick_iters: > 0 adds a structured (non-random) "kick"
-                           tier between the cheap soft reset and the noisy
-                           perturbed restart in the stagnation ladder: this
-                           many outer sweeps of exact coordinate bisection
-                           from ``best_theta``, self-contained and
-                           GPU-capable. Default 0 (disabled, previous
-                           behaviour). Not expected to itself find a better
-                           point -- see
-                           :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
-                           ``bisection_kick_iters`` docs for the rationale.
-            bisection_kick_n_bisect: Bisection halvings per stage per kick
-                           iteration. Default 30 (auto-capped at 30 when
-                           ``bisection_kick_device`` is not ``"cpu"``).
-            bisection_kick_device: ``"cpu"`` (default, float64, exact) or a
-                           torch device string like ``"mps"``/``"cuda"``
-                           (float32, faster per iteration but capped
-                           precision) for the kick specifically --
-                           independent of the main solve's ``device``.
             seed:          Seed for the perturbation RNG (private, does not
                            touch global RNG state). ``None`` (default) is
                            unseeded/non-reproducible -- only relevant for
@@ -951,7 +927,6 @@ class DECMModel:
                     block_newton_gate=block_newton_gate,
                     block_newton_min_rel=block_newton_min_rel,
                     stall_block_newton_gate=stall_block_newton_gate,
-                    stall_block_newton_first=stall_block_newton_first,
                     stall_block_newton_off_mre=stall_block_newton_off_mre,
                     stall_block_newton_revert=stall_block_newton_revert,
                     checkpoint_fn=_ckpt_fn,
@@ -965,9 +940,6 @@ class DECMModel:
                     noise_cap_mult=noise_cap_mult,
                     noise_growth=noise_growth,
                     max_stalls=max_stalls,
-                    bisection_kick_iters=bisection_kick_iters,
-                    bisection_kick_n_bisect=bisection_kick_n_bisect,
-                    bisection_kick_device=bisection_kick_device,
                     seed=seed,
                     device=device,
                 )
@@ -997,7 +969,6 @@ class DECMModel:
                 block_newton_gate=block_newton_gate,
                 block_newton_min_rel=block_newton_min_rel,
                 stall_block_newton_gate=stall_block_newton_gate,
-                stall_block_newton_first=stall_block_newton_first,
                 stall_block_newton_off_mre=stall_block_newton_off_mre,
                 stall_block_newton_revert=stall_block_newton_revert,
                 checkpoint_fn=_ckpt_fn,
@@ -1011,9 +982,6 @@ class DECMModel:
                 noise_cap_mult=noise_cap_mult,
                 noise_growth=noise_growth,
                 max_stalls=max_stalls,
-                bisection_kick_iters=bisection_kick_iters,
-                bisection_kick_n_bisect=bisection_kick_n_bisect,
-                bisection_kick_device=bisection_kick_device,
                 seed=seed,
             )
 
@@ -1067,12 +1035,9 @@ class DECMModel:
         eta_in    = theta[3 * N :]
         beta_out  = np.exp(-eta_out)
         beta_in   = np.exp(-eta_in)
-        q_in  = 1.0 / np.expm1(eta_in).clip(min=1e-300)
-        q_out = 1.0 / np.expm1(eta_out).clip(min=1e-300)
         parts: list = []
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
-            q_out_chunk = q_out[i_start:i_end]
             eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]
             log_q = -np.log(np.expm1(eta_chunk).clip(min=1e-300))
             logit_p = -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q
@@ -1163,46 +1128,6 @@ class DECMModel:
         if method != "exact":
             raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
         return self._sample_raw(seed=seed, chunk_size=chunk_size)
-
-    def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1, method: str = "grouped") -> list:
-        """Generate ``n`` independent samples in parallel.
-
-        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
-        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
-        works the same as with the list returned by :meth:`sample`.
-
-        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
-        the GIL during random-number generation and array operations, giving
-        near-linear speedup up to the number of physical cores.  Note that
-        DECM uses an O(N²) sampler (link probabilities are not rank-1), so the
-        per-sample cost is higher than for DCM/DWCM/qDECM.
-
-        Args:
-            n: Number of independent samples to draw.
-            seed: Master seed from which per-sample seeds are derived.
-            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
-            method: ``"grouped"`` (default) or ``"exact"``, see :meth:`sample`.
-
-        Returns:
-            List of ``n`` NumPy arrays, one per sample.
-
-        Raises:
-            RuntimeError: if :meth:`solve_tool` has not been called yet.
-        """
-        import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
-        if method not in ("exact", "grouped"):
-            raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
-        draw = self._sample_grouped if method == "grouped" else self._sample_raw
-        if method == "grouped":
-            self._grouped_sampler_state()   # build the group cache before the threads start
-        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
-        if n_jobs == 1:
-            return [draw(seed=s) for s in seeds]
-        max_workers = None if n_jobs < 0 else n_jobs
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            return list(ex.map(lambda s: draw(seed=s), seeds))
 
     def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
         """Compute the DECM p-value of each observed weight in an edge list.

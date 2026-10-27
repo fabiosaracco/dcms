@@ -31,7 +31,6 @@ def _np(x):
 
 def _distinct(rng, n_ab, c):
     """For each block k draw c[k] distinct integers in [0, n_ab[k]); returns (block id, value) arrays."""
-    K = len(c)
     ids, vals = [], []
     full = c == n_ab                       # every pair of the block is a link: no randomness (covers singleton-singleton blocks)
     for k in np.flatnonzero(full):

@@ -383,7 +383,7 @@ def solve_fixed_point_dwcm(
             :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
             parameter of the same name. Default True.
         device: ``"cpu"`` (default, float64) or a torch device string like
-            ``"mps"``/``"cuda"`` (float32 -- see DECM's ``_bisection_kick``
+            ``"mps"``/``"cuda"`` (float32 -- as for DECM
             for the precedent). Only supported together with ``mult`` (the
             degeneracy-reduced path) and ``backend`` resolving to
             ``"pytorch"``. The returned ``SolverResult`` is always

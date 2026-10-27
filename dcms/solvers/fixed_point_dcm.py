@@ -502,8 +502,7 @@ def solve_fixed_point_dcm(
         device:     ``"cpu"`` (default, float64) or a torch device string
                     like ``"mps"``/``"cuda"`` (float32 -- MPS has no
                     float64 support at all, and CUDA float64 is slow
-                    enough that float32 is the practical choice too, same
-                    precedent as DECM's ``_bisection_kick``). Only
+                    enough that float32 is the practical choice too). Only
                     supported together with ``mult`` (the degeneracy
                     -reduced path) and ``backend`` resolving to
                     ``"pytorch"`` -- the raw per-node chunked/numba paths

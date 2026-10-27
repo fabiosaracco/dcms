@@ -7,7 +7,7 @@ number of *distinct* constraint pairs rather than 2 N equations.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 import numpy as np
 

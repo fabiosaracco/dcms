@@ -442,7 +442,7 @@ class DWCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
+    def solve_tool(self, ic='strengths', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, reduce_degeneracy:bool=True, device:str='cpu', seed:int|None=None)-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -467,6 +467,8 @@ class DWCMModel:
             verbose (bool): If ``True``, print a progress line at every
                 iteration (timestamp, iteration count, elapsed time, MRE).
                 Default=False.
+            seed (int or None): Seed for the retry-noise RNG of the stagnation-escape mini-loop (only relevant on
+                instances that reach it). ``None`` (default) = unseeded, not reproducible.
             monitor (bool): If ``True`` (and ``verbose=True``), overwrite the
                 same terminal line at each iteration (``end='\\r'``) so only
                 the latest status is visible.  Default=False.
@@ -506,10 +508,10 @@ class DWCMModel:
 
         if _use_reduced:
             from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm_degenerate  # lazy import to avoid circular dependency
-            self.sol = solve_fixed_point_dwcm_degenerate(self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
+            self.sol = solve_fixed_point_dwcm_degenerate(self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device, seed=seed)
         else:
             from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm  # lazy import to avoid circular dependency
-            self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor)
+            self.sol = solve_fixed_point_dwcm(self.residual, self.ic, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, seed=seed)
         if len(self.sol.message)>0:
             print(self.sol.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
             

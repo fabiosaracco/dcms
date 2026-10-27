@@ -911,7 +911,7 @@ class DECMModel:
                 fb_result = _run_once(fallback)
                 if fb_result.message:
                     print(fb_result.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
-                if fb_result.residuals[-1] < self.sol.residuals[-1]:
+                if fb_result.mre < self.sol.mre:      # best MRE of each attempt, not the last iterate's
                     self.sol = fb_result
                 if self.sol.converged:
                     break

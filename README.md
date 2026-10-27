@@ -951,6 +951,8 @@ DCM was not part of that benchmark; on the same inputs it converges in 14–24 i
 | qDECM | superlinear (topology, then weights) | O(M²) | O(M²) per stage |
 | DECM | superlinear (alternating GS-Newton on 4N) | O(M²), or O(chunk × M) when `M > 2000` | O(M²), two passes |
 
+**Memory caveat.** The dense steps hold a few `M × M` float64 matrices (≈ 7 GB each at `M = 30 000`): with the per-node chunked path gone, networks whose groups stay close to `N` for `N` in the tens of thousands (continuous or low-collision strengths) need that much memory. On the 19 project networks `M ≤ 7 305`. The DECM step switches to row blocks above `M = 2000`.
+
 `M` is the number of distinct sufficient-statistics groups (§2.5), `M ≤ N`; on real networks with heavy-tailed degree/strength distributions `M` is far smaller than `N` (N²/M² from 18 to 438 on the 19 networks of the project).
 
 ---

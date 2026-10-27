@@ -1131,8 +1131,8 @@ class TestStallBlockNewtonTier:
         )
         return capsys.readouterr().out
 
-    def test_off_by_default(self, capsys) -> None:
-        out = self._run(capsys)
+    def test_explicit_zero_gate_is_off(self, capsys) -> None:
+        out = self._run(capsys, stall_block_newton_gate=0.0)
         assert "[patience] stalled" in out and "block-Newton ON" not in out
 
     def test_tier_fires_after_soft_reset(self, capsys) -> None:

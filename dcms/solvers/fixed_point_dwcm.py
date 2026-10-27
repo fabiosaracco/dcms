@@ -36,9 +36,9 @@ from dcms.models.parameters import _ETA_MIN, _ETA_MAX
 # Maximum ℓ∞ norm of the Anderson FP-residual r_k = g(θ_k) − θ_k accepted
 # into the mixing history.  Iterates beyond this threshold are skipped to
 # prevent Anderson mixing from being contaminated by extreme values.  The
-# threshold is most relevant for the theta-newton variant, which can produce
+# threshold is most relevant for the theta-newton step, which can produce
 # large transient steps during the initial phase when θ is far from the
-# solution, but the guard applies uniformly to all variants.
+# solution.
 _ANDERSON_MAX_NORM: float = 1e6
 
 # When the ℓ∞ equation-residual jumps by more than this factor above the
@@ -69,21 +69,9 @@ _ANDERSON_THETA_FLOOR: float = 0.1
 # own numerics and there is no evidence one value would suit all three.
 _Z_G_CLAMP: float = 1e-15
 
-# In the β-space FP variants (gauss-seidel, jacobi), the FP map β_new = s/D(β)
-# can have spectral radius > 1 for high-strength hub nodes (β* ≈ 1), causing
-# slowly-growing oscillations that Anderson cannot accelerate away.  When the
-# β-FP step would move θ by more than this amount (|Δθ| > threshold), we fall
-# back to a bounded θ-Newton step for that node instead.
-#
-# The threshold is chosen to catch:
-#   • Infeasible overshoots  (β_new ≥ 1) → |Δθ| >> 0.1
-#   • Non-contractive oscillations for hub nodes → |Δθ| ≈ 0.12–0.15 per step
-# while leaving normal nodes (|Δθ| ≪ 0.1) untouched after warm-up.
-_FP_NEWTON_FALLBACK_DELTA: float = 0.1
-
-# When FP-GS Anderson stagnates (residual not improved by ≥ 1 % over this many
+# When the iteration stagnates (residual not improved by ≥ 1 % over this many
 # consecutive iterations), run a Newton-Anderson mini-loop from best_theta to
-# escape the non-contractive oscillation region.
+# escape the non-contractive oscillation region (limit cycles on hub networks).
 #
 # Plain Newton (diagonal approximation) oscillates on extreme hub networks
 # without Anderson mixing — the off-diagonal Jacobian terms are too large to
@@ -456,7 +444,7 @@ def _solve_dwcm_reduced(
             if n_iter % _STAGNATION_WINDOW == 0:
                 if n_iter > _STAGNATION_WINDOW:
                     improvement = (best_res_old - best_res_recent) / max(best_res_old, 1e-30)
-                    if improvement < _STAGNATION_RTOL:
+                    if 0.0 <= improvement < _STAGNATION_RTOL:
                         message = (
                             f"Stagnation: residual improved by only {improvement:.2%} "
                             f"over last {_STAGNATION_WINDOW} iterations "

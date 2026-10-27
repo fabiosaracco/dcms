@@ -71,10 +71,6 @@ _Z_G_CLAMP: float = 1e-8
 _Z_NEWTON_FLOOR: float = _Z_G_CLAMP  # = 1e-8; hard floor (enables doubling)
 _Z_NEWTON_FRAC: float = 0.5          # relative floor; z_new >= z_old * 0.5
 _ANDERSON_THETA_FLOOR: float = 0.1
-_FP_NEWTON_FALLBACK_DELTA: float = 0.1
-_FPGS_NEWTON_RESET_WINDOW: int = 30
-_FPGS_NEWTON_STEPS: int = 30
-_FPGS_NEWTON_AND_DEPTH: int = 5
 
 
 
@@ -519,13 +515,13 @@ def _solve_qdecm_weights_reduced(
             # 3 sweeps are enough for typical cases (convergence is geometric).
             if _hub_active and (_hub_out_idx or _hub_in_idx):
                 import numpy as _hnp
-                _beta_out_fp = torch.exp(-theta_fp[:N]).numpy()
-                _beta_in_fp  = torch.exp(-theta_fp[N:]).numpy()
+                _beta_out_fp = torch.exp(-theta_fp[:N]).cpu().numpy()
+                _beta_in_fp  = torch.exp(-theta_fp[N:]).cpu().numpy()
 
                 _HUB_SWEEPS = 3
                 for _sweep in range(_HUB_SWEEPS):
                     for _hk, _hi in enumerate(_hub_out_idx):
-                        _p_row = _hub_P_out_rows[_hk].numpy()
+                        _p_row = _hub_P_out_rows[_hk].cpu().numpy()
                         _new_beta = _bisect_hub_beta(
                             _p_row, _beta_in_fp, s_out[_hi].item(),
                             self_idx=_hi,
@@ -537,7 +533,7 @@ def _solve_qdecm_weights_reduced(
                             _beta_out_fp[_hi] = _new_beta
 
                     for _hk, _hj in enumerate(_hub_in_idx):
-                        _p_col = _hub_P_in_cols[_hk].numpy()
+                        _p_col = _hub_P_in_cols[_hk].cpu().numpy()
                         _new_beta = _bisect_hub_beta(
                             _p_col, _beta_out_fp, s_in[_hj].item(),
                             self_idx=_hj,
@@ -807,10 +803,8 @@ def solve_fixed_point_qdecm(
     ).to(dtype=torch.float64)
 
     # --- Topology step: plain DCM, already reduced (2-tuple groups) ---
-    # Solved to tighter tolerance than the weight step (matching
-    # qDECMModel.solve_tool's established practice): better topology
-    # precision helps the weight step converge, since p_ij feeds into it
-    # as a fixed input.
+    # Solved to the same tolerance as the weight step (2026-10-27: the old tol*1e-3 was checked to be unnecessary: the
+    # E[w_ij] matrices agree to the solver tolerance either way).
     topo_res = solve_fixed_point_dcm(
         theta_topo0, k_out, k_in,
         tol=tol, max_iter=topo_max_iter, anderson_depth=anderson_depth,

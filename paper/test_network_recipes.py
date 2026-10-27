@@ -54,3 +54,13 @@ def test_current_ladder_matches_solve_tool_defaults():
     params = inspect.signature(DECMModel.solve_tool).parameters
     for key, value in CURRENT_LADDER.items():
         assert params[key].default == value, (key, params[key].default, value)
+
+
+def test_standalone_solver_has_the_same_ladder_defaults():
+    import inspect
+    from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
+    from network_recipes import CURRENT_LADDER
+    params = inspect.signature(solve_fixed_point_decm).parameters
+    for key, value in CURRENT_LADDER.items():
+        if key in params:
+            assert params[key].default == value, (key, params[key].default, value)

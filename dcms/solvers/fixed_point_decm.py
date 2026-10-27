@@ -48,6 +48,7 @@ import torch
 
 from dcms.models.parameters import DECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
+from dcms.solvers._common import anderson_mixing as _anderson_mixing, compute_groups, expand_result, first_member_index, reduce_blocks
 from dcms.solvers.base import SolverResult
 from dcms.utils.profiling import _PeakRAMMonitor
 
@@ -75,71 +76,6 @@ _ANDERSON_THETA_FLOOR: float = 0.1
 # -------------------------------------------------------------------------
 # Anderson mixing (identical to the version in fixed_point_qdecm.py)
 # -------------------------------------------------------------------------
-
-def _anderson_mixing(
-    fp_outputs: list[torch.Tensor],
-    residuals_hist: list[torch.Tensor],
-    weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Anderson mixing: compute the next iterate from FP history.
-
-    Uses per-component-weighted least-squares to compute mixing coefficients,
-    preventing high-magnitude components from dominating the mix.
-
-    Args:
-        fp_outputs:     List of g(θ_k) values, each shape (M,).
-        residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (M,).
-        weights:        Optional per-component weight, shape (M,), used only
-                        in the degeneracy-reduced path (see
-                        :func:`solve_fixed_point_decm`). The
-                        mixing coefficients are found by minimising a
-                        WEIGHTED norm of the combined residual instead of
-                        the plain L2 norm -- needed because in the reduced
-                        representation each group entry stands in for
-                        ``mult[g]`` original nodes; without this weighting,
-                        a group of 500 identical nodes and a singleton group
-                        would count equally in the least-squares fit, unlike
-                        in the unreduced (per-node) system where the group
-                        of 500 implicitly contributes 500 identical rows.
-                        None (default) reproduces the original unweighted
-                        behaviour exactly.
-
-    Returns:
-        Anderson-mixed next iterate, shape (M,).
-    """
-    m = len(fp_outputs)
-    if m == 1:
-        return fp_outputs[0]
-
-    R = torch.stack(residuals_hist, dim=1)   # (M, m)
-    G = torch.stack(fp_outputs, dim=1)        # (M, m)
-
-    w = R.abs().max(dim=1, keepdim=True).values.clamp(min=1e-15)
-    R_w = R / w
-
-    if weights is not None:
-        RtR = R_w.T @ (weights[:, None] * R_w)
-    else:
-        RtR = R_w.T @ R_w
-    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype, device=RtR.device)
-    ones = torch.ones(m, dtype=RtR.dtype, device=RtR.device)
-    try:
-        c = torch.linalg.solve(RtR, ones)
-        c_sum = c.sum().item()
-        if abs(c_sum) < 1e-14 or not math.isfinite(c_sum):
-            raise RuntimeError("Degenerate Anderson weights.")
-        c = c / c_sum
-        c = c.clamp(-10.0, 10.0)
-        c_sum_clamped = c.sum().item()
-        if abs(c_sum_clamped) < 1e-14 or not math.isfinite(c_sum_clamped):
-            c = ones / m
-        else:
-            c = c / c_sum_clamped
-    except RuntimeError:
-        c = ones / m
-
-    return G @ c
-
 
 # -------------------------------------------------------------------------
 # Dense DECM step (for N ≤ _LARGE_N_THRESHOLD)
@@ -230,14 +166,7 @@ def compute_degeneracy_groups(
         k_out_g, k_in_g, s_out_g, s_in_g: (M,) float tensors, the shared
             target values for each group.
     """
-    N = k_out.shape[0]
-    key = torch.stack([k_out, k_in, s_out, s_in], dim=1)
-    uniq, group_of = torch.unique(key, dim=0, return_inverse=True)
-    M = uniq.shape[0]
-    mult = torch.zeros(M, dtype=torch.float64)
-    mult.scatter_add_(0, group_of, torch.ones(N, dtype=torch.float64))
-    k_out_g, k_in_g, s_out_g, s_in_g = uniq[:, 0], uniq[:, 1], uniq[:, 2], uniq[:, 3]
-    return group_of, mult, k_out_g, k_in_g, s_out_g, s_in_g
+    return compute_groups(k_out, k_in, s_out, s_in)
 
 
 def _block_newton_deltas(
@@ -2570,21 +2499,8 @@ def solve_fixed_point_decm(
     # guesses, which are themselves a function of (k, s) alone); this is
     # only an approximation for initial guesses that break that pattern,
     # and only affects the *starting point*, not the converged solution.
-    _first_idx = torch.zeros(M, dtype=torch.long)
-    _seen = torch.zeros(M, dtype=torch.bool)
-    _group_of_list = group_of.tolist()
-    for _i, _g in enumerate(_group_of_list):
-        if not _seen[_g]:
-            _seen[_g] = True
-            _first_idx[_g] = _i
-    theta0_g = torch.cat(
-        [
-            theta0[:N][_first_idx],
-            theta0[N : 2 * N][_first_idx],
-            theta0[2 * N : 3 * N][_first_idx],
-            theta0[3 * N :][_first_idx],
-        ]
-    )
+    _first_idx = first_member_index(group_of, M)
+    theta0_g = reduce_blocks(theta0, _first_idx, N, 4)
 
     def _checkpoint_fn_g(n_iter_: int, event: str, theta_m: torch.Tensor, res_: float) -> None:
         """Expand the group-level best_theta to the N nodes before handing it to the user's ``checkpoint_fn``."""
@@ -2597,14 +2513,7 @@ def solve_fixed_point_decm(
             init_best_theta if isinstance(init_best_theta, torch.Tensor)
             else torch.tensor(init_best_theta, dtype=torch.float64)
         ).to(dtype=torch.float64)
-        init_best_theta_g = torch.cat(
-            [
-                _ibt[:N][_first_idx],
-                _ibt[N : 2 * N][_first_idx],
-                _ibt[2 * N : 3 * N][_first_idx],
-                _ibt[3 * N :][_first_idx],
-            ]
-        )
+        init_best_theta_g = reduce_blocks(_ibt, _first_idx, N, 4)
 
     global _Z_G_CLAMP, _Z_NEWTON_FLOOR
     saved_clamp = (_Z_G_CLAMP, _Z_NEWTON_FLOOR)       # the core sets the module-level z clamp for the duration of the call
@@ -2653,26 +2562,7 @@ def solve_fixed_point_decm(
     finally:
         _Z_G_CLAMP, _Z_NEWTON_FLOOR = saved_clamp
 
-    def _expand(theta_m):
-        import numpy as np
-        g = group_of.numpy()
-        to_ = theta_m[:M][g]
-        ti_ = theta_m[M : 2 * M][g]
-        eo_ = theta_m[2 * M : 3 * M][g]
-        ei_ = theta_m[3 * M :][g]
-        return np.concatenate([to_, ti_, eo_, ei_])
-
-    return SolverResult(
-        theta=_expand(result_g.theta),
-        best_theta=_expand(result_g.best_theta),
-        converged=result_g.converged,
-        iterations=result_g.iterations,
-        residuals=result_g.residuals,
-        elapsed_time=result_g.elapsed_time,
-        peak_ram_bytes=result_g.peak_ram_bytes,
-        message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
-        best_mre=result_g.best_mre,
-    )
+    return expand_result(result_g, group_of, N, M, 4)
 
 def _targeted_bisection_fix(
     theta: torch.Tensor,

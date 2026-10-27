@@ -31,6 +31,7 @@ import time
 import torch
 
 from .base import SolverResult
+from dcms.solvers._common import anderson_mixing as _anderson_mixing, compute_groups, expand_result, first_member_index, reduce_blocks
 from dcms.utils.profiling import _PeakRAMMonitor
 from dcms.models.parameters import _ETA_MIN, _ETA_MAX
 # Maximum ℓ∞ norm of the Anderson FP-residual r_k = g(θ_k) − θ_k accepted
@@ -102,90 +103,6 @@ _FPGS_NEWTON_MAX_FAILED_FIRINGS: int = 3
 
 
 
-def _anderson_mixing(
-    fp_outputs: list[torch.Tensor],
-    residuals_hist: list[torch.Tensor],
-    weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Anderson mixing: compute the next iterate from history.
-
-    Solves the *per-component-weighted* constrained least-squares problem:
-
-        min  ‖W⁻¹ Σ_i c_i r_i‖²    s.t.  Σ_i c_i = 1
-
-    where r_i = g(θ_i) − θ_i are the FP residuals and W = diag(w) is a
-    per-component scale with w_j = max_i |r_i[j]| (the running max magnitude
-    of each coordinate over the history).
-
-    This *weighted* formulation prevents high-strength hub nodes whose
-    θ-space FP residuals are much larger than typical nodes from dominating
-    the mixing — the unweighted R^T R is ill-conditioned by a factor equal to
-    the hub/typical residual ratio squared (easily 10⁶ for N=5000 power-law
-    networks), leading to catastrophic extrapolation.  Scaling each row by its
-    max magnitude makes the effective R^T R close to the identity (condition ≈ 1),
-    giving stable weights while preserving Anderson's acceleration property.
-
-    The solution is obtained via the normal equations of the m×m system
-    (R_w^T R_w) c ∝ 1 where R_w = R / w[:,None], then normalised so Σ c_i = 1.
-
-    Args:
-        fp_outputs:     List of g(θ_k) values (FP outputs), each shape (2N,).
-        residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (2N,).
-        weights:        Optional per-row multiplicity weight, shape (2N,).
-                        Used by the degeneracy-reduced (``mult``) path: a
-                        group of ``mult[g]`` identical nodes contributes
-                        ``mult[g]`` identical rows to this fit in the
-                        unreduced system but only one row in the reduced
-                        system, so without this weight the fit implicitly
-                        under-counts high-multiplicity groups (see the
-                        analogous DECM fix,
-                        ``dcms.solvers.fixed_point_decm._anderson_mixing``).
-                        ``None`` (default) reproduces the old behaviour.
-
-    Returns:
-        Anderson-mixed next iterate θ_{k+1}, shape (2N,).
-    """
-    m = len(fp_outputs)
-    if m == 1:
-        return fp_outputs[0]
-
-    R = torch.stack(residuals_hist, dim=1)  # (2N, m)
-    G = torch.stack(fp_outputs, dim=1)      # (2N, m)
-
-    # Per-component weighting: scale each row by its max |r_k| over the history.
-    # This prevents hub nodes (large |r_k|) from dominating R^T R and avoids
-    # the ill-conditioning that causes Anderson to produce β ≈ 1 iterates.
-    w = R.abs().max(dim=1, keepdim=True).values.clamp(min=1e-15)  # (2N, 1)
-    R_w = R / w  # (2N, m): each row scaled to max-absolute-value 1
-
-    # Normal equations on the weighted system: (R_w^T R_w) c ∝ ones
-    if weights is not None:
-        RtR = R_w.T @ (weights[:, None] * R_w)
-    else:
-        RtR = R_w.T @ R_w  # (m, m)
-    # Regularise to avoid singularity when recent steps are nearly collinear.
-    RtR = RtR + 1e-10 * torch.eye(m, dtype=RtR.dtype, device=RtR.device)
-    ones = torch.ones(m, dtype=RtR.dtype, device=RtR.device)
-    try:
-        c = torch.linalg.solve(RtR, ones)  # (m,): c ∝ (R_w^T R_w)^{-1} 1
-        c_sum = c.sum().item()
-        if abs(c_sum) < 1e-14 or not math.isfinite(c_sum):
-            raise RuntimeError("Degenerate Anderson weights.")
-        c = c / c_sum  # normalise: Σ c_i = 1
-        # Clamp to prevent wild extrapolation, then re-normalise safely
-        c = c.clamp(-10.0, 10.0)
-        c_sum_clamped = c.sum().item()
-        if abs(c_sum_clamped) < 1e-14 or not math.isfinite(c_sum_clamped):
-            # Post-clamp weights are degenerate; fall back to uniform mixing.
-            c = ones / m
-        else:
-            c = c / c_sum_clamped
-    except RuntimeError:
-        c = ones / m  # fallback: simple uniform mixing
-
-    return G @ c
-
-
 # -------------------------------------------------------------------------
 # Degeneracy reduction (Vallarano et al., Sci Rep 11:15227, 2021)
 # -------------------------------------------------------------------------
@@ -210,14 +127,7 @@ def compute_degeneracy_groups_dwcm(
         mult:     (M,) float tensor, multiplicity of each group.
         s_out_g, s_in_g: (M,) float tensors, the shared target values.
     """
-    N = s_out.shape[0]
-    key = torch.stack([s_out, s_in], dim=1)
-    uniq, group_of = torch.unique(key, dim=0, return_inverse=True)
-    M = uniq.shape[0]
-    mult = torch.zeros(M, dtype=torch.float64)
-    mult.scatter_add_(0, group_of, torch.ones(N, dtype=torch.float64))
-    s_out_g, s_in_g = uniq[:, 0], uniq[:, 1]
-    return group_of, mult, s_out_g, s_in_g
+    return compute_groups(s_out, s_in)
 
 
 def _dwcm_step_dense_weighted(
@@ -780,14 +690,8 @@ def solve_fixed_point_dwcm(
     group_of, mult, s_out_g, s_in_g = compute_degeneracy_groups_dwcm(s_out, s_in)
     M = s_out_g.shape[0]
 
-    _first_idx = torch.zeros(M, dtype=torch.long)
-    _seen = torch.zeros(M, dtype=torch.bool)
-    _group_of_list = group_of.tolist()
-    for _i, _g in enumerate(_group_of_list):
-        if not _seen[_g]:
-            _seen[_g] = True
-            _first_idx[_g] = _i
-    theta0_g = torch.cat([theta0[:N][_first_idx], theta0[N:][_first_idx]])
+    _first_idx = first_member_index(group_of, M)
+    theta0_g = reduce_blocks(theta0, _first_idx, N, 2)
 
     result_g = _solve_dwcm_reduced(
         theta0_g, s_out_g, s_in_g, mult,
@@ -795,20 +699,4 @@ def solve_fixed_point_dwcm(
         verbose=verbose, monitor=monitor, weight_anderson=weight_anderson, device=device, seed=seed,
     )
 
-    def _expand(theta_m):
-        import numpy as np
-        g = group_of.numpy()
-        to_ = theta_m[:M][g]
-        ti_ = theta_m[M:][g]
-        return np.concatenate([to_, ti_])
-
-    return SolverResult(
-        theta=_expand(result_g.theta),
-        best_theta=_expand(result_g.best_theta),
-        converged=result_g.converged,
-        iterations=result_g.iterations,
-        residuals=result_g.residuals,
-        elapsed_time=result_g.elapsed_time,
-        peak_ram_bytes=result_g.peak_ram_bytes,
-        message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
-    )
+    return expand_result(result_g, group_of, N, M, 2)

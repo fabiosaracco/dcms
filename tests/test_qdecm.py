@@ -402,6 +402,23 @@ class TestDegeneracyReduction:
         assert m1.solve_tool(tol=1e-9, max_iter=2000)
         assert "degeneracy-reduced" in m1.sol.message
 
+    def test_hub_bisection_with_a_single_node_hub_group(self) -> None:
+        """A hub that is alone in its group has no pair with itself: the hub bisection must not let its (non-existent) diagonal
+        bound the bracket nor enter the sum. Regression for the 2026-10-27 diagonal fix (quirinale_dico6 stopped converging)."""
+        g = torch.Generator().manual_seed(0)
+        N = 150
+        adj = (torch.rand(N, N, generator=g) < 0.05).double()
+        adj.fill_diagonal_(0.0)
+        w = adj * torch.randint(1, 5, (N, N), generator=g).double()
+        hub = int(torch.argmax(adj.sum(1)))
+        w[hub, :] *= 10; w[:, hub] *= 10                                          # realizable network with one extreme s/k node
+        k_out, k_in, s_out, s_in = adj.sum(1), adj.sum(0), w.sum(1), w.sum(0)
+        assert float(s_out[hub] / k_out[hub]) > 10
+        qm = qDECMModel(k_out, k_in, s_out, s_in)
+        assert qm.solve_tool(tol=1e-6, max_iter=3000, hub_sk_threshold=5.0)
+        th = torch.as_tensor(qm.sol.best_theta)
+        assert qm.max_relative_error(th[:2 * N], th[2 * N:]) < 1e-3          # hub rows are solved by bisection, others to tol
+
     def test_removed_options_are_rejected(self) -> None:
         k_out, k_in, s_out, s_in = self._degenerate_network()
         for kw in ({"variant": "gauss-seidel"}, {"backend": "numba"}, {"reduce_degeneracy": False}, {"backtracking_gamma": 1.2}):

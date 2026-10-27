@@ -206,7 +206,7 @@ assert len({r.tag for r in RECIPES}) == 19, f"expected 19 unique recipes, got {l
 # silently running them under the new defaults; the validated benchmark recipes pin the NEW one.
 # ---------------------------------------------------------------------------------------------
 LEGACY_LADDER: dict = dict(
-    patience=750, patience_rel_tol=0.0, stall_block_newton_gate=0.0,
+    patience=750, patience_rel_tol=0.0, stall_block_newton_gate=0.0, stall_block_newton_off_mre=0.0,
 )
 CURRENT_LADDER: dict = dict(     # = the solve_tool defaults at commit 4a1f492 (benchmark v2); written out so they cannot drift
     patience=250, patience_rel_tol=0.1, stall_block_newton_gate=0.05, stall_block_newton_off_mre=2e-4,
@@ -217,6 +217,7 @@ CURRENT_LADDER: dict = dict(     # = the solve_tool defaults at commit 4a1f492 (
 # converged at the first attempt with `general` (fresh ic='degrees', multi_start=False, seed 0), under CURRENT_LADDER.
 BENCHMARK_V2_GENERAL: dict = dict(
     anderson_depth=10, hub_sk_threshold=5.0, backtracking_gamma=0.0, z_clamp=1e-6, noise_base=2e-3,
+    multi_start=False, seed=0,        # as measured: a single attempt from ic='degrees' (pass ic='degrees' and a reduced-path model)
     **CURRENT_LADDER,
 )
 

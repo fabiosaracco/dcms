@@ -55,8 +55,6 @@ from dcms.utils.profiling import _PeakRAMMonitor
 # Numerical constants (mirrors fixed_point_qdecm.py)
 # -------------------------------------------------------------------------
 _ANDERSON_MAX_NORM: float = 1e6
-_ANDERSON_BLOWUP_FACTOR: float = 50.0
-_Q_MAX: float = 0.9999
 
 _Z_G_CLAMP: float = 1e-6      # project-wide default (2026-09-25): solver, model residual and targeted fix all use it
 _Z_NEWTON_FLOOR: float = _Z_G_CLAMP
@@ -1600,7 +1598,7 @@ def solve_fixed_point_decm(
                         ``patience`` window after it was switched on), the joint step is switched OFF again before the next tier, so the
                         noisy restarts run with the scalar step (on q1 the joint step kept on made every restart blow up). Default True.
         stall_block_newton_off_mre: With a block-Newton gate active (static or stall tier): once the record falls below this MRE (provided the joint step was switched on above it: q4 turns it on at 2e-5 and needs it) the joint step is switched
-                        OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). A static ``block_newton_gate`` (on from the start) counts as switched on above any threshold, so it is switched off as soon as the record falls below this value. Default 2e-4 (same as ``solve_tool``); 0.0 = never off.
+                        OFF again (scalar Newton finishes; the joint step is unstable near ~1e-4 on e1). A static ``block_newton_gate`` (on from the start) counts as switched on at the residual the run starts from: a fresh start (large residual) has it switched off once the record falls below this value, a run resumed from below it keeps it. Default 2e-4 (same as ``solve_tool``); 0.0 = never off.
         block_newton_min_rel: With ``block_newton_gate > 0``: rows whose relative residual is already below this value are not stepped jointly
                         (they keep the scalar step). ``None`` (default) = ``0.1 * tol``; ``0.0`` = no restriction. Prevents the s == k rows,
                         whose solution lies at infinity, from marching along the soft direction (theta-c, eta+c) far beyond what their
@@ -1988,7 +1986,7 @@ def solve_fixed_point_decm(
 
     # Mutable (gate, min_rel) read by the step closures: a stall-ladder tier can switch the joint 2x2 step on mid-run.
     _bn = [block_newton_gate, _bn_min_rel]
-    _bn_on_res = [float('inf')]   # record at which the joint step was switched on (off_mre acts only if that was above it)
+    _bn_on_res = [float('inf')]   # record at which the joint step was switched on (off_mre acts only if that was above it); a static gate counts as switched on at the starting residual
     _bn_stall_used = [False]   # stall tier already fired (so switching the gate off again does not re-arm it)
     if stall_block_newton_gate > 0.0 and mult is None:
         raise ValueError("stall_block_newton_gate requires the degeneracy-reduced path (mult given).")
@@ -2096,6 +2094,8 @@ def solve_fixed_point_decm(
     else:
         best_theta = theta.clone()
         best_theta_res = float("inf")
+    if block_newton_gate > 0.0 and best_theta_res != float("inf"):
+        _bn_on_res[0] = best_theta_res   # static gate: "switched on" at the residual the run starts from (off_mre acts only above it)
 
     # ------------------------------------------------------------------
     # Stagnation/blowup perturbed-restart state (see `patience` docstring).
@@ -2674,6 +2674,8 @@ def solve_fixed_point_decm(
                 sys.stdout.flush()
 
             if res_norm < best_theta_res:
+                if block_newton_gate > 0.0 and best_theta_res == float("inf"):
+                    _bn_on_res[0] = res_norm   # static gate, fresh start: the residual the run starts from
                 best_theta_res = res_norm
                 best_theta = theta.clone()
                 if stall_block_newton_off_mre > 0.0 and _bn[0] > 0.0 and _bn_on_res[0] > stall_block_newton_off_mre > best_theta_res:

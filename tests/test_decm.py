@@ -901,14 +901,14 @@ class TestBlockNewton:
 
     def test_gate_zero_is_the_scalar_step(self) -> None:
         theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
-        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64)
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(11))
         a = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult)
         b = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, block_newton_gate=1e-300)      # nothing is below this gate
         assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
     def test_dense_and_chunked_agree_with_the_gate_on(self) -> None:
         theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
-        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64)
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(11))
         hub = torch.zeros(M, dtype=torch.bool); hub[:2] = True
         for hm in (None, hub):
             d = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 5.0, mult, hub_out_mask=hm, block_newton_gate=1e9)
@@ -917,7 +917,7 @@ class TestBlockNewton:
 
     def test_joint_step_is_the_exact_2x2_newton_step(self) -> None:
         theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem()
-        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64)
+        th = theta_true + 0.02 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(11))
         th_new, F = _decm_step_dense_weighted(th, ko, ki, so, si, *zs, 100.0, mult, block_newton_gate=1e9)
         h = 1e-6
         for g in range(M):
@@ -936,7 +936,7 @@ class TestBlockNewton:
         th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
         th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
         kw = dict(tol=1e-9, max_iter=200, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, num_threads=1)
-        blk = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, block_newton_gate=0.05, **kw)
+        blk = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, block_newton_gate=0.05, stall_block_newton_off_mre=0.0, **kw)
         sca = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)
         assert blk.converged and blk.iterations < 50
         assert not sca.converged and min(sca.residuals) > 1e-3
@@ -973,7 +973,7 @@ class TestBlowupGuardDepthOne:
         from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
         th0, ko, ki, so, si = self._problem()
         res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=30, anderson_depth=1, hub_sk_threshold=0.0,
-                                                patience=10**6, block_newton_gate=0.05, verbose=False, num_threads=1)
+                                                patience=10**6, block_newton_gate=0.05, stall_block_newton_off_mre=0.0, verbose=False, num_threads=1)
         assert res.converged and res.iterations < 30          # the guard (default scale-adaptive factor) must not disturb a converging depth-1 run
 
 
@@ -1143,8 +1143,12 @@ class TestStallBlockNewtonTier:
         out = self._run(capsys, stall_block_newton_gate=0.05, stall_block_newton_off_mre=1e300)
         assert out.count("block-Newton ON") == 1 and "block-Newton OFF (record" not in out
 
+    def test_off_mre_not_applied_to_a_static_gate_that_starts_below_it(self, capsys) -> None:
+        out = self._run(capsys, block_newton_gate=0.05, stall_block_newton_off_mre=1e300)     # a resumed run: starting residual < threshold
+        assert "block-Newton OFF" not in out
+
     def test_off_mre_switches_static_gate_off_once(self, capsys) -> None:
-        out = self._run(capsys, block_newton_gate=0.05, stall_block_newton_off_mre=1e300)
+        out = self._run(capsys, block_newton_gate=0.05, stall_block_newton_off_mre=0.9995)   # start residual 1.0 > 0.9995 > record 0.9988
         assert out.count("block-Newton OFF") == 1
 
     def test_block_newton_reverted_if_tier_fails(self, capsys) -> None:
@@ -1181,3 +1185,9 @@ class TestCheckpointOnRestart:
         m2, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         m2.solve_tool(ic="degrees", multi_start=False, **kw)
         assert m1.sol.mre == m2.sol.mre and m1.sol.iterations == m2.sol.iterations
+
+
+def test_non_cpu_device_without_reduction_raises_instead_of_being_ignored() -> None:
+    model, _ = make_decm_model(N=8, seed=1)
+    with pytest.raises(NotImplementedError):
+        model.solve_tool(tol=1e-6, device="mps", reduce_degeneracy=False)

@@ -724,3 +724,18 @@ class TestFpgsNewtonMiniLoopRetryLadder:
         finally:
             torch.set_num_threads(prev_threads)
         assert converged, model.sol.message
+
+
+class TestSolveToolSeedAndDevice:
+    def test_seed_is_accepted_and_runs_are_reproducible(self) -> None:
+        model, _ = make_dwcm_model(N=6, seed=1)
+        assert model.solve_tool(tol=1e-8, max_iter=500, seed=3)
+        theta = np.array(model.sol.best_theta)
+        model2, _ = make_dwcm_model(N=6, seed=1)
+        model2.solve_tool(tol=1e-8, max_iter=500, seed=3)
+        assert np.array_equal(theta, np.array(model2.sol.best_theta))
+
+    def test_non_cpu_device_without_reduction_raises_instead_of_being_ignored(self) -> None:
+        model, _ = make_dwcm_model(N=6, seed=1)
+        with pytest.raises(NotImplementedError):
+            model.solve_tool(tol=1e-6, device="mps", reduce_degeneracy=False)

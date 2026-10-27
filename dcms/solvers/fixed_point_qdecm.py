@@ -1050,8 +1050,7 @@ def _solve_fixed_point_qdecm_impl(
                      clamp would then disagree with what the model's own
                      residual judges.
         device:      ``"cpu"`` (default, float64) or a torch device string
-                     like ``"mps"``/``"cuda"`` (float32 -- see DECM's
-                     the same float32 precedent as DECM). Only supported
+                     like ``"mps"``/``"cuda"`` (float32, as for DECM). Only supported
                      together with ``mult`` (the degeneracy-reduced path)
                      and ``backend`` resolving to ``"pytorch"``. The
                      returned ``SolverResult`` is always CPU/float64

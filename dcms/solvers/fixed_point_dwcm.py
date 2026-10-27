@@ -383,8 +383,7 @@ def solve_fixed_point_dwcm(
             :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
             parameter of the same name. Default True.
         device: ``"cpu"`` (default, float64) or a torch device string like
-            ``"mps"``/``"cuda"`` (float32 -- as for DECM
-            for the precedent). Only supported together with ``mult`` (the
+            ``"mps"``/``"cuda"`` (float32, as for DECM). Only supported together with ``mult`` (the
             degeneracy-reduced path) and ``backend`` resolving to
             ``"pytorch"``. The returned ``SolverResult`` is always
             CPU/float64 regardless of ``device``.
@@ -392,9 +391,9 @@ def solve_fixed_point_dwcm(
             ``_FPGS_NEWTON_RETRY_NOISE_BASE`` and the ``if _fpgs_newton_fired:``
             block) -- private, does not touch global RNG state, mirrors
             :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
-            parameter of the same name. ``None`` (default) is
-            unseeded/non-reproducible -- only relevant for instances that
-            actually hit a diverging mini-loop firing.
+            parameter of the same name. ``None`` (default) uses the fixed default
+            state of a fresh ``torch.Generator``, so the run is deterministic anyway
+            -- only relevant for instances that actually hit a diverging mini-loop firing.
 
     Returns:
         :class:`~src.solvers.base.SolverResult` instance.

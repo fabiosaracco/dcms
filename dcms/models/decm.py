@@ -982,6 +982,7 @@ class DECMModel:
                 noise_cap_mult=noise_cap_mult,
                 noise_growth=noise_growth,
                 max_stalls=max_stalls,
+                device=device,
                 seed=seed,
             )
 

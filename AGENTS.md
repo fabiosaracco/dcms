@@ -61,6 +61,8 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - Questo è il modello più difficile da far convergere: le equazioni di grado e strength sono **accoppiate** (η entra in p_ij)
 - **Status: ✅ COMPLETATO** — alternating GS-Newton Anderson(10), 100% convergenza fino a N=5k
 
+
+> **Nota (2026-10-27).** Le sezioni seguenti sono la cronologia di progetto: il solver per nodo, la variante FP-GS (Gauss-Seidel in β-space), il backend Numba e il backtracking sono stati RIMOSSI. Oggi esiste un solo solver per modello: θ-Newton + Anderson(10) sul sistema ridotto per degenerazione (vedi README §2).
 ## Metodi di risoluzione
 
 > **Lezione appresa dalle Fasi 1-5:** solo i metodi Fixed-Point scalano e convergono in modo affidabile per N grande. I metodi Newton-like (Newton pieno, Broyden, LM) richiedono O(N²) RAM e non scalano oltre N≈500. L-BFGS scala in RAM ma non converge in modo affidabile sul DWCM puro per reti eterogenee; tuttavia funziona sul qDECM con warm-start dalla soluzione two-step. Pertanto, il DECM va implementato usando **prioritariamente** i metodi seguenti.

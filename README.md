@@ -931,12 +931,12 @@ k, s = k_s_generator_pl(
 
 ## 4. Performance
 
-Measured on the 19 real networks of the project (N from 232 to 107 056, M from 20 to 7 305 groups), 24 threads, `tol = 1e-5`, seed 0, benchmark v2 (package at commit `4a1f492`, `benchmark_19/results_v2/`). All runs converged:
+Measured on the 19 real networks of the project (N from 232 to 107 056, M from 20 to 7 305 groups), 24 threads, `tol = 1e-5`, seed 0, benchmark v2 (DWCM and DECM: package at commit `4a1f492`; qDECM: see its row; `benchmark_19/results_v2/`). All runs converged:
 
 | Model | Networks converged | Iterations | Wall time | Remarks |
 |---|---|---|---|---|
 | DWCM | 19 / 19 | 13 – 59 | < 10 s | |
-| qDECM | 19 / 19 | 26 – 175 | < 2 min | **to be re-measured**: those runs predate the 2026-10-27 fix of the within-group pairs (§2.5), which changes the iteration counts |
+| qDECM | 19 / 19 | 27 – 474 | 1 s – 3.6 min | re-measured with package `44a153d` (after the within-group-pairs fix of §2.5 and with the topology solved to `tol * 1e-3`), `ic_topo="degrees"`, `hub_sk_threshold=5`; MRE over every node equals the solver MRE. The slowest is quirinale_dico4 (474 iterations, 216 s); all others take ≤ 107 s |
 | DECM | 19 / 19 | 164 – 3 064 | 1 s – 10 h 19 | recipe `general` at the first attempt on every network (`anderson_depth=10, hub_sk_threshold=5, z_clamp=1e-6, noise_base=2e-3`); the three slowest networks (M ≈ 5 000–7 300) take 1–10 h |
 
 DCM was not part of that benchmark; on the same inputs it converges in 14–24 iterations (tol 1e-8).

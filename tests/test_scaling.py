@@ -2,15 +2,11 @@
 
 Covers:
 - Correctness: chunked residual and neg_log_likelihood match dense versions.
-- Correctness: chunked fixed-point step matches dense step.
-- Convergence: fixed-point (Gauss-Seidel) and L-BFGS converge for N=1000.
+- Convergence: the reduced θ-Newton solver converges for N=100 and N=1000.
 - Auto-switch: residual() calls _residual_chunked when N > _LARGE_N_THRESHOLD
   (verified via monkeypatching the threshold).
-- Scaling: benchmark smoke tests run without error for N=50 and N=200.
 
 All tests are designed to complete in < 30 seconds on a typical CI runner.
-Larger-scale benchmarks (N > 1000) are in ``src/benchmarks/dcm_scaling.py``
-and are run manually.
 """
 from __future__ import annotations
 
@@ -24,7 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dcms.models.dcm import DCMModel, _LARGE_N_THRESHOLD, _DEFAULT_CHUNK
-from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm, _fp_step_chunked_dcm
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from dcms.utils.wng import k_s_generator_pl
 
 
@@ -202,175 +198,48 @@ class TestChunkedNegLogLikelihood:
 
 
 # ---------------------------------------------------------------------------
-# Chunked fixed-point step correctness
+# Convergence at N = 100 and N = 1000
 # ---------------------------------------------------------------------------
 
-class TestChunkedFPStep:
-    """Verify that _fp_step_chunked produces identical updates as the dense step."""
-
-    def _dense_step(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        k_out: torch.Tensor,
-        k_in: torch.Tensor,
-        variant: str,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference dense fixed-point step."""
-        xy = x[:, None] * y[None, :]
-        xy_diag = xy.diagonal()
-        D_out = (y[None, :] / (1.0 + xy)).sum(dim=1) - y / (1.0 + xy_diag)
-        x_new = torch.where(D_out > 0, k_out / D_out, x)
-        x_upd = x_new if variant == "gauss-seidel" else x
-        xy2 = x_upd[:, None] * y[None, :]
-        xy2_diag = xy2.diagonal()
-        D_in = (x_upd[None, :] / (1.0 + xy2.T)).sum(dim=1) - x_upd / (1.0 + xy2_diag)
-        y_new = torch.where(D_in > 0, k_in / D_in, y)
-        return x_new, y_new
-
-    @pytest.mark.parametrize("variant", ["gauss-seidel"])
-    @pytest.mark.parametrize("N,seed", [(6, 0), (15, 1), (30, 2)])
-    def test_chunked_matches_dense(self, variant: str, N: int, seed: int) -> None:
-        """Chunked step must produce the same x_new and y_new as the dense step."""
-        rng = np.random.default_rng(seed)
-        x = torch.tensor(rng.uniform(0.1, 1.5, N), dtype=torch.float64)
-        y = torch.tensor(rng.uniform(0.1, 1.5, N), dtype=torch.float64)
-        k_out = torch.tensor(rng.uniform(1.0, N - 1, N), dtype=torch.float64)
-        k_in = torch.tensor(rng.uniform(1.0, N - 1, N), dtype=torch.float64)
-
-        x_dense, y_dense = self._dense_step(x, y, k_out, k_in, variant)
-        x_chunk, y_chunk, _ = _fp_step_chunked_dcm(x, y, k_out, k_in, chunk_size=3)
-
-        assert torch.allclose(x_dense, x_chunk, atol=1e-12), (
-            f"x_new mismatch ({variant}): max diff {(x_dense - x_chunk).abs().max():.3e}"
-        )
-        assert torch.allclose(y_dense, y_chunk, atol=1e-12), (
-            f"y_new mismatch ({variant}): max diff {(y_dense - y_chunk).abs().max():.3e}"
-        )
-
-    @pytest.mark.parametrize("chunk_size", [1, 4, 7, 20])
-    def test_chunk_size_invariance(self, chunk_size: int) -> None:
-        """Result must be independent of chunk_size."""
-        N = 20
-        rng = np.random.default_rng(42)
-        x = torch.tensor(rng.uniform(0.1, 1.0, N), dtype=torch.float64)
-        y = torch.tensor(rng.uniform(0.1, 1.0, N), dtype=torch.float64)
-        k_out = torch.tensor(rng.uniform(1.0, 5.0, N), dtype=torch.float64)
-        k_in = torch.tensor(rng.uniform(1.0, 5.0, N), dtype=torch.float64)
-
-        x_ref, y_ref, _ = _fp_step_chunked_dcm(x, y, k_out, k_in, chunk_size=1)
-        x_c, y_c, _ = _fp_step_chunked_dcm(x, y, k_out, k_in, chunk_size=chunk_size)
-        assert torch.allclose(x_ref, x_c, atol=1e-12)
-        assert torch.allclose(y_ref, y_c, atol=1e-12)
-
-
-# ---------------------------------------------------------------------------
-# Convergence at N = 100 using chunked computation
-# ---------------------------------------------------------------------------
-
-class TestChunkedConvergenceSmall:
-    """Verify solver convergence using explicitly forced chunked computation (N=100)."""
+class TestScalingN1000:
+    """Verify that the reduced θ-Newton solver converges for N=100 and N=1000 power-law networks,
+    judged by the PER-NODE residual of the expanded solution."""
 
     @pytest.fixture(scope="class")
     def model_100(self) -> DCMModel | None:
-        """Return a DCMModel for a power-law network with N=100."""
         for seed in range(20):
             m = _make_pl_model(N=100, seed=seed)
             if m is not None:
                 return m
         return None
 
-    def test_fixed_point_invalid_chunk_size_raises(self, model_100: DCMModel | None) -> None:
-        """solve_fixed_point_dcm must raise ValueError for negative chunk_size."""
-        if model_100 is None:
-            pytest.skip("No feasible N=100 network found")
-        theta0 = model_100.initial_theta("degrees")
-        with pytest.raises(ValueError, match="chunk_size"):
-            solve_fixed_point_dcm(
-                model_100.residual, theta0, model_100.k_out, model_100.k_in,
-                chunk_size=-1,
-            )
-
-    def test_fixed_point_chunk_size_zero_accepted(self, model_100: DCMModel | None) -> None:
-        """solve_fixed_point_dcm must accept chunk_size=0 (auto-select) and converge."""
-        if model_100 is None:
-            pytest.skip("No feasible N=100 network found")
-        theta0 = model_100.initial_theta("degrees")
-        result = solve_fixed_point_dcm(
-            model_100.residual, theta0, model_100.k_out, model_100.k_in,
-            tol=1e-7, max_iter=5_000, variant="gauss-seidel",
-            chunk_size=0,  # 0 means auto-select
-        )
-        err = model_100.constraint_error(result.best_theta)
-        assert err < CONV_TOL, (
-            f"Fixed-point GS (chunk_size=0) N=100: err={err:.3e}"
-        )
-
-    def test_fixed_point_gs_chunked_convergence(self, model_100: DCMModel | None) -> None:
-        """Fixed-point GS must converge for N=100 even with chunk_size=16."""
-        if model_100 is None:
-            pytest.skip("No feasible N=100 network found")
-        theta0 = model_100.initial_theta("degrees")
-        result = solve_fixed_point_dcm(
-            model_100.residual, theta0, model_100.k_out, model_100.k_in,
-            tol=1e-7, max_iter=5_000, variant="gauss-seidel",
-            chunk_size=16,
-        )
-        err = model_100.constraint_error(result.best_theta)
-        assert err < CONV_TOL, (
-            f"Fixed-point GS (chunked) N=100: err={err:.3e} conv={result.converged}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Convergence at N = 1000 (validation scale)
-# ---------------------------------------------------------------------------
-
-class TestScalingN1000:
-    """Verify that the memory-efficient solvers converge for N=1000.
-
-    Uses the auto-switching code paths (residual switches to chunked for
-    N > _LARGE_N_THRESHOLD).  Here N=1000 < threshold, so the *dense* path is
-    used — but the chunked path is explicitly exercised via chunk_size parameter.
-    """
-
     @pytest.fixture(scope="class")
     def model_1k(self) -> DCMModel | None:
-        """Return a DCMModel for a power-law network with N=1000."""
         for seed in range(20):
             m = _make_pl_model(N=1_000, seed=seed)
             if m is not None:
                 return m
         return None
 
-    def test_fixed_point_gs_n1000(self, model_1k: DCMModel | None) -> None:
-        """Fixed-point Gauss-Seidel must converge for N=1000."""
-        if model_1k is None:
-            pytest.skip("No feasible N=1000 network found")
-        theta0 = model_1k.initial_theta("degrees")
+    def test_theta_newton_n100(self, model_100: DCMModel | None) -> None:
+        if model_100 is None:
+            pytest.skip("No feasible N=100 network found")
         result = solve_fixed_point_dcm(
-            model_1k.residual, theta0, model_1k.k_out, model_1k.k_in,
-            tol=1e-6, max_iter=10_000, variant="gauss-seidel",
+            model_100.initial_theta("degrees"), model_100.k_out, model_100.k_in,
+            tol=1e-7, max_iter=5_000, anderson_depth=10,
         )
-        err = model_1k.max_relative_error(result.best_theta)
-        assert err < CONV_TOL, (
-            f"Fixed-point GS N=1000: err={err:.3e} conv={result.converged} "
-            f"iters={result.iterations}"
-        )
+        assert model_100.constraint_error(result.best_theta) < CONV_TOL
 
     def test_theta_newton_n1000(self, model_1k: DCMModel | None) -> None:
-        """θ-Newton must converge for N=1000."""
         if model_1k is None:
             pytest.skip("No feasible N=1000 network found")
-        theta0 = model_1k.initial_theta("degrees")
         result = solve_fixed_point_dcm(
-            model_1k.residual, theta0, model_1k.k_out, model_1k.k_in,
-            tol=1e-6, max_iter=5_000, variant="theta-newton", anderson_depth=10,
+            model_1k.initial_theta("degrees"), model_1k.k_out, model_1k.k_in,
+            tol=1e-6, max_iter=5_000, anderson_depth=10,
         )
         err = model_1k.max_relative_error(result.best_theta)
         assert err < CONV_TOL, (
-            f"θ-Newton N=1000: err={err:.3e} conv={result.converged} "
-            f"iters={result.iterations}"
+            f"θ-Newton N=1000: err={err:.3e} conv={result.converged} iters={result.iterations}"
         )
 
     def test_chunked_residual_n1000(self, model_1k: DCMModel | None) -> None:
@@ -392,30 +261,3 @@ class TestScalingN1000:
         assert torch.allclose(F_dense, F_chunk, atol=1e-10), (
             f"Max diff dense vs chunked for N=1000: {(F_dense - F_chunk).abs().max():.3e}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Benchmark module smoke test
-# ---------------------------------------------------------------------------
-
-class TestScalingBenchmarkModule:
-    """Smoke-test the dcm_scaling benchmark at a very small N."""
-
-    def test_run_scaling_benchmark_n50(self) -> None:
-        """run_scaling_benchmark must complete without error for N=50."""
-        from dcms.benchmarks.dcm_scaling import run_scaling_benchmark
-        records = run_scaling_benchmark(N=50, rho=0.3, seed=0, tol=1e-6,
-                                        timeout=60.0, verbose=False)
-        assert len(records) > 0
-        # At least one method must converge
-        converged = [r for r in records if r["converged"]]
-        assert len(converged) > 0, "No solver converged for N=50 in smoke test"
-
-    def test_run_scaling_benchmark_n200(self) -> None:
-        """run_scaling_benchmark must complete without error for N=200."""
-        from dcms.benchmarks.dcm_scaling import run_scaling_benchmark
-        records = run_scaling_benchmark(N=200, rho=0.1, seed=0, tol=1e-6,
-                                        timeout=60.0, verbose=False)
-        assert len(records) > 0
-        converged = [r for r in records if r["converged"]]
-        assert len(converged) > 0, "No solver converged for N=200 in smoke test"

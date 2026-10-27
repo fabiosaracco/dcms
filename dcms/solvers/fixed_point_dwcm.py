@@ -270,6 +270,9 @@ def _dwcm_step_dense_weighted(
     W1W_diag = W1W.diagonal()
 
     F_out = (W * mult[None, :]).sum(1) - W_diag - s_out
+    # The returned residual must be F(theta) at the INPUT theta for both halves (it drives the convergence test and the best-iterate
+    # record); F_in below is evaluated after the out half-step and is used only for the in Newton step.
+    F_in_current = (W * mult[:, None]).sum(0) - W_diag - s_in
     h_out = -((W1W * mult[None, :]).sum(1) - W1W_diag)
     delta_out = (-F_out / (h_out - 1e-30)).clamp(-max_step, max_step)
     theta_out_new = (theta_out + delta_out).clamp(eta_lo, _ETA_MAX)
@@ -287,7 +290,7 @@ def _dwcm_step_dense_weighted(
     theta_in_new = (theta_in + delta_in).clamp(eta_lo, _ETA_MAX)
     theta_in_new = torch.where(s_in == 0, torch.full_like(theta_in_new, _ETA_MAX), theta_in_new)
 
-    F_current = torch.cat([F_out, F_in])
+    F_current = torch.cat([F_out, F_in_current])
     return torch.cat([theta_out_new, theta_in_new]), F_current
 
 

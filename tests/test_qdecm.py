@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dcms.models.qdecm import qDECMModel, _ETA_MAX, _ETA_MIN
 from dcms.models.dcm import DCMModel
-from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm
+from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm, solve_fixed_point_qdecm_weight
 from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 
@@ -295,32 +295,19 @@ def _solve_two_step(
     tol: float = 1e-5,
     topo_max_iter: int = 5_000,
     weight_max_iter: int = 10_000,
-    weight_variant: str = "theta-newton",
     anderson_depth: int = 10,
 ) -> tuple:
     """Run the two-step qDECM solve and return (topo_result, weight_result)."""
-    dcm = DCMModel(model.k_out, model.k_in)
     theta_topo0 = model.initial_theta_topo()
     r_topo = solve_fixed_point_dcm(
-        dcm.residual, theta_topo0, dcm.k_out, dcm.k_in,
-        tol=tol, max_iter=topo_max_iter,
-        variant="theta-newton", anderson_depth=10,
+        theta_topo0, model.k_out, model.k_in,
+        tol=tol, max_iter=topo_max_iter, anderson_depth=10,
     )
-    theta_topo = r_topo.theta
-
-    theta_w0 = model.initial_theta_weight(
-        torch.tensor(theta_topo, dtype=torch.float64), "topology"
-    )
-    res_fn = lambda tw: model.residual_strength(
-        torch.tensor(theta_topo, dtype=torch.float64),
-        tw.clamp(_ETA_MIN, _ETA_MAX),
-    )
-    r_weight = solve_fixed_point_qdecm(
-        res_fn, theta_w0,
-        model.s_out, model.s_in,
-        theta_topo=torch.tensor(theta_topo, dtype=torch.float64),
-        tol=tol, max_iter=weight_max_iter,
-        variant=weight_variant, anderson_depth=anderson_depth,
+    theta_topo = torch.tensor(r_topo.theta, dtype=torch.float64)
+    theta_w0 = model.initial_theta_weight(theta_topo, "topology")
+    r_weight = solve_fixed_point_qdecm_weight(
+        theta_topo, theta_w0, model.k_out, model.k_in, model.s_out, model.s_in,
+        tol=tol, max_iter=weight_max_iter, anderson_depth=anderson_depth,
     )
     return r_topo, r_weight
 
@@ -332,9 +319,7 @@ class TestSolverConvergenceSmall:
     def test_theta_newton_converges(self, N: int, seed: int) -> None:
         """θ-Newton must converge on small networks."""
         model, theta_topo_true, theta_weight_true = make_qdecm_model(N=N, seed=seed)
-        r_topo, r_weight = _solve_two_step(
-            model, tol=CONV_TOL, weight_variant="theta-newton",
-        )
+        r_topo, r_weight = _solve_two_step(model, tol=CONV_TOL)
         assert r_topo.converged, f"N={N} seed={seed}: topology step failed"
         assert r_weight.converged, f"N={N} seed={seed}: weight step failed"
         err = model.max_relative_error(
@@ -343,56 +328,20 @@ class TestSolverConvergenceSmall:
         )
         assert err < CONV_TOL * 100, f"N={N} seed={seed}: MRE={err:.2e}"
 
-    @pytest.mark.parametrize("N,seed", [(4, 0), (4, 1), (10, 0)])
-    def test_fp_gs_no_crash(self, N: int, seed: int) -> None:
-        """FP-GS Anderson may not converge but must not crash."""
-        model, _, _ = make_qdecm_model(N=N, seed=seed)
-        r_topo, r_weight = _solve_two_step(
-            model, tol=CONV_TOL, weight_variant="gauss-seidel",
-            weight_max_iter=2_000,
-        )
-        assert r_topo.converged, f"N={N} seed={seed}: topology step failed"
-        if r_weight.converged:
-            err = model.constraint_error_strength(
-                torch.tensor(r_topo.theta, dtype=torch.float64),
-                torch.tensor(r_weight.theta, dtype=torch.float64),
-            )
-            assert err < CONV_TOL * 100, f"N={N} seed={seed}: strength error={err:.2e}"
-
-
 # ---------------------------------------------------------------------------
 # Fixed-point solver direct tests
 # ---------------------------------------------------------------------------
 
 class TestFixedPointqDECM:
-    """Direct tests of solve_fixed_point_qdecm."""
+    """Direct tests of solve_fixed_point_qdecm_weight."""
 
-    def test_fp_gs_converges_n4(self) -> None:
+    def test_weight_step_converges_n4(self) -> None:
         model, theta_topo_true, _ = make_qdecm_model(N=4, seed=0)
         theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
         theta_weight0 = model.initial_theta_weight(theta_topo, "topology")
-        res_fn = lambda tw: model.residual_strength(theta_topo, tw.clamp(_ETA_MIN, _ETA_MAX))
-        result = solve_fixed_point_qdecm(
-            res_fn, theta_weight0,
-            model.s_out, model.s_in,
-            theta_topo=theta_topo,
+        result = solve_fixed_point_qdecm_weight(
+            theta_topo, theta_weight0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=CONV_TOL, max_iter=10_000,
-            damping=1.0, variant="gauss-seidel",
-        )
-        # FP-GS doesn't always converge; just check it doesn't crash
-        assert result.iterations >= 0
-
-    def test_theta_newton_converges_n4(self) -> None:
-        model, theta_topo_true, _ = make_qdecm_model(N=4, seed=0)
-        theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
-        theta_weight0 = model.initial_theta_weight(theta_topo, "topology")
-        res_fn = lambda tw: model.residual_strength(theta_topo, tw.clamp(_ETA_MIN, _ETA_MAX))
-        result = solve_fixed_point_qdecm(
-            res_fn, theta_weight0,
-            model.s_out, model.s_in,
-            theta_topo=theta_topo,
-            tol=CONV_TOL, max_iter=10_000,
-            variant="theta-newton",
         )
         assert result.converged or result.residuals[-1] < CONV_TOL * 10
 
@@ -418,128 +367,46 @@ class TestDegeneracyReduction:
         s_in = adj_w.sum(dim=0)
         return k_out, k_in, s_out, s_in
 
-    def test_weighted_step_matches_unreduced_at_mult_one(self) -> None:
-        """_qdecm_step_dense_weighted with mult=1 must exactly reproduce
-        _theta_newton_step_dense (float64, single step, not just at
-        convergence) -- this is the algebraic identity the reduction relies
-        on, independent of any real degeneracy being present."""
-        from dcms.solvers.fixed_point_qdecm import (
-            _theta_newton_step_dense, _qdecm_step_dense_weighted,
-        )
-        torch.manual_seed(1)
-        N = 25
-        s_out = torch.rand(N, dtype=torch.float64) * 10 + 1
-        s_in = torch.rand(N, dtype=torch.float64) * 10 + 1
+    def test_weighted_step_residual_matches_the_model_at_mult_one(self) -> None:
+        """With unit multiplicities the weighted step's residual F must equal the model's own (independent) per-node
+        strength residual -- the algebraic identity the reduction relies on, at a generic point."""
+        from dcms.solvers.fixed_point_qdecm import _qdecm_step_dense_weighted
+        model, theta_topo_true, _ = make_qdecm_model(N=12, seed=1)
+        theta_topo = torch.tensor(theta_topo_true, dtype=torch.float64)
+        N = model.N
         theta = torch.rand(2 * N, dtype=torch.float64) * 0.5 + 0.3
-        P = torch.rand(N, N, dtype=torch.float64) * 0.3
+        P = model.pij_matrix(theta_topo).clone()
         P.fill_diagonal_(0.0)
-        mult = torch.ones(N, dtype=torch.float64)
+        _, F = _qdecm_step_dense_weighted(theta.clone(), P, model.s_out, model.s_in, max_step=1.0, mult=torch.ones(N, dtype=torch.float64))
+        assert torch.allclose(F, model.residual_strength(theta_topo, theta), atol=1e-10)
 
-        t1, F1 = _theta_newton_step_dense(theta.clone(), P, s_out, s_in, max_step=1.0)
-        t2, F2 = _qdecm_step_dense_weighted(theta.clone(), P, s_out, s_in, max_step=1.0, mult=mult)
-
-        assert torch.allclose(t1, t2, atol=1e-12), f"theta diff: {(t1-t2).abs().max():.3e}"
-        assert torch.allclose(F1, F2, atol=1e-12), f"F diff: {(F1-F2).abs().max():.3e}"
-
-    def test_reduced_matches_full_pipeline(self) -> None:
-        """Full topology+weight pipeline, reduced vs unreduced, must agree
-        on the expected-weight matrix once converged.
-
-        NOTE on the tolerance: the per-step algebra is proven algebraically
-        exact (see test_weighted_step_matches_unreduced_at_mult_one and a
-        crafted multi-member-group check done during development, both
-        exact to float64 precision). At full-pipeline scale, though, full
-        vs reduced can land on slightly different points along the
-        weight-step's genuine gauge freedom: G_ij = G(theta_b_out_i +
-        theta_b_in_j) depends only on the pairwise SUM, so
-        theta_b_out += c, theta_b_in -= c leaves every W_ij unchanged
-        exactly (verified numerically to machine precision) -- this is the
-        same gauge direction DCM has (see solve_fixed_point_dcm_degenerate's
-        module docs), just less sharply pinned down by the positivity box
-        here. Both full and reduced independently satisfy their own
-        residual to ~1e-10 or tighter -- i.e. both are genuinely valid
-        solutions, they just aren't bit-identical along that direction.
-        Observed magnitude: ~2e-3 on crisi_dico2 (N=15168), ~4e-3 on this
-        smaller synthetic network. 1e-2 catches real algorithmic bugs
-        (which showed O(1) discrepancies during development) while
-        tolerating this gauge-freedom artifact.
-        """
-        from dcms.solvers.fixed_point_qdecm import (
-            solve_fixed_point_qdecm, solve_fixed_point_qdecm_degenerate,
-        )
-        from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
-
+    def test_expanded_pipeline_solves_the_per_node_system(self) -> None:
+        """The reduced topology+weight solution, expanded to the N nodes, must satisfy the ORIGINAL per-node degree and strength
+        equations (the reduction is exact) and be constant within every (k_out, k_in, s_out, s_in) group."""
         k_out, k_in, s_out, s_in = self._degenerate_network()
         N = k_out.shape[0]
-
-        dcm = DCMModel(k_out, k_in)
-        theta_topo0 = dcm.initial_theta("degrees")
-        topo_full = solve_fixed_point_dcm(
-            dcm.residual, theta_topo0, k_out, k_in,
-            tol=1e-11, max_iter=2000, variant="theta-newton",
-            anderson_depth=10, backend="pytorch",
-        )
-        assert topo_full.converged
-        theta_topo_full = torch.as_tensor(topo_full.best_theta)
-
         qm = qDECMModel(k_out, k_in, s_out, s_in)
-        theta_w0 = qm.initial_theta_weight(theta_topo_full, method="topology")
-        res_full = solve_fixed_point_qdecm(
-            lambda tb: qm.residual_strength(theta_topo_full, tb),
-            theta_w0, s_out, s_in, theta_topo_full,
-            tol=1e-11, max_iter=2000, variant="theta-newton",
-            anderson_depth=10, backend="pytorch",
-        )
-        assert res_full.converged, f"full weight solver did not converge: mre={res_full.mre:.3e}"
+        assert qm.solve_tool(tol=1e-10, max_iter=3000)
+        theta = torch.as_tensor(qm.sol.best_theta)
+        assert qm.max_relative_error(theta[:2 * N], theta[2 * N:]) < 1e-8
+        key = np.stack([k_out.numpy(), k_in.numpy(), s_out.numpy(), s_in.numpy()], 1)
+        _, inv = np.unique(key, axis=0, return_inverse=True)
+        for g in range(inv.max() + 1):
+            idx = np.flatnonzero(inv.ravel() == g)
+            for blk in range(4):
+                assert np.ptp(qm.sol.best_theta[blk * N:(blk + 1) * N][idx]) == 0.0
 
-        res_red = solve_fixed_point_qdecm_degenerate(
-            theta_topo0, theta_w0, k_out, k_in, s_out, s_in,
-            tol=1e-11, max_iter=2000, topo_max_iter=2000, anderson_depth=10,
-            backend="pytorch",
-        )
-        assert res_red.converged, f"reduced weight solver did not converge: mre={res_red.mre:.3e}"
-
-        to_f, ti_f = res_full.best_theta[:N], res_full.best_theta[N:]
-        to_r, ti_r = res_red.best_theta[:N], res_red.best_theta[N:]
-        z_f = to_f[:, None] + ti_f[None, :]
-        z_r = to_r[:, None] + ti_r[None, :]
-        G_f = -1.0 / np.expm1(-np.clip(z_f, 1e-8, None))
-        G_r = -1.0 / np.expm1(-np.clip(z_r, 1e-8, None))
-        topo_np = theta_topo_full.numpy()
-        P = 1.0 / (1.0 + np.exp(topo_np[:N, None] + topo_np[None, N:]))
-        np.fill_diagonal(P, 0.0)
-        W_f = P * G_f
-        W_r = P * G_r
-        np.fill_diagonal(W_f, 0.0)
-        np.fill_diagonal(W_r, 0.0)
-        max_diff = np.max(np.abs(W_f - W_r))
-        assert max_diff < 1e-2, f"E[w] mismatch full vs reduced: {max_diff:.3e}"
-
-    def test_solve_tool_reduce_degeneracy_default_true(self) -> None:
-        """solve_tool() must use the reduced path by default (both topology
-        and weight steps) and agree with reduce_degeneracy=False."""
+    def test_solve_tool_uses_the_reduced_system(self) -> None:
         k_out, k_in, s_out, s_in = self._degenerate_network()
         m1 = qDECMModel(k_out, k_in, s_out, s_in)
-        conv1 = m1.solve_tool(tol=1e-9, max_iter=2000)
-        assert conv1
+        assert m1.solve_tool(tol=1e-9, max_iter=2000)
         assert "degeneracy-reduced" in m1.sol.message
 
-        m2 = qDECMModel(k_out, k_in, s_out, s_in)
-        conv2 = m2.solve_tool(tol=1e-9, max_iter=2000, reduce_degeneracy=False)
-        assert conv2
-        assert "degeneracy-reduced" not in m2.sol.message
-
-    def test_solve_tool_falls_back_for_backtracking_gamma(self) -> None:
-        """reduce_degeneracy=True with backtracking_gamma>0 must fall back
-        to the full solver (backtracking isn't supported in the reduced
-        path)."""
+    def test_removed_options_are_rejected(self) -> None:
         k_out, k_in, s_out, s_in = self._degenerate_network()
-        m = qDECMModel(k_out, k_in, s_out, s_in)
-        conv = m.solve_tool(tol=1e-9, max_iter=2000, backtracking_gamma=1.2)
-        assert conv
-        assert "degeneracy-reduced" not in m.sol.message
-
-
+        for kw in ({"variant": "gauss-seidel"}, {"backend": "numba"}, {"reduce_degeneracy": False}, {"backtracking_gamma": 1.2}):
+            with pytest.raises(TypeError):
+                qDECMModel(k_out, k_in, s_out, s_in).solve_tool(tol=1e-6, **kw)
 
 
 class TestZClampExposure:
@@ -547,42 +414,35 @@ class TestZClampExposure:
     a hard-coded, unreachable module constant, unlike DECM's own tunable z_clamp).
     Default 1e-8 unchanged; these tests check the plumbing, not a numerics claim."""
 
+    @staticmethod
+    def _weight_call(model, theta_topo_true, theta_weight_true, **kw):
+        return solve_fixed_point_qdecm_weight(
+            torch.tensor(theta_topo_true, dtype=torch.float64), torch.tensor(theta_weight_true, dtype=torch.float64),
+            model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-5, max_iter=5, **kw,
+        )
+
     def test_default_is_silent_and_matches_the_module_constant(self) -> None:
         import dcms.solvers.fixed_point_qdecm as fpq
         import warnings
         model, theta_topo_true, theta_weight_true = make_qdecm_model(N=6, seed=0)
-        res_weight = lambda tb: model.residual_strength(torch.tensor(theta_topo_true, dtype=torch.float64), tb)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            solve_fixed_point_qdecm(
-                res_weight, torch.tensor(theta_weight_true, dtype=torch.float64), model.s_out, model.s_in,
-                theta_topo=torch.tensor(theta_topo_true, dtype=torch.float64),
-                tol=1e-5, max_iter=5,
-            )
+            self._weight_call(model, theta_topo_true, theta_weight_true)
         assert fpq._Z_G_CLAMP == 1e-8 and fpq._Z_NEWTON_FLOOR == 1e-8
 
     def test_non_default_value_warns_reaches_the_module_constant_and_is_restored(self, monkeypatch) -> None:
         import dcms.solvers.fixed_point_qdecm as fpq
         model, theta_topo_true, theta_weight_true = make_qdecm_model(N=6, seed=0)
         seen = []
+        step = fpq._qdecm_step_dense_weighted
 
-        def make_spy(step):
-            def spy(*a, **k):
-                seen.append((fpq._Z_G_CLAMP, fpq._Z_NEWTON_FLOOR))
-                return step(*a, **k)
-            return spy
+        def spy(*a, **k):
+            seen.append((fpq._Z_G_CLAMP, fpq._Z_NEWTON_FLOOR))
+            return step(*a, **k)
 
-        for name in ("_fp_step_dense", "_fp_step_chunked", "_theta_newton_step_dense",
-                     "_theta_newton_step_chunked", "_qdecm_step_dense_weighted"):
-            monkeypatch.setattr(fpq, name, make_spy(getattr(fpq, name)))
-        res_weight = lambda tb: model.residual_strength(torch.tensor(theta_topo_true, dtype=torch.float64), tb)
-
+        monkeypatch.setattr(fpq, "_qdecm_step_dense_weighted", spy)
         with pytest.warns(UserWarning, match="z_clamp"):
-            solve_fixed_point_qdecm(
-                res_weight, torch.tensor(theta_weight_true, dtype=torch.float64), model.s_out, model.s_in,
-                theta_topo=torch.tensor(theta_topo_true, dtype=torch.float64),
-                tol=1e-5, max_iter=5, z_clamp=1e-3,
-            )
+            self._weight_call(model, theta_topo_true, theta_weight_true, z_clamp=1e-3)
         assert seen and all(v == (1e-3, 1e-3) for v in seen)       # in force during the call
         assert fpq._Z_G_CLAMP == 1e-8 and fpq._Z_NEWTON_FLOOR == 1e-8   # restored afterwards
 
@@ -590,5 +450,5 @@ class TestZClampExposure:
         import dcms.solvers.fixed_point_qdecm as fpq
         model, _, _ = make_qdecm_model(N=6, seed=0)
         with pytest.warns(UserWarning, match="z_clamp"):
-            model.solve_tool(tol=1e-3, max_iter=5, z_clamp=1e-4, reduce_degeneracy=False)
+            model.solve_tool(tol=1e-3, max_iter=5, z_clamp=1e-4)
         assert fpq._Z_G_CLAMP == 1e-8   # restored after the call

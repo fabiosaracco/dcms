@@ -44,7 +44,7 @@ def test_solves_on_device_in_float32_and_returns_cpu_float64(name, device):
 
 
 @pytest.mark.parametrize("name", ["DCM", "DWCM", "qDECM", "DECM"])
-def test_non_cpu_device_requires_the_reduced_path(name):
-    """No device is needed: the request itself must raise, not be ignored."""
-    with pytest.raises(NotImplementedError):
+def test_the_unreduced_system_no_longer_exists(name):
+    """Every device runs the reduced system only; the old switch is gone, so asking for it is an error, not a silent CPU run."""
+    with pytest.raises(TypeError):
         _models()[name]().solve_tool(tol=1e-4, device="mps", reduce_degeneracy=False)

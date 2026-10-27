@@ -732,10 +732,8 @@ class qDECMModel:
             self.ic_topo = self.initial_theta_topo(ic_topo)
         else:
             self.ic_topo = _torch.as_tensor(ic_topo, dtype=_torch.float64)
-        # note: as the topology always work, using a better precision on th esolution may help the convergence of the weights
-        topo_tol_help=10**-3
         from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-        _sol_topo = solve_fixed_point_dcm(self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, device=device)
+        _sol_topo = solve_fixed_point_dcm(self.ic_topo, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, device=device)
 
         if len(_sol_topo.message)>0:
             print(f'Topology: {_sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True

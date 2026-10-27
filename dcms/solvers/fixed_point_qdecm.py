@@ -783,7 +783,7 @@ def solve_fixed_point_qdecm(
         k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
         tol: Convergence tolerance for the weight step (and, since the
             topology step feeds it, indirectly for topology too via
-            solve_fixed_point_dcm_degenerate's own tol which is set equal).
+            solve_fixed_point_dcm's own tol, which is set equal).
         max_iter: Max iterations for the weight step.
         topo_max_iter: Max iterations for the topology (DCM) step.
         anderson_depth, max_step, max_time, verbose, monitor, device: as in
@@ -811,10 +811,9 @@ def solve_fixed_point_qdecm(
     # qDECMModel.solve_tool's established practice): better topology
     # precision helps the weight step converge, since p_ij feeds into it
     # as a fixed input.
-    _topo_tol_help = 1e-3   # TEMPORARY: removed after the refactor is verified bit-identical
     topo_res = solve_fixed_point_dcm(
         theta_topo0, k_out, k_in,
-        tol=tol * _topo_tol_help, max_iter=topo_max_iter, anderson_depth=anderson_depth,
+        tol=tol, max_iter=topo_max_iter, anderson_depth=anderson_depth,
         max_step=max_step, max_time=max_time, verbose=verbose, monitor=monitor,
         device=device,
     )
@@ -926,8 +925,9 @@ def solve_fixed_point_qdecm_weight(
     theta_topo_out_g = theta_topo[:N][_first_idx]
     theta_topo_in_g = theta_topo[N:][_first_idx]
     log_xy_g = -theta_topo_out_g[:, None] - theta_topo_in_g[None, :]
+    # The diagonal is the REAL probability between two distinct members of the same group: the weighted step counts it
+    # (mult_g - 1) times ("weighted sum minus one diagonal term"); zeroing it dropped all within-group pairs.
     P_g = torch.sigmoid(log_xy_g)
-    P_g.fill_diagonal_(0.0)
 
     theta_weight0_g = torch.cat(
         [theta_weight0[:N][_first_idx], theta_weight0[N:][_first_idx]]

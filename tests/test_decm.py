@@ -439,12 +439,10 @@ class TestDECMSolverConvergence:
         )
 
     def test_solve_fixed_point_decm_directly(self):
-        """Test the low-level solve_fixed_point_decm function."""
-        N = 6
-        model, theta_true = make_decm_model(N=N, seed=5)
+        """Test the public solve_fixed_point_decm function (reduced system, per-node input and output)."""
+        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_decm(
-            residual_fn=model.residual,
             theta0=theta0,
             k_out=model.k_out,
             k_in=model.k_in,
@@ -454,14 +452,10 @@ class TestDECMSolverConvergence:
             max_iter=5000,
             anderson_depth=10,
         )
-        # make_decm_model generates fractional targets (0.003–0.17), which make
-        # relative convergence harder than for integer-degree networks. Check
-        # that the solver found a reasonable solution via MRE rather than the
-        # implementation-specific convergence flag.
-        mre = model.max_relative_error(result.best_theta)
-        assert mre < 0.05, (
-            f"DECM solver (N={N}, seed=5): MRE={mre:.3e} — solver did not find a good solution"
-        )
+        assert result.converged, result.message
+        assert "degeneracy-reduced" in result.message
+        assert result.best_theta.shape == (4 * model.N,)
+        assert model.max_relative_error(result.best_theta) < CONV_TOL * 10
 
     def test_result_has_correct_fields(self):
         """SolverResult attributes should have all expected fields after solve_tool."""
@@ -486,31 +480,22 @@ class TestDECMSolverConvergence:
         err = model.constraint_error(model.sol.best_theta)
         assert err < 1.0  # sanity check: not wildly wrong
 
-    def test_solve_tool_reduce_degeneracy_default_true(self):
-        """solve_tool() must use the reduced path by default (message tags
-        it) and reduce_degeneracy=False must still converge to the same
-        solution."""
+    def test_solve_tool_uses_the_reduced_system(self):
+        """solve_tool() solves the degeneracy-reduced system (the message tags it) and the expanded solution satisfies the
+        original per-node equations."""
         model, _ = make_decm_model(N=10, seed=0)
         m1 = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
         conv1 = m1.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10)
         assert conv1
         assert "degeneracy-reduced" in m1.sol.message
-
-        m2 = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
-        conv2 = m2.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10, reduce_degeneracy=False)
-        assert conv2
-        assert "degeneracy-reduced" not in m2.sol.message
-
         assert m1.constraint_error(m1.sol.best_theta) < CONV_TOL * 10
-        assert m2.constraint_error(m2.sol.best_theta) < CONV_TOL * 10
 
-    def test_solve_tool_falls_back_for_backtracking_gamma(self):
-        """reduce_degeneracy=True with backtracking_gamma>0 must fall back
-        to the full solver (not supported in the reduced path)."""
+    def test_removed_options_are_rejected(self):
+        """The per-node solver, the numba backend and backtracking no longer exist: asking for them is an error."""
         model, _ = make_decm_model(N=10, seed=0)
-        m = DECMModel(model.k_out, model.k_in, model.s_out, model.s_in)
-        conv = m.solve_tool(ic="degrees", tol=CONV_TOL, max_iter=5000, anderson_depth=10, backtracking_gamma=1.2)
-        assert conv
+        for kw in ({"variant": "theta-newton"}, {"backend": "numba"}, {"reduce_degeneracy": False}, {"backtracking_gamma": 1.2}):
+            with pytest.raises(TypeError):
+                DECMModel(model.k_out, model.k_in, model.s_out, model.s_in).solve_tool(ic="degrees", tol=CONV_TOL, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +505,7 @@ class TestDECMSolverConvergence:
 from dcms.solvers.fixed_point_decm import (  # noqa: E402
     _decm_step_chunked_weighted,
     _decm_step_dense_weighted,
-    solve_fixed_point_decm_degenerate,
+    solve_fixed_point_decm,
 )
 
 
@@ -591,7 +576,7 @@ class TestHubOutFreezeInStep:
     def test_hub_solver_still_converges_with_freeze(self) -> None:
         model, theta_true = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
-        result = solve_fixed_point_decm_degenerate(
+        result = solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=1e-8, max_iter=4000, hub_sk_threshold=0.25,   # s/k > 0.25: 6 out-hubs, 3 in-hubs
         )
@@ -605,11 +590,11 @@ class TestDiagStateCallback:
         theta0 = model.initial_theta("degrees")
         seen = []
         kw = dict(tol=1e-12, max_iter=5)
-        res_hook = solve_fixed_point_decm_degenerate(
+        res_hook = solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             diag_state_callback=lambda n, th, F: seen.append((n, tuple(th.shape), tuple(F.shape))), **kw,
         )
-        res_plain = solve_fixed_point_decm_degenerate(
+        res_plain = solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in, **kw,
         )
         assert [s[0] for s in seen] == list(range(len(seen))) and len(seen) == 5
@@ -640,7 +625,7 @@ class TestResumeKeepsNegativeHubEta:
 
     def _iter0_mre(self, model, theta0, **kw):
         seen = []
-        solve_fixed_point_decm_degenerate(
+        solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=1e-15, max_iter=1, hub_sk_threshold=self.THR,
             diag_callback=lambda n, a, r: seen.append(r), diag_every=1, **kw,
@@ -740,7 +725,7 @@ class TestAdaptiveHubSweeps:
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
         for sweeps in (3, 50):
-            res = solve_fixed_point_decm_degenerate(
+            res = solve_fixed_point_decm(
                 theta0, model.k_out, model.k_in, model.s_out, model.s_in,
                 tol=1e-8, max_iter=4000, hub_sk_threshold=0.25, hub_bisect_max_sweeps=sweeps,
             )
@@ -801,7 +786,7 @@ class TestTheta0PairFloor:
         theta0 = torch.as_tensor(theta_true, dtype=torch.float64).clone()
         theta0[3 * N + 0] = -5.0                     # eta_in of node 0 far below every eta_out: pair sums < 0
         assert _min_pair_z(theta0[2 * N:3 * N], theta0[3 * N:], None) < 0.0
-        res = solve_fixed_point_decm_degenerate(
+        res = solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-15, max_iter=1,
         )
         th = torch.as_tensor(res.theta, dtype=torch.float64)
@@ -815,7 +800,7 @@ class TestPatienceRelTol:
     def _run(self, capsys, **kw):
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
-        solve_fixed_point_decm_degenerate(
+        solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=1e-30, max_iter=30, patience=4, verbose=True, **kw,
         )
@@ -825,8 +810,8 @@ class TestPatienceRelTol:
     def test_default_is_unchanged(self, capsys) -> None:
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
-        a = solve_fixed_point_decm_degenerate(theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-12, max_iter=200)
-        b = solve_fixed_point_decm_degenerate(theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-12, max_iter=200,
+        a = solve_fixed_point_decm(theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-12, max_iter=200)
+        b = solve_fixed_point_decm(theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-12, max_iter=200,
                                               patience_rel_tol=0.0)
         assert np.array_equal(a.theta, b.theta) and a.iterations == b.iterations
 
@@ -840,7 +825,7 @@ class TestPatienceRelTol:
         # even when stalls (and perturbed restarts) fire constantly, best_theta must stay the true minimum of the run
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
-        res = solve_fixed_point_decm_degenerate(
+        res = solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in, tol=1e-30, max_iter=60, patience=4, patience_rel_tol=0.5,
         )
         assert res.best_mre == pytest.approx(min(res.residuals))
@@ -946,14 +931,14 @@ class TestBlockNewton:
             assert float(((d_step - d_fd).abs() / d_fd.abs().clamp(min=1e-9)).max()) < 1e-4
 
     def test_gate_solves_a_saturated_problem_the_scalar_step_cannot(self) -> None:
-        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
         theta_true, ko, ki, so, si, mult, zs, M = self._solution_problem(M=40, eta_lo=4.0, eta_hi=7.0, seed=3, mult_max=1)   # all nodes distinct: the solver's own grouping has mult=1
         assert float((so / ko).max()) < 1.001                                            # really saturated
         th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
         th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
-        kw = dict(tol=1e-9, max_iter=200, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, num_threads=1)
-        blk = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, block_newton_gate=0.05, stall_block_newton_off_mre=0.0, **kw)
-        sca = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)
+        kw = dict(tol=1e-9, max_iter=200, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False)
+        blk = solve_fixed_point_decm(th0.clone(), ko, ki, so, si, block_newton_gate=0.05, stall_block_newton_off_mre=0.0, **kw)
+        sca = solve_fixed_point_decm(th0.clone(), ko, ki, so, si, **kw)
         assert blk.converged and blk.iterations < 50
         assert not sca.converged and min(sca.residuals) > 1e-3
 
@@ -970,10 +955,10 @@ class TestBlowupGuardDepthOne:
 
     @staticmethod
     def _run(depth, capsys, **kw):
-        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
         th0, ko, ki, so, si = TestBlowupGuardDepthOne._problem(TestBlowupGuardDepthOne)
-        res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=60, anderson_depth=depth, hub_sk_threshold=0.0,
-                                                patience=10**6, blowup_factor=1.05, verbose=True, num_threads=1, **kw)
+        res = solve_fixed_point_decm(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=60, anderson_depth=depth, hub_sk_threshold=0.0,
+                                                patience=10**6, blowup_factor=1.05, verbose=True, **kw)
         return res, capsys.readouterr().out
 
     def test_depth_one_has_the_guard(self, capsys) -> None:
@@ -986,10 +971,10 @@ class TestBlowupGuardDepthOne:
         assert "[blowup]" in out
 
     def test_depth_one_default_threshold_does_not_fire_on_a_healthy_run(self) -> None:
-        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
         th0, ko, ki, so, si = self._problem()
-        res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=30, anderson_depth=1, hub_sk_threshold=0.0,
-                                                patience=10**6, block_newton_gate=0.05, stall_block_newton_off_mre=0.0, verbose=False, num_threads=1)
+        res = solve_fixed_point_decm(th0.clone(), ko, ki, so, si, tol=1e-9, max_iter=30, anderson_depth=1, hub_sk_threshold=0.0,
+                                                patience=10**6, block_newton_gate=0.05, stall_block_newton_off_mre=0.0, verbose=False)
         assert res.converged and res.iterations < 30          # the guard (default scale-adaptive factor) must not disturb a converging depth-1 run
 
 
@@ -1020,12 +1005,12 @@ class TestBlockNewtonMinRel:
             assert float((act[0] - base[0]).abs().max()) > 1e-9                          # and without the restriction the joint step really differs
 
     def test_solver_default_min_rel_still_converges_the_saturated_problem(self) -> None:
-        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm_degenerate
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
         theta_true, ko, ki, so, si, mult, zs, M = TestBlockNewton._solution_problem(M=40, eta_lo=4.0, eta_hi=7.0, seed=3, mult_max=1)
         th0 = theta_true + 0.3 * torch.randn(4 * M, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
         th0[2 * M:] = th0[2 * M:].clamp(min=1.0)
-        kw = dict(tol=1e-6, max_iter=100, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, num_threads=1, block_newton_gate=0.05)
-        res = solve_fixed_point_decm_degenerate(th0.clone(), ko, ki, so, si, **kw)       # block_newton_min_rel=None -> 0.1 * tol
+        kw = dict(tol=1e-6, max_iter=100, anderson_depth=1, hub_sk_threshold=0.0, patience=10**6, verbose=False, block_newton_gate=0.05)
+        res = solve_fixed_point_decm(th0.clone(), ko, ki, so, si, **kw)       # block_newton_min_rel=None -> 0.1 * tol
         assert res.converged and res.iterations < 50
 
 
@@ -1122,10 +1107,10 @@ class TestHubRootMethodIllinois:
 
     def test_solver_converges_with_illinois_and_default_is_bisect(self) -> None:
         import inspect
-        assert inspect.signature(solve_fixed_point_decm_degenerate).parameters["hub_root_method"].default == "bisect"
+        assert inspect.signature(solve_fixed_point_decm).parameters["hub_root_method"].default == "bisect"
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
-        result = solve_fixed_point_decm_degenerate(
+        result = solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=1e-8, max_iter=4000, hub_sk_threshold=0.25, hub_root_method="illinois",
         )
@@ -1140,7 +1125,7 @@ class TestStallBlockNewtonTier:
     def _run(capsys, **kw):
         model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
         theta0 = model.initial_theta("degrees")
-        solve_fixed_point_decm_degenerate(
+        solve_fixed_point_decm(
             theta0, model.k_out, model.k_in, model.s_out, model.s_in,
             tol=1e-300, max_iter=200, patience=4, patience_rel_tol=0.5, verbose=True, seed=0, **kw,
         )
@@ -1174,14 +1159,6 @@ class TestStallBlockNewtonTier:
         out = self._run(capsys, stall_block_newton_gate=0.05, stall_block_newton_revert=False)
         assert "block-Newton OFF (no significant record" not in out
 
-    def test_requires_degenerate_path(self) -> None:
-        model, _ = make_decm_model_degenerate(N0=6, r=3, seed=3)
-        with pytest.raises(ValueError):
-            solve_fixed_point_decm(
-                lambda th: th, model.initial_theta("degrees"), model.k_out, model.k_in, model.s_out, model.s_in,
-                tol=1e-8, max_iter=5, stall_block_newton_gate=0.05,
-            )
-
 
 class TestCheckpointOnRestart:
     """`checkpoint_dir` / `checkpoint_fn`: the best_theta the restarts return to is saved (N-node layout), nothing changes otherwise."""
@@ -1202,8 +1179,3 @@ class TestCheckpointOnRestart:
         m2.solve_tool(ic="degrees", multi_start=False, **kw)
         assert m1.sol.mre == m2.sol.mre and m1.sol.iterations == m2.sol.iterations
 
-
-def test_non_cpu_device_without_reduction_raises_instead_of_being_ignored() -> None:
-    model, _ = make_decm_model(N=8, seed=1)
-    with pytest.raises(NotImplementedError):
-        model.solve_tool(tol=1e-6, device="mps", reduce_degeneracy=False)

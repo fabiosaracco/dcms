@@ -303,12 +303,12 @@ class TestZeroStrengthBehavior:
 
 class TestFixedPointDWCM:
     @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
-    def test_gauss_seidel_converges(self, N: int, seed: int) -> None:
+    def test_converges(self, N: int, seed: int) -> None:
         model, _ = make_dwcm_model(N=N, seed=seed)
         theta0 = model.initial_theta("strengths")
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-10, max_iter=5000, damping=1.0, variant="gauss-seidel",
+            theta0, model.s_out, model.s_in,
+            tol=1e-10, max_iter=5000,
         )
         err = model.constraint_error(result.best_theta)
         assert err < CONV_TOL, f"N={N} GS error={err:.3e}"
@@ -317,31 +317,15 @@ class TestFixedPointDWCM:
         model, _ = make_dwcm_model(N=4, seed=0)
         theta0 = model.initial_theta("strengths")
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in, max_iter=20,
+            theta0, model.s_out, model.s_in, max_iter=20,
         )
         assert len(result.residuals) > 0
-
-    def test_invalid_variant_raises(self) -> None:
-        model, _ = make_dwcm_model(N=4)
-        theta0 = model.initial_theta()
-        with pytest.raises(ValueError):
-            solve_fixed_point_dwcm(
-                model.residual, theta0, model.s_out, model.s_in, variant="bad"
-            )
-
-    def test_invalid_damping_raises(self) -> None:
-        model, _ = make_dwcm_model(N=4)
-        theta0 = model.initial_theta()
-        with pytest.raises(ValueError):
-            solve_fixed_point_dwcm(
-                model.residual, theta0, model.s_out, model.s_in, damping=0.0
-            )
 
     def test_elapsed_time_positive(self) -> None:
         model, _ = make_dwcm_model(N=4)
         theta0 = model.initial_theta()
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in, max_iter=5,
+            theta0, model.s_out, model.s_in, max_iter=5,
         )
         assert result.elapsed_time >= 0.0
 
@@ -349,37 +333,13 @@ class TestFixedPointDWCM:
         model, _ = make_dwcm_model(N=4)
         theta0 = model.initial_theta()
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in, max_iter=5,
+            theta0, model.s_out, model.s_in, max_iter=5,
         )
         assert result.peak_ram_bytes >= 0
 
-    def test_chunked_step_matches_dense_step(self) -> None:
-        """Chunked fixed-point step must produce the same result as the dense path."""
-        from dcms.solvers.fixed_point_dwcm import _fp_step_chunked_dwcm
-        model, theta = make_dwcm_model(N=8)
-        theta_t = torch.tensor(theta, dtype=torch.float64)
-        N = model.N
-        beta_out = torch.exp(-theta_t[:N])
-        beta_in = torch.exp(-theta_t[N:])
-
-        # Dense path (using DWCMModel internals)
-        xy = beta_out[:, None] * beta_in[None, :]
-        denom = (1.0 - xy).clamp(min=1e-15)
-        D_out_mat = beta_in[None, :] / denom
-        D_out_mat.fill_diagonal_(0.0)
-        D_out = D_out_mat.sum(dim=1)
-        beta_out_new_dense = torch.where(D_out > 0, model.s_out / D_out, beta_out)
-
-        beta_out_new_chunked, _, _ = _fp_step_chunked_dwcm(
-            beta_out, beta_in, model.s_out, model.s_in, chunk_size=3
-        )
-        assert torch.allclose(beta_out_new_dense, beta_out_new_chunked, atol=1e-13), (
-            f"Max diff: {(beta_out_new_dense - beta_out_new_chunked).abs().max().item():.3e}"
-        )
-
 
 class TestThetaNewtonDWCM:
-    """Tests for the theta-newton variant of solve_fixed_point_dwcm."""
+    """Tests of the theta-Newton iteration of solve_fixed_point_dwcm."""
 
     @pytest.mark.parametrize("N,seed", [(4, 0), (10, 1)])
     def test_converges(self, N: int, seed: int) -> None:
@@ -387,8 +347,8 @@ class TestThetaNewtonDWCM:
         model, _ = make_dwcm_model(N=N, seed=seed)
         theta0 = model.initial_theta("strengths")
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-10, max_iter=5000, variant="theta-newton", max_step=1.0,
+            theta0, model.s_out, model.s_in,
+            tol=1e-10, max_iter=5000, max_step=1.0,
         )
         err = model.constraint_error(result.best_theta)
         assert err < CONV_TOL, f"N={N} theta-newton error={err:.3e}"
@@ -399,8 +359,8 @@ class TestThetaNewtonDWCM:
         model, _ = make_dwcm_model(N=N, seed=seed)
         theta0 = model.initial_theta("strengths")
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-10, max_iter=5000, variant="theta-newton",
+            theta0, model.s_out, model.s_in,
+            tol=1e-10, max_iter=5000,
             max_step=1.0, anderson_depth=10,
         )
         err = model.constraint_error(result.best_theta)
@@ -425,8 +385,8 @@ class TestThetaNewtonDWCM:
         model = DWCMModel(s_out, s_in)
         theta0 = model.initial_theta("strengths")
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-8, max_iter=200, variant="theta-newton", max_step=1.0,
+            theta0, model.s_out, model.s_in,
+            tol=1e-8, max_iter=200, max_step=1.0,
         )
         theta_arr = result.best_theta
         assert theta_arr[0] == pytest.approx(_ETA_MAX, abs=1e-12), \
@@ -434,30 +394,13 @@ class TestThetaNewtonDWCM:
         assert theta_arr[N + N - 1] == pytest.approx(_ETA_MAX, abs=1e-12), \
             f"Zero s_in node θ_in[N-1] should be _ETA_MAX, got {theta_arr[N + N - 1]}"
 
-    def test_chunked_matches_dense(self) -> None:
-        """Chunked theta-newton step must give the same result as the dense path."""
-        from dcms.solvers.fixed_point_dwcm import (
-            _theta_newton_step_dense, _theta_newton_step_chunked,
-        )
-        model, theta_np = make_dwcm_model(N=8, seed=5)
-        theta_t = torch.tensor(theta_np, dtype=torch.float64)
-        dense, F_dense = _theta_newton_step_dense(theta_t, model.s_out, model.s_in, max_step=1.0)
-        chunked, F_chunked = _theta_newton_step_chunked(theta_t, model.s_out, model.s_in,
-                                             chunk_size=3, max_step=1.0)
-        assert torch.allclose(dense, chunked, atol=1e-13), (
-            f"Max diff dense vs chunked: {(dense - chunked).abs().max().item():.3e}"
-        )
-        assert torch.allclose(F_dense, F_chunked, atol=1e-13), (
-            f"Max diff F dense vs chunked: {(F_dense - F_chunked).abs().max().item():.3e}"
-        )
-
     def test_result_fields(self) -> None:
         """SolverResult must have positive elapsed_time and non-negative peak_ram."""
         model, _ = make_dwcm_model(N=4, seed=0)
         theta0 = model.initial_theta("strengths")
         result = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-8, max_iter=10, variant="theta-newton", max_step=1.0,
+            theta0, model.s_out, model.s_in,
+            tol=1e-8, max_iter=10, max_step=1.0,
         )
         assert result.elapsed_time >= 0.0
         assert result.peak_ram_bytes >= 0
@@ -490,104 +433,51 @@ class TestDegeneracyReduction:
         assert torch.allclose(s_out_g[group_of], model.s_out)
         assert torch.allclose(s_in_g[group_of], model.s_in)
 
-    def test_reduced_matches_full_solver(self) -> None:
-        """Reduced and full solvers must agree on the expected-weight matrix
-        (gauge-invariant quantity) to near machine precision once converged."""
-        from dcms.solvers.fixed_point_dwcm import (
-            solve_fixed_point_dwcm,
-            solve_fixed_point_dwcm_degenerate,
-        )
+    def test_expanded_solution_solves_the_per_node_system(self) -> None:
+        """The reduced solution, expanded to the N nodes, must satisfy the ORIGINAL per-node strength equations (the reduction is
+        exact, not an approximation) and be constant within every degeneracy group."""
+        from dcms.solvers.fixed_point_dwcm import compute_degeneracy_groups_dwcm, solve_fixed_point_dwcm
         model = self._degenerate_model()
-        theta0 = model.initial_theta("strengths")
-
-        res_full = solve_fixed_point_dwcm(
-            model.residual, theta0, model.s_out, model.s_in,
-            tol=1e-11, max_iter=3000, variant="theta-newton",
-            anderson_depth=10, backend="pytorch",
-        )
-        res_red = solve_fixed_point_dwcm_degenerate(
-            theta0, model.s_out, model.s_in,
-            tol=1e-11, max_iter=3000, anderson_depth=10, backend="pytorch",
-        )
-        assert res_full.converged, f"full solver did not converge: mre={res_full.mre:.3e}"
-        assert res_red.converged, f"reduced solver did not converge: mre={res_red.mre:.3e}"
-
+        res = solve_fixed_point_dwcm(model.initial_theta("strengths"), model.s_out, model.s_in, tol=1e-11, max_iter=3000, anderson_depth=10)
+        assert res.converged, f"reduced solver did not converge: {res.message}"
+        assert "degeneracy-reduced" in res.message
+        assert model.max_relative_error(torch.as_tensor(res.best_theta)) < 1e-9
         N = model.N
-        to_f, ti_f = res_full.best_theta[:N], res_full.best_theta[N:]
-        to_r, ti_r = res_red.best_theta[:N], res_red.best_theta[N:]
-        z_f = to_f[:, None] + ti_f[None, :]
-        z_r = to_r[:, None] + ti_r[None, :]
-        W_f = 1.0 / np.expm1(np.clip(z_f, 1e-15, None))
-        W_r = 1.0 / np.expm1(np.clip(z_r, 1e-15, None))
-        np.fill_diagonal(W_f, 0.0)
-        np.fill_diagonal(W_r, 0.0)
-        max_diff = np.max(np.abs(W_f - W_r))
-        assert max_diff < 1e-6, f"W-matrix mismatch full vs reduced: {max_diff:.3e}"
+        group_of, _, _, _ = compute_degeneracy_groups_dwcm(model.s_out, model.s_in)
+        for g in range(int(group_of.max()) + 1):
+            idx = np.flatnonzero(group_of.numpy() == g)
+            assert np.ptp(res.best_theta[:N][idx]) == 0.0 and np.ptp(res.best_theta[N:][idx]) == 0.0
 
-    def test_reduced_faster_with_heavy_degeneracy(self) -> None:
-        """Reduced solver must be meaningfully faster when M << N."""
-        import time
-        g = torch.Generator().manual_seed(0)
-        N = 1500
-        adj = (torch.rand(N, N, generator=g) < 0.01).double() * (
-            torch.randint(1, 5, (N, N), generator=g).double()
-        )
-        adj.fill_diagonal_(0.0)
-        s_out = adj.sum(dim=1)
-        s_in = adj.sum(dim=0)
-        model = DWCMModel(s_out, s_in)
+    def test_agrees_with_an_independent_root_finder(self) -> None:
+        """Check against scipy.optimize.root on the full per-node residual of a small problem: same weight matrix."""
+        from scipy.optimize import root
+        from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
+        model, _ = make_dwcm_model(N=12, seed=4)
+        res = solve_fixed_point_dwcm(model.initial_theta("strengths"), model.s_out, model.s_in, tol=1e-12, max_iter=5000, anderson_depth=10)
+        assert res.converged
+        sol = root(lambda t: model.residual(torch.as_tensor(t)).numpy(), res.best_theta * 1.02, method="lm", tol=1e-14)
+        N = model.N
 
-        from dcms.solvers.fixed_point_dwcm import (
-            solve_fixed_point_dwcm,
-            solve_fixed_point_dwcm_degenerate,
-            compute_degeneracy_groups_dwcm,
-        )
-        _, _, s_out_g, _ = compute_degeneracy_groups_dwcm(s_out, s_in)
-        theta0 = model.initial_theta("strengths")
+        def W(theta):
+            W_ = 1.0 / np.expm1(np.clip(theta[:N, None] + theta[None, N:], 1e-15, None))
+            np.fill_diagonal(W_, 0.0)
+            return W_
 
-        def best_of_three(fn) -> float:     # wall-clock tests flake under load: compare the fastest of three runs
-            ts = []
-            for _ in range(3):
-                t0 = time.perf_counter()
-                fn()
-                ts.append(time.perf_counter() - t0)
-            return min(ts)
+        assert np.max(np.abs(W(res.best_theta) - W(sol.x))) < 1e-6
 
-        t_full = best_of_three(lambda: solve_fixed_point_dwcm(
-            model.residual, theta0, s_out, s_in,
-            tol=1e-11, max_iter=200, variant="theta-newton",
-            anderson_depth=10, backend="pytorch",
-        ))
-        t_red = best_of_three(lambda: solve_fixed_point_dwcm_degenerate(
-            theta0, s_out, s_in,
-            tol=1e-11, max_iter=200, anderson_depth=10, backend="pytorch",
-        ))
-
-        assert t_red < 0.9 * t_full, (
-            f"reduced (M={len(s_out_g)}) should be faster than "
-            f"full (N={len(s_out)}): reduced={t_red:.3f}s, full={t_full:.3f}s"
-        )
-
-    def test_solve_tool_reduce_degeneracy_default_true(self) -> None:
-        """solve_tool() must use the reduced path by default and agree with
-        reduce_degeneracy=False."""
+    def test_solve_tool_uses_the_reduced_system(self) -> None:
         model = self._degenerate_model()
         m1 = DWCMModel(model.s_out, model.s_in)
         conv1 = m1.solve_tool(tol=1e-9, max_iter=2000)
         assert conv1 and "degeneracy-reduced" in m1.sol.message
+        assert m1.max_relative_error(torch.as_tensor(m1.sol.best_theta)) < 1e-8
 
-        m2 = DWCMModel(model.s_out, model.s_in)
-        conv2 = m2.solve_tool(tol=1e-9, max_iter=2000, reduce_degeneracy=False)
-        assert conv2 and "degeneracy-reduced" not in m2.sol.message
-
-        N = model.N
-        z1 = m1.sol.best_theta[:N, None] + m1.sol.best_theta[None, N:]
-        z2 = m2.sol.best_theta[:N, None] + m2.sol.best_theta[None, N:]
-        W1 = 1.0 / np.expm1(np.clip(z1, 1e-15, None))
-        W2 = 1.0 / np.expm1(np.clip(z2, 1e-15, None))
-        np.fill_diagonal(W1, 0.0)
-        np.fill_diagonal(W2, 0.0)
-        assert np.max(np.abs(W1 - W2)) < 1e-4
+    def test_removed_options_are_rejected(self) -> None:
+        """The per-node solver, Gauss-Seidel and the numba backend no longer exist: asking for them is an error."""
+        model = self._degenerate_model()
+        for kw in ({"variant": "gauss-seidel"}, {"backend": "numba"}, {"reduce_degeneracy": False}):
+            with pytest.raises(TypeError):
+                DWCMModel(model.s_out, model.s_in).solve_tool(tol=1e-6, **kw)
 
 
 class TestFpgsNewtonMiniLoopGuard:
@@ -630,7 +520,7 @@ class TestFpgsNewtonMiniLoopGuard:
             torch.set_num_threads(2)
             converged = model.solve_tool(
                 ic="strengths", tol=1e-5, max_iter=500, max_time=300,
-                anderson_depth=10, backend="pytorch", num_threads=2,
+                anderson_depth=10,
             )
         finally:
             torch.set_num_threads(prev_threads)
@@ -644,7 +534,7 @@ class TestFpgsNewtonMiniLoopGuard:
         long enough to fire the mini-loop at all."""
         model, _ = make_dwcm_model(N=10, seed=1)
         converged = model.solve_tool(
-            ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10, backend="pytorch",
+            ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10,
         )
         assert converged
 
@@ -703,7 +593,7 @@ class TestFpgsNewtonMiniLoopRetryLadder:
         never fires the mini-loop at all (same network as TestFpgsNewtonMiniLoopGuard's twin)."""
         model, _ = make_dwcm_model(N=10, seed=1)
         converged = model.solve_tool(
-            ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10, backend="pytorch",
+            ic="strengths", tol=CONV_TOL, max_iter=2000, anderson_depth=10,
         )
         assert converged
 
@@ -722,7 +612,7 @@ class TestFpgsNewtonMiniLoopRetryLadder:
             torch.set_num_threads(2)
             converged = model.solve_tool(
                 ic="strengths", tol=1e-5, max_iter=500, max_time=300,
-                anderson_depth=10, backend="pytorch", num_threads=2,
+                anderson_depth=10,
             )
         finally:
             torch.set_num_threads(prev_threads)
@@ -737,11 +627,6 @@ class TestSolveToolSeedAndDevice:
         model2, _ = make_dwcm_model(N=6, seed=1)
         model2.solve_tool(tol=1e-8, max_iter=500, seed=3)
         assert np.array_equal(theta, np.array(model2.sol.best_theta))
-
-    def test_non_cpu_device_without_reduction_raises_instead_of_being_ignored(self) -> None:
-        model, _ = make_dwcm_model(N=6, seed=1)
-        with pytest.raises(NotImplementedError):
-            model.solve_tool(tol=1e-6, device="mps", reduce_degeneracy=False)
 
 
 class TestMiniLoopGiveUp:

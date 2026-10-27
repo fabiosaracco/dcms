@@ -193,8 +193,8 @@ class TestZeroDegreeBehavior:
         model = self._make_zero_degree_model()
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_dcm(
-            model.residual, theta0, model.k_out, model.k_in,
-            tol=1e-10, max_iter=5000, variant="theta-newton", anderson_depth=10,
+            theta0, model.k_out, model.k_in,
+            tol=1e-10, max_iter=5000, anderson_depth=10,
         )
         err = model.constraint_error(result.best_theta)
         assert err < 1e-5, f"θ-Newton error with zero-degree nodes: {err:.3e}"
@@ -290,8 +290,8 @@ class TestSaturatedNodeBehavior:
         model = self._make_saturated_model()
         theta0 = model.initial_theta("degrees")
         result = solve_fixed_point_dcm(
-            model.residual, theta0, model.k_out, model.k_in,
-            tol=1e-10, max_iter=5000, variant="theta-newton", anderson_depth=10,
+            theta0, model.k_out, model.k_in,
+            tol=1e-10, max_iter=5000, anderson_depth=10,
         )
         err = model.constraint_error(result.best_theta)
         assert err < 1e-5, f"θ-Newton error with saturated nodes: {err:.3e}"
@@ -335,106 +335,51 @@ class TestDegeneracyReduction:
         assert torch.allclose(k_out_g[group_of], k_out)
         assert torch.allclose(k_in_g[group_of], k_in)
 
-    def test_reduced_matches_full_solver(self) -> None:
-        """Reduced and full solvers must agree on the connection-probability
-        matrix (gauge-invariant) to near machine precision once converged."""
-        from dcms.solvers.fixed_point_dcm import (
-            solve_fixed_point_dcm,
-            solve_fixed_point_dcm_degenerate,
-        )
+    def test_expanded_solution_solves_the_per_node_system(self) -> None:
+        """The reduced solution, expanded to the N nodes, must satisfy the ORIGINAL per-node degree equations (the
+        reduction is exact, not an approximation) and be constant within every degeneracy group."""
+        from dcms.solvers.fixed_point_dcm import compute_degeneracy_groups_dcm, solve_fixed_point_dcm
         model, k_out, k_in = self._degenerate_model()
-        theta0 = model.initial_theta("degrees")
-
-        res_full = solve_fixed_point_dcm(
-            model.residual, theta0, k_out, k_in,
-            tol=1e-11, max_iter=3000, variant="theta-newton",
-            anderson_depth=10, backend="pytorch",
-        )
-        res_red = solve_fixed_point_dcm_degenerate(
-            theta0, k_out, k_in,
-            tol=1e-11, max_iter=3000, anderson_depth=10, backend="pytorch",
-        )
-        assert res_full.converged, f"full solver did not converge: mre={res_full.mre:.3e}"
-        assert res_red.converged, f"reduced solver did not converge: mre={res_red.mre:.3e}"
-
+        res = solve_fixed_point_dcm(model.initial_theta("degrees"), k_out, k_in, tol=1e-11, max_iter=3000, anderson_depth=10)
+        assert res.converged, f"reduced solver did not converge: {res.message}"
+        assert "degeneracy-reduced" in res.message
+        assert model.max_relative_error(torch.as_tensor(res.best_theta)) < 1e-9
         N = k_out.shape[0]
-        to_f, ti_f = res_full.best_theta[:N], res_full.best_theta[N:]
-        to_r, ti_r = res_red.best_theta[:N], res_red.best_theta[N:]
-        P_f = 1.0 / (1.0 + np.exp(to_f[:, None] + ti_f[None, :]))
-        P_r = 1.0 / (1.0 + np.exp(to_r[:, None] + ti_r[None, :]))
-        max_diff = np.max(np.abs(P_f - P_r))
-        assert max_diff < 1e-7, f"P-matrix mismatch full vs reduced: {max_diff:.3e}"
+        group_of, _, _, _ = compute_degeneracy_groups_dcm(k_out, k_in)
+        for g in range(int(group_of.max()) + 1):
+            idx = np.flatnonzero(group_of.numpy() == g)
+            assert np.ptp(res.best_theta[:N][idx]) == 0.0 and np.ptp(res.best_theta[N:][idx]) == 0.0
 
-    def test_reduced_faster_with_heavy_degeneracy(self) -> None:
-        """Reduced solver must be meaningfully faster when M << N.
-
-        Needs N large enough that O(N^2) vs O(M^2) pairwise compute
-        actually dominates wall time over fixed per-call overhead (a small
-        N like the correctness tests above use is too noisy for a timing
-        assertion). Real networks (see RESUME.md) show 10-35x; this just
-        checks the effect is real and directionally large, not the exact
-        ratio.
-        """
-        import time
-        g = torch.Generator().manual_seed(0)
-        N = 1500
-        adj = (torch.rand(N, N, generator=g) < 0.01).double()
+    def test_agrees_with_an_independent_root_finder(self) -> None:
+        """Gauge-invariant check against scipy on a small problem: the probability matrix of the reduced solution equals the one
+        scipy.optimize.root finds on the full per-node residual (started from the reduced solution, perturbed)."""
+        from scipy.optimize import root
+        from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
+        g = torch.Generator().manual_seed(3)
+        N = 30
+        adj = (torch.rand(N, N, generator=g) < 0.2).double()
         adj.fill_diagonal_(0.0)
-        k_out = adj.sum(dim=1)
-        k_in = adj.sum(dim=0)
+        k_out, k_in = adj.sum(1), adj.sum(0)
         model = DCMModel(k_out, k_in)
+        res = solve_fixed_point_dcm(model.initial_theta("degrees"), k_out, k_in, tol=1e-12, max_iter=3000, anderson_depth=10)
+        assert res.converged
+        sol = root(lambda t: model.residual(torch.as_tensor(t)).numpy(), res.best_theta + 0.05, method="lm", tol=1e-14)
+        P_r = 1.0 / (1.0 + np.exp(res.best_theta[:N, None] + res.best_theta[None, N:]))
+        P_s = 1.0 / (1.0 + np.exp(sol.x[:N, None] + sol.x[None, N:]))
+        np.fill_diagonal(P_r, 0.0)
+        np.fill_diagonal(P_s, 0.0)
+        assert np.max(np.abs(P_r - P_s)) < 1e-6
 
-        from dcms.solvers.fixed_point_dcm import (
-            solve_fixed_point_dcm,
-            solve_fixed_point_dcm_degenerate,
-            compute_degeneracy_groups_dcm,
-        )
-        _, _, k_out_g, _ = compute_degeneracy_groups_dcm(k_out, k_in)
-        theta0 = model.initial_theta("degrees")
-
-        t0 = time.perf_counter()
-        solve_fixed_point_dcm(
-            model.residual, theta0, k_out, k_in,
-            tol=1e-11, max_iter=200, variant="theta-newton",
-            anderson_depth=10, backend="pytorch",
-        )
-        t_full = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        solve_fixed_point_dcm_degenerate(
-            theta0, k_out, k_in,
-            tol=1e-11, max_iter=200, anderson_depth=10, backend="pytorch",
-        )
-        t_red = time.perf_counter() - t0
-
-        assert t_red < 0.7 * t_full, (
-            f"reduced (M={len(k_out_g)}) should be meaningfully faster than "
-            f"full (N={len(k_out)}): reduced={t_red:.3f}s, full={t_full:.3f}s"
-        )
-
-    def test_solve_tool_reduce_degeneracy_default_true(self) -> None:
-        """solve_tool() must use the reduced path by default and agree with
-        reduce_degeneracy=False."""
+    def test_solve_tool_uses_the_reduced_system(self) -> None:
         model, k_out, k_in = self._degenerate_model()
         m1 = DCMModel(k_out, k_in)
         conv1 = m1.solve_tool(tol=1e-9, max_iter=2000)
         assert conv1 and "degeneracy-reduced" in m1.sol.message
+        assert m1.max_relative_error(torch.as_tensor(m1.sol.best_theta)) < 1e-8
 
-        m2 = DCMModel(k_out, k_in)
-        conv2 = m2.solve_tool(tol=1e-9, max_iter=2000, reduce_degeneracy=False)
-        assert conv2 and "degeneracy-reduced" not in m2.sol.message
-
-        P1 = 1.0 / (1.0 + np.exp(m1.sol.best_theta[:len(k_out), None] + m1.sol.best_theta[None, len(k_out):]))
-        P2 = 1.0 / (1.0 + np.exp(m2.sol.best_theta[:len(k_out), None] + m2.sol.best_theta[None, len(k_out):]))
-        np.fill_diagonal(P1, 0.0)
-        np.fill_diagonal(P2, 0.0)
-        assert np.max(np.abs(P1 - P2)) < 1e-6
-
-    def test_solve_tool_falls_back_for_gauss_seidel(self) -> None:
-        """reduce_degeneracy=True with variant='gauss-seidel' must fall back
-        to the full solver (not silently ignore the requested variant)."""
+    def test_removed_options_are_rejected(self) -> None:
+        """The per-node solver, Gauss-Seidel and the numba backend no longer exist: asking for them is an error."""
         model, k_out, k_in = self._degenerate_model()
-        m = DCMModel(k_out, k_in)
-        conv = m.solve_tool(tol=1e-9, max_iter=2000, variant="gauss-seidel")
-        assert conv
-        assert "degeneracy-reduced" not in m.sol.message
+        for kw in ({"variant": "gauss-seidel"}, {"backend": "numba"}, {"reduce_degeneracy": False}):
+            with pytest.raises(TypeError):
+                DCMModel(k_out, k_in).solve_tool(tol=1e-6, **kw)

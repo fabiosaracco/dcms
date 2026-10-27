@@ -2,12 +2,7 @@
 
 This project implements numerical solvers for **maximum-entropy** (MaxEnt) models of directed networks.  Given an observed graph, the models find the probability distribution over all directed graphs that maximises entropy subject to reproducing a chosen set of topological constraints (degree and/or strength sequences).
 
-Two solvers are provided for every model, both proven to scale reliably to N = 5 000 and beyond:
-
-| Solver | Algorithm | When to prefer |
-|--------|-----------|----------------|
-| **FP-GS Anderson(10)** | Gauss-Seidel fixed-point + Anderson(10) acceleration | DWCM/qDECM where the contraction condition holds (mild heterogeneity) |
-| **θ-Newton Anderson(10)** | Coordinate-wise Newton in log-space + Anderson(10) acceleration | Default choice — most robust, fastest at large N |
+Every model is solved by the same method, a **θ-Newton iteration with Anderson(10) acceleration on the degeneracy-reduced system** (nodes with identical constraints share their parameters, so the solver works on M ≤ N groups and expands the solution back to the N nodes — §2.5). The reduction is exact, not an approximation. Earlier versions also offered a per-node solver, a Gauss-Seidel fixed-point variant, a Numba backend and a backtracking line search: they were removed on 2026-10-27 because the reduced θ-Newton solver is what every result of this project uses (see §2.4).
 
 Park, J. & Newman, M.E.J. (2004). Statistical mechanics of networks. *Physical Review E*, **70**, 066117.
 
@@ -31,12 +26,6 @@ Install from GitHub (the package is not yet on PyPI):
 
 ```bash
 pip install git+https://github.com/fabiosaracco/dcms.git
-```
-
-To include optional [Numba](https://numba.pydata.org/) support (only beneficial for very large networks, N ≳ 100 000 — see §3.9 for benchmarked RAM/speed trade-offs):
-
-```bash
-pip install "dcms[numba] @ git+https://github.com/fabiosaracco/dcms.git"
 ```
 
 **Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, NumPy ≥ 1.24, SciPy ≥ 1.10. GPU acceleration (optional, §2.7) uses whatever PyTorch backend is already installed — Apple Silicon MPS or an NVIDIA CUDA GPU — no extra package.
@@ -135,100 +124,31 @@ All solvers return a `SolverResult` dataclass with fields `theta`, `converged`, 
 
 ---
 
-### 2.1 FP-GS Anderson(10) — Gauss-Seidel Fixed-Point with Anderson Acceleration
+### 2.1 θ-Newton step
 
 #### Rationale
 
-The MaxEnt self-consistency equations can be written as a **fixed-point problem**:
+The constraints are treated directly as a **nonlinear system** `F(θ) = 0` and solved with a **coordinate-wise Newton step** in θ-space:
 
 ```
-θ_new = g(θ)
+Δθ_out_g = -F_out_g(θ) / (∂F_out_g / ∂θ_out_g)
 ```
 
-where, for a single out-multiplier of the DCM, `g` isolates the variable on one side:
+where, for the DCM, `F_out_g = k_hat_out_g - k_out_g` is the residual of the out-degree constraint of group `g`, and the denominator is the diagonal element of the Jacobian:
 
 ```
-x_i^new = k_out_i / Σ_{j≠i} y_j / (1 + x_i · y_j)   →   θ_out_i^new = -log(x_i^new)
+∂F_out_g / ∂θ_out_g = -(Σ_h m_h p_gh (1 - p_gh) - p_gg (1 - p_gg))
 ```
 
-The **Gauss-Seidel** ordering updates `θ_out` first and immediately uses the fresh values when computing `θ_in`.  This makes the effective Jacobian of the map (the **spectral radius** ρ of ∂g/∂θ) smaller than the Jacobi (simultaneous) variant, yielding faster convergence.
-
-Convergence is guaranteed when ρ < 1.  For sparse, homogeneous networks this holds comfortably.  For power-law networks with high-degree hubs, some nodes have ρ ≥ 1 and plain FP-GS stagnates; a node-level Newton fallback and the blowup-reset logic handle those cases (see Implementation details below).
-
-For the DWCM and qDECM weight step, the fixed-point map in β-space is a multiplicative scaling rule.  For the **DWCM** (where `p_ij = 1`):
-
-```
-β_out_i^new = β_out_i · s_out_i / s_out_hat_i,   s_out_hat_i = Σ_{j≠i} β_in_j / (1 - β_out_i · β_in_j)
-```
-
-For the **qDECM weight step** (conditioned DWCM with `p_ij` from the DCM):
-
-```
-β_out_i^new = β_out_i · s_out_i / s_out_hat_i,   s_out_hat_i = Σ_{j≠i} p_ij / (1 - β_out_i · β_in_j)
-```
-
-Here the spectral radius depends on the inverse of `(1 - β·β)`, which grows rapidly as `β → 1` (hub nodes with `s/k → ∞`).  This is the main failure mode of FP-GS at large N and high heterogeneity.
-
-#### Anderson Acceleration
-
-Anderson mixing (depth m = 10) transforms the plain fixed-point sequence into a quasi-Newton method by finding the linear combination of the last `m` residuals `r_k = g(θ_k) - θ_k` that minimises the mixed residual norm:
-
-```
-min_{c, Σc=1}  ‖Σ_k c_k · r_k‖²
-```
-
-The coefficients `c` are found by a small `m×m` least-squares system (O(m²) per step).  The acceleration can reduce iteration counts by 5–50× on well-conditioned problems.
-
-**Blowup protection:** if the Anderson iterate produces a residual jump > `_ANDERSON_BLOWUP_FACTOR × best_residual`, the history is cleared and the plain Newton step is used instead.  This prevents one bad linear combination from ruining the run.
-
-**Weighted mixing:** residuals are row-normalised by their component-wise maximum before solving the least-squares problem.  This prevents hub nodes (which have large absolute residuals) from dominating the mixing coefficients.
-
-#### Implementation
-
-- `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="gauss-seidel", anderson_depth=10)`
-- `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="gauss-seidel", anderson_depth=10)`
-- `dcms/solvers/fixed_point_qdecm.py` — `solve_fixed_point_qdecm(..., variant="gauss-seidel", anderson_depth=10)`
-- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (DECM only uses θ-Newton; see §2.2)
-
-All four files share the same algorithmic skeleton:
-
-1. **Dense path** (N ≤ threshold): materialise the N×N probability/weight matrix once per iteration.
-2. **Chunked path** (N > threshold): process rows in blocks of 512 to keep peak RAM at O(chunk × N) rather than O(N²).  The dense/chunked crossover threshold is **5 000** for DCM/DWCM and **2 000** for qDECM/DECM (`DCM_LARGE_N_THRESHOLD`, `DWCM_LARGE_N_THRESHOLD`, `qDECM_LARGE_N_THRESHOLD` in `dcms/models/parameters.py`).
-3. **Node-level Newton fallback**: when `|Δθ_FP| > _FP_NEWTON_FALLBACK_DELTA` for a node, replace the FP step with an exact diagonal Newton step `Δθ = -F_i / (∂F_i/∂θ_i)`.
-4. **Best-θ tracking**: the result always returns the lowest-residual iterate seen, not the final one.
-
-**Literature:**
-Walker, H.F. & Ni, P. (2011). Anderson acceleration for fixed-point iterations. *SIAM Journal on Numerical Analysis*, 49(4), 1715–1735. https://doi.org/10.1137/10078356X
-
----
-
-### 2.2 θ-Newton Anderson(10) — Coordinate Newton with Anderson Acceleration
-
-#### Rationale
-
-Instead of solving `θ = g(θ)`, the θ-Newton method treats the constraints directly as a **nonlinear system** `F(θ) = 0` and applies a **coordinate-wise Newton step**:
-
-```
-Δθ_out_i = -F_out_i(θ) / (∂F_out_i / ∂θ_out_i)
-```
-
-where `F_out_i = k_hat_out_i - k_out_i` is the residual of node `i`'s out-degree constraint, and the denominator is the diagonal element of the Jacobian:
-
-```
-∂F_out_i / ∂θ_out_i = -Σ_{j≠i} p_ij · (1 - p_ij)
-```
-
-This is equivalent to a **Gauss-Seidel Newton** step: update `θ_out_i` node by node using fresh values immediately.  The step is clipped to `[-max_step, +max_step]` in log-space to prevent large excursions near hubs.
-
-**Key advantage over FP-GS:** the step size is `O(|F_i| / Σ p(1-p))`, which naturally adapts to the curvature of the likelihood surface.  Hub nodes — where FP-GS oscillates or diverges because ρ ≥ 1 — are handled gracefully: their large residual produces a large numerator, but the large denominator (many connections) stabilises the step.
+(`m_h` = number of nodes of group `h`; "weighted sum minus one diagonal term" is the reduction of the per-node `Σ_{j≠i}`). Out-parameters are updated first and the fresh values are immediately used for the in-parameters (a Gauss-Seidel *ordering* of the Newton steps). The step is clipped to `[-max_step, +max_step]` to prevent large excursions near hubs. Because the update is additive in θ, the iteration never leaves the feasible domain (β > 1 is never produced), and hubs — whose large residual is divided by a large denominator — are handled gracefully.
 
 For the DWCM/qDECM weight step, the coordinate Newton formula becomes:
 
 ```
-Δη_out_i = (s_hat_out_i - s_out_i) / Σ_{j≠i} p_ij · G_ij · (G_ij - 1)
+Δη_out_g = (s_hat_out_g - s_out_g) / (Σ_h m_h p_gh · G_gh · (G_gh - 1) - diagonal term)
 ```
 
-where `G_ij = 1/(1 - β_i · β_j)` is the geometric-distribution correction factor and `p_ij` is the topology probability from the DCM step.  The denominator is always negative (the Jacobian diagonal is negative-definite), so the step is in the correct descent direction.
+where `G = 1/(1 - β_g β_h)` is the geometric-distribution correction factor and `p` is the topology probability from the DCM step (for the qDECM, **including its diagonal**: the probability between two distinct members of the same group). The denominator is always negative (the Jacobian diagonal is negative-definite), so the step is in the correct descent direction.
 
 For the DECM, the coupling between degree and strength equations modifies the strength Jacobian diagonal:
 
@@ -236,35 +156,52 @@ For the DECM, the coupling between degree and strength equations modifies the st
 ∂F_s_out_i / ∂η_out_i = −Σ_{j≠i} p_ij · G_ij² · (1 − p_ij + z_ij)
 ```
 
-which equals the qDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`.  The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously within each group: pass 1 updates (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col sums.
+which equals the qDECM diagonal plus a correction `Σ p_ij · (1 − p_ij) · G_ij²` reflecting the dependence of `p_ij` on `η`. The DECM solver therefore uses alternating out-group / in-group GS-Newton passes that update both topology (θ) and weight (η) multipliers simultaneously: pass 1 updates (θ_out, η_out) from row sums; pass 2 updates (θ_in, η_in) from col sums.
 
-**The z-floor mechanism:** define `z_ij = θ_out_i + θ_in_j`.  When `z_ij → 0`, `G_ij → ∞` and the residual blows up.  The solver maintains per-node floors `z_min_out[i]` and `z_min_in[j]` (computed from significant pairs with `p_ij > 0.5/N`) and applies a global floor from `min(θ_in)` over non-zero-strength nodes.  This guarantees `z_ij > _Z_G_CLAMP = 1e-8` for all pairs after every Newton step.
-
-**Anderson acceleration** is applied identically to the FP-GS case, with the same blowup protection and history clearing.  When the Anderson mix violates the z-floor (i.e. `min(θ_out) + min(θ_in) < 0`), the mix is rejected and the plain Newton step is used instead, and the Anderson history is cleared.
-
-#### Implementation
-
-- `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(..., variant="theta-newton", anderson_depth=10)`
-- `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(..., variant="theta-newton", anderson_depth=10)`
-- `dcms/solvers/fixed_point_qdecm.py` — `solve_fixed_point_qdecm(..., variant="theta-newton", anderson_depth=10)`
-- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(..., variant="theta-newton", anderson_depth=10)` (alternating out/in GS-Newton on 4N vector)
-
-Internally, each file has a `_theta_newton_step_chunked` (and optionally `_theta_newton_step_dense`) function that computes the diagonal Jacobian and applies the clipped step without materialising the full Jacobian matrix (O(N) RAM).
+**The z-floor mechanism:** define `z_ij = θ_out_i + θ_in_j`. When `z_ij → 0`, `G_ij → ∞` and the residual blows up. The solver maintains per-node floors `z_min_out[i]` and `z_min_in[j]` and applies a global floor from `min(θ_in)` over non-zero-strength nodes. This guarantees `z_ij > _Z_G_CLAMP` for all pairs after every Newton step.
 
 **Numerical constants (tuneable):**
 
 | Constant | Default | Role |
 |----------|---------|------|
-| `_Z_G_CLAMP` | `1e-8` | Minimum `z = θ_out + θ_in` before clamping |
-| `_Z_NEWTON_FLOOR` | `1e-8` | Hard floor on `z` after each Newton step |
+| `_Z_G_CLAMP` | `1e-8` (`1e-6` for DECM) | Minimum `z = θ_out + θ_in` before clamping |
+| `_Z_NEWTON_FLOOR` | same as `_Z_G_CLAMP` | Hard floor on `z` after each Newton step |
 | `_Z_NEWTON_FRAC` | `0.5` | Max fractional decrease of `z` per step (prevents period-2 oscillation) |
 | `max_step` | `1.0` (DCM/DWCM/qDECM), `0.5` (DECM) | Max `|Δθ|` per coordinate per step (reduces for heterogeneous hubs) |
-| `_ANDERSON_BLOWUP_FACTOR` | `5000` | Residual-jump ratio that triggers history clear |
+| `_ANDERSON_BLOWUP_FACTOR` | `100` (DCM), `5000` (qDECM), scale-adaptive (DECM) | Residual-jump ratio that triggers history clear |
+
+#### Implementation
+
+- `dcms/solvers/fixed_point_dcm.py` — `solve_fixed_point_dcm(theta0, k_out, k_in, ...)`
+- `dcms/solvers/fixed_point_dwcm.py` — `solve_fixed_point_dwcm(theta0, s_out, s_in, ...)`
+- `dcms/solvers/fixed_point_qdecm.py` — `solve_fixed_point_qdecm(theta_topo0, theta_weight0, k_out, k_in, s_out, s_in, ...)` (topology + weight) and `solve_fixed_point_qdecm_weight(...)` (weight step given a topology)
+- `dcms/solvers/fixed_point_decm.py` — `solve_fixed_point_decm(theta0, k_out, k_in, s_out, s_in, ...)` (alternating out/in GS-Newton on the 4N vector)
+
+Each takes the per-node sequences, groups the nodes internally, iterates on the M groups and returns a `SolverResult` expanded back to N nodes. The dense/chunked choice applies to the DECM reduced step only (chunked once `M` exceeds `DECM_LARGE_N_THRESHOLD = 2000`, so memory stays O(chunk × M)).
 
 **Literature:**
 Kelley, C.T. (1995). *Iterative Methods for Linear and Nonlinear Equations*. SIAM. Chapter 5.
 
-Walker, H.F. & Ni, P. (2011). Anderson acceleration for fixed-point iterations. *SIAM Journal on Numerical Analysis*, 49(4), 1715–1735.
+---
+
+### 2.2 Anderson acceleration
+
+Anderson mixing (depth m = 10) transforms the plain Newton sequence into a quasi-Newton method by finding the linear combination of the last `m` residuals `r_k = g(θ_k) - θ_k` (here `g` is one Newton step) that minimises the mixed residual norm:
+
+```
+min_{c, Σc=1}  ‖Σ_k c_k · r_k‖²
+```
+
+The coefficients `c` are found by a small `m×m` least-squares system (O(m²) per step). The acceleration can reduce iteration counts by 5–50× on well-conditioned problems.
+
+**Blowup protection:** if the Anderson iterate produces a residual jump > `_ANDERSON_BLOWUP_FACTOR × best_residual`, the history is cleared and the plain Newton step is used instead. This prevents one bad linear combination from ruining the run. When the Anderson mix violates the z-floor (`min(θ_out) + min(θ_in) < 0`), the mix is rejected, the plain Newton step is used and the history is cleared.
+
+**Weighted mixing:** residuals are row-normalised by their component-wise maximum before solving the least-squares problem, so hub nodes (large absolute residuals) do not dominate the mixing coefficients; in the reduced system the rows are also weighted by the group multiplicities (a group of `m` identical nodes counts `m` times, exactly as in the per-node system).
+
+**Best-θ tracking:** the result always returns the lowest-residual iterate seen, not the final one.
+
+**Literature:**
+Walker, H.F. & Ni, P. (2011). Anderson acceleration for fixed-point iterations. *SIAM Journal on Numerical Analysis*, 49(4), 1715–1735. https://doi.org/10.1137/10078356X
 
 ---
 
@@ -300,35 +237,17 @@ print(model.sol.mre)
 
 ---
 
-### 2.4 Backtracking line search — preventing Newton divergence
+### 2.4 Options removed on 2026-10-27
 
-On very difficult networks the θ-Newton step can cause the residual to *increase* dramatically at a single iteration (even by a factor of 4–10×), after which Anderson mixing accumulates bad history and the solver diverges.  The **backtracking line search** prevents this by checking the residual at the proposed iterate and dampening the step when necessary.
+The following existed in earlier versions and are gone (passing them is a `TypeError`):
 
-**Mechanism:** after computing the Newton proposal `θ_fp`, the solver evaluates `F(θ_fp)`.  If `MRE(F(θ_fp)) > backtracking_gamma × MRE(F(θ))`, the step is halved (`α = 0.5 → 0.25 → … → 1/32`) until the condition is met or the minimum step size is reached.  The best dampened iterate is accepted and Anderson history is cleared to prevent contamination.
-
-**Effect on an empirical online social network** (N = 22 754, one hub with s/k = 152):  
-- Without backtracking: residual jumps from 0.976 to 3.73 at iteration 2, then diverges.  
-- With `backtracking_gamma=1.2, anderson_depth=3, hub_sk_threshold=100`: residuals decrease **monotonically** (0.976 → 0.905 → …) with no divergence.
-
-**Parameters:**
-- `backtracking_gamma` (default 0.0 = disabled): threshold ratio.  Typical values 1.2–2.0.  Lower values enforce stricter descent but cost more evaluations.
-- **Combine with** `hub_sk_threshold` on networks with extreme-hub nodes.
-
-**Cost:** each iteration triggers at most 1 extra O(N²) residual evaluation (plus up to 4 more if halvings are needed).  For small/medium networks this overhead is negligible; for large chunked networks (N > 5 000) expect 2–4× longer iterations when backtracking is active.
-
-**Example:**
-
-```python
-model = qDECMModel(k_out, k_in, s_out, s_in)
-converged = model.solve_tool(
-    hub_sk_threshold=100,     # bisection for the extreme hub
-    backtracking_gamma=1.2,   # strict: allow at most 20% residual increase per step
-    anderson_depth=3,         # reduced history to limit contamination
-    max_time=3600,
-    verbose=True,
-)
-print(model.sol.mre)
-```
+| Removed | Why |
+|---|---|
+| per-node (unreduced) solver, `reduce_degeneracy` | The degeneracy reduction is analytically exact (§2.5) and was cross-checked against the per-node solver when it was introduced; nothing in this project used the per-node path. Consistency is now tested against the per-node *residuals*, see `tests/test_reduction_consistency.py`. |
+| `variant="gauss-seidel"` (β-space fixed point) | Not implemented for the reduced system; the θ-Newton iteration is what all results use. |
+| `backend="numba"`, `num_threads` | Never used (the reduced systems have M ≤ ~7 000 groups, far below the old N > 100 000 switch). |
+| `backtracking_gamma` (line search) | Available only on the per-node path. |
+| `bisection_kick_*`, `stall_block_newton_first` | The structured "kick" tier of the stagnation ladder never helped (an 8 h run on one of the hardest networks gained ~1%). |
 
 ---
 
@@ -343,9 +262,11 @@ Two nodes that share the exact same **sufficient statistics** — the observed s
 | qDECM (conditioned-weight step only — the topology step is a plain DCM) | `(k_out, k_in, s_out, s_in)` |
 | DECM | `(k_out, k_in, s_out, s_in)` |
 
-On real-world networks with heavy-tailed degree/strength distributions, most of the tail shares a small number of distinct low-degree/low-strength value combinations, so the number of **groups** `M` (unique keys) is often far smaller than the number of nodes `N`. Solving for `M` group-level unknowns instead of `N` per-node unknowns turns the O(N²) pairwise compute into O(M²) — measured **10–67× faster** on real networks (see table below), with the group and per-node solutions agreeing to machine precision (or the model's own convergence tolerance) once expanded back to per-node shape.
+On real-world networks with heavy-tailed degree/strength distributions, most of the tail shares a small number of distinct low-degree/low-strength value combinations, so the number of **groups** `M` (unique keys) is often far smaller than the number of nodes `N`. Solving for `M` group-level unknowns instead of `N` per-node unknowns turns the O(N²) pairwise compute into O(M²) — measured **10–67× faster** on real networks (see table below), and the group-level residual equals the per-node residual of the expanded parameters **identically** (checked at random points, with groups of multiplicity > 1, in `tests/test_reduction_consistency.py`).
 
-> **All four models have a genuine gauge freedom**, not just DCM. `p_ij`/`W_ij` always enter through the additive combination `θ_out_i + θ_in_j` (degree part) and/or `η_out_i + η_in_j` (strength part, DWCM/qDECM-weight/DECM), so `θ_out += c, θ_in -= c` — and, separately, `η_out += c, η_in -= c` where a strength part exists — leaves every `p_ij`/`W_ij` unchanged (verified numerically to machine precision for all four models). **DECM has two independent gauge directions** (θ-shift and η-shift, since its degree and strength equations decouple through this same additive structure). The full and reduced solvers are therefore not expected to land on identical raw θ unless both are very tightly converged along every gauge direction — always compare via a gauge-invariant quantity (`p_ij` and/or `W_ij`), never raw θ. This is also the real explanation for qDECM's weight step showing a looser agreement (~2e-3) than DCM/DWCM/DECM in the table below: it isn't a vague "conditioning artifact", it's this same gauge direction, just less sharply constrained by the model's positivity box than in the other three cases.
+> **All four models have a genuine gauge freedom**, not just DCM. `p_ij`/`W_ij` always enter through the additive combination `θ_out_i + θ_in_j` (degree part) and/or `η_out_i + η_in_j` (strength part, DWCM/qDECM-weight/DECM), so `θ_out += c, θ_in -= c` — and, separately, `η_out += c, η_in -= c` where a strength part exists — leaves every `p_ij`/`W_ij` unchanged. **DECM has two independent gauge directions** (θ-shift and η-shift). Two solutions of the same problem are therefore not expected to coincide in raw θ: always compare via a gauge-invariant quantity (`p_ij` and/or `E[w_ij]`), never raw θ.
+
+> **Correctness note (2026-10-27).** Until this date the qDECM weight step dropped the pairs between two *distinct members of the same group* (the group-level topology matrix had its diagonal zeroed instead of keeping the real probability), so for groups with more than one node the solver converged on a slightly wrong system: its own (group-level) MRE reached 1e-5 while the per-node strength MRE of the expanded solution was ~3e-3–6e-3 on the real networks tried. This had been attributed to "gauge freedom" in an earlier version of this section; it was found by the per-node residual check above. DCM, DWCM and DECM were checked the same way and were correct.
 
 **Measured on empirical data from online social networks** (`tol≈1e-9/1e-10`, `theta-newton`, `anderson_depth=10`; network labels below are anonymized, distinct letters = distinct networks):
 
@@ -358,38 +279,24 @@ On real-world networks with heavy-tailed degree/strength distributions, most of 
 | qDECM (weight step) | online social network B | 20914 → 4070 | 23.5× |
 | DECM | online social network C | 15168 → 3003 | ~10–25× |
 
-**Status:** on by default. Every model's `solve_tool()` accepts `reduce_degeneracy: bool = True` (§3.1-3.4) — set it to `False` to force the full (unreduced) solver. It's automatically bypassed (with a printed note) when the requested options aren't supported by the reduced path: `variant != "theta-newton"`, `backend == "numba"`, or (qDECM/DECM only) `backtracking_gamma > 0`. This is also the path GPU acceleration (§2.7) requires — `device != "cpu"` needs `reduce_degeneracy=True`.
+**Status:** always on — there is no other path. The standalone functions group the nodes themselves:
 
 ```python
-model = DCMModel(k_out, k_in)
-converged = model.solve_tool(tol=1e-9)                       # reduced by default
-converged = model.solve_tool(tol=1e-9, reduce_degeneracy=False)  # force the full solver
-```
-
-The standalone `solve_fixed_point_*_degenerate` functions (§3.8) remain available directly, e.g. to pass a custom residual function or when not using the model wrapper:
-
-**Example:**
-
-```python
-from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate
+from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
 model = DCMModel(k_out, k_in)
 theta0 = model.initial_theta("degrees")
 
-result = solve_fixed_point_dcm_degenerate(
-    theta0, k_out, k_in,
-    tol=1e-9, max_iter=2000, anderson_depth=10,
-)
-# result.theta / result.best_theta are already expanded back to shape (2N,) —
-# a drop-in replacement for solve_fixed_point_dcm's return value.
+result = solve_fixed_point_dcm(theta0, k_out, k_in, tol=1e-9, max_iter=2000, anderson_depth=10)
+# result.theta / result.best_theta are expanded back to shape (2N,)
 print(result.converged, result.mre, result.message)  # message reports "N=... -> M=..."
 ```
 
-`solve_fixed_point_dwcm_degenerate` and `solve_fixed_point_qdecm_degenerate` follow the same pattern (`s_out, s_in` in place of `k_out, k_in`; qDECM additionally needs `theta_topo0`/`k_out`/`k_in` since it also runs the topology step internally). `solve_fixed_point_decm_degenerate` additionally supports `hub_sk_threshold` (§2.3) and `weight_anderson` (multiplicity-aware Anderson mixing, on by default — needed because a degeneracy class of `mult` identical nodes must count `mult` times in the Anderson least-squares fit to match the unreduced system exactly).
+`solve_fixed_point_dwcm(theta0, s_out, s_in, ...)`, `solve_fixed_point_qdecm(theta_topo0, theta_weight0, k_out, k_in, s_out, s_in, ...)` and `solve_fixed_point_decm(theta0, k_out, k_in, s_out, s_in, ...)` follow the same pattern. `solve_fixed_point_decm` additionally supports `hub_sk_threshold` (§2.3) and `weight_anderson` (multiplicity-aware Anderson mixing, on by default — a degeneracy class of `mult` identical nodes must count `mult` times in the Anderson least-squares fit).
 
 ### 2.6 Perturbed restart on stagnation / repeated blowup (DECM)
 
-Even with Anderson acceleration and the blowup guard (§2.1), some hub-heavy instances get stuck at a **quasi-fixed point**: progress halts for hundreds of iterations, or the Anderson blowup guard keeps tripping and rolling back to the same point without ever improving on it. Plain rollback-and-retry alone cannot escape a genuine trap — the deterministic Newton/Anderson dynamics just reproduce the same trajectory. The fix is to occasionally add noise:
+Even with Anderson acceleration and the blowup guard (§2.2), some hub-heavy instances get stuck at a **quasi-fixed point**: progress halts for hundreds of iterations, or the Anderson blowup guard keeps tripping and rolling back to the same point without ever improving on it. Plain rollback-and-retry alone cannot escape a genuine trap — the deterministic Newton/Anderson dynamics just reproduce the same trajectory. The fix is to occasionally add noise:
 
 - **Stagnation:** if `best_theta_res` has not set a *significant* record (more than `patience_rel_tol` better than the reference) for `patience` consecutive iterations, the solver climbs a stall ladder instead of continuing from the stuck iterate: soft reset from `best_theta`, then block-Newton ON, then restarts from `best_theta` plus Gaussian noise (see the *Stall ladder* paragraph below).
 - **Repeated blowup:** the existing blowup guard's plain rollback-to-`best_theta` is left untouched for an *isolated* blowup (common and self-resolving on hub-heavy networks — see `blowup_factor` below). Only if the guard trips **again with no record improvement in between** does it escalate to the same noisy restart — this is the "quasi-fixed-point trap" case, not routine Anderson housekeeping.
@@ -421,7 +328,7 @@ Pass an explicit value to override this — but the two directions call for oppo
 
 **Stall ladder (solve_tool defaults, 2026-10):** a *significant* record = beating the reference by more than `patience_rel_tol` (0.1). After `patience` (250) iterations without one: (1) soft reset from `best_theta` with Anderson cleared; (2) block-Newton switched ON (`stall_block_newton_gate`, 0.05; switched OFF again once the record is below `stall_block_newton_off_mre`, 2e-4, if it was switched on above it; and reverted OFF if its own patience window yields no significant record, `stall_block_newton_revert=True`); (3) noisy restarts, then STOP after `max_stalls`. The standalone solver functions keep the old defaults (patience 750, `patience_rel_tol=0`, block-Newton tier off). Validated from scratch with one recipe on a set of real directed weighted networks (N from ~10³ to ~10⁵): four networks that the old defaults never converged within 6-10 h now converge in 1.2-3.1k iterations, four more need 2-8x fewer iterations, and the rest are unchanged. A hard case stalls at a 3.3e-3 plateau with the stall ladder alone (a handful of out-side rows with `s ≈ k` and `k_in ≈ 0`, one `(node, side)` holding the maximum for hundreds of iterations), but converges from zero adding `streak_fix_threshold=10` (723 it, 3.5 min, 2 threads) or `20` (1752 it); `50` fires too late and does not.
 
-**Status:** on by default (`DECMModel.solve_tool()` and the standalone `solve_fixed_point_decm[_degenerate]`). Inert for well-behaved instances that never stagnate or blow up — no default-value tuning is needed to get the old behaviour on easy networks. Set `patience<=0` to fully disable and restore the old fail-fast-on-stagnation behaviour.
+**Status:** on by default (`DECMModel.solve_tool()` and the standalone `solve_fixed_point_decm`). Inert for well-behaved instances that never stagnate or blow up — no default-value tuning is needed to get the old behaviour on easy networks. Set `patience<=0` to fully disable and restore the old fail-fast-on-stagnation behaviour.
 
 ```python
 model = DECMModel(k_out, k_in, s_out, s_in)
@@ -443,20 +350,19 @@ model.solve_tool(
 
 ### 2.7 GPU acceleration — the `device` parameter
 
-Every model's `solve_tool()` (and the underlying `solve_fixed_point_*_degenerate` functions, §3.8) accepts `device: str = "cpu"`. Passing a torch device string (`"mps"` on Apple Silicon, `"cuda"` on an NVIDIA GPU) runs the entire Newton/Anderson iteration — dense **and** chunked (§2.1's crossover) — on that device instead of the CPU.
+Every model's `solve_tool()` (and the underlying `solve_fixed_point_*` functions, §3.8) accepts `device: str = "cpu"`. Passing a torch device string (`"mps"` on Apple Silicon, `"cuda"` on an NVIDIA GPU) runs the entire Newton/Anderson iteration — dense **and** chunked (§2.1's crossover) — on that device instead of the CPU.
 
 **Precision:** CPU always uses float64 (unchanged, exact). Non-CPU devices use **float32**: MPS has no float64 support at all (a hard PyTorch limitation, not a choice made here), and CUDA float64 throughput is slow enough that float32 is the practical choice there too. `SolverResult` (`self.sol`) is always converted back to CPU/float64 before being returned, regardless of `device` — the float32 arithmetic is purely an internal, iteration-time detail.
 
 **What this means in practice:** GPU runs will not reach the same `tol` as CPU — float32 has roughly 7 significant decimal digits, so expect convergence to plateau somewhere in the `1e-6`–`1e-7` MRE range even on an easy network, rather than continuing down to `1e-9`/`1e-10`. This is normal, not a bug. GPU is a speed trade for networks large enough that the O(M²) (dense) or O(chunk×M) (chunked) per-iteration cost dominates — for small/medium `M` the fixed overhead of moving data to the device usually outweighs any benefit, and CPU is both faster and more precise.
 
-**Requirements:** only `reduce_degeneracy=True` (§2.5) is supported with a non-CPU `device` — the raw per-node dense/chunked paths, and the Numba backend, remain CPU-only. Requesting `device != "cpu"` together with `reduce_degeneracy=False`, `backend="numba"`, or (qDECM/DECM) `backtracking_gamma > 0` raises `NotImplementedError` rather than silently falling back, since silently running on CPU would defeat the point of asking for a GPU.
+**Requirements:** none beyond a torch device — every solver runs the reduced system, which is the only one supported on a non-CPU device.
 
 ```python
 model = DECMModel(k_out, k_in, s_out, s_in)
 model.solve_tool(
     tol=1e-6,             # loosen vs. the CPU default -- float32 won't reach 1e-9
     device="mps",         # or "cuda"; default "cpu"
-    reduce_degeneracy=True,  # required for device != "cpu" (already the default)
 )
 ```
 
@@ -540,13 +446,10 @@ converged = model.solve_tool(
     tol=1e-6,               # convergence tolerance (ℓ∞ relative residual MRE)
     max_iter=2000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
-    variant="theta-newton", # "theta-newton" (default) or "gauss-seidel"
     anderson_depth=10,
-    backend="auto",         # "auto" (default), "pytorch", or "numba"
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
-    reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in) into groups (see §2.5); default True
-    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32; see §2.7)
 )
 theta = model.sol.theta     # converged parameters, shape (2N,) -- always CPU/float64 regardless of device
 ```
@@ -574,14 +477,10 @@ converged = model.solve_tool(
     tol=1e-6,
     max_iter=2000,
     max_time=0,
-    variant="theta-newton",
     anderson_depth=10,
-    backend="auto",         # "auto" (default), "pytorch", or "numba"
-    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
-    reduce_degeneracy=True, # collapse nodes sharing (s_out,s_in) into groups (see §2.5); default True
-    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32; see §2.7)
 )
 theta = model.sol.theta     # converged parameters, shape (2N,) -- always CPU/float64 regardless of device
 ```
@@ -622,17 +521,12 @@ converged = model.solve_tool(
     tol=1e-6,
     max_iter=2000,
     max_time=0,
-    variant="theta-newton",
     anderson_depth=10,
-    backend="auto",         # "auto" (default), "pytorch", or "numba"
-    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
-    backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
     z_clamp=1e-8,           # floor on the weight step's z; exposed for symmetry with DECM's own z_clamp, don't change lightly
-    reduce_degeneracy=True, # collapse degenerate node groups in both steps (see §2.5); default True
-    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32; see §2.7)
 )
 # solve_tool returns True if *both* topology and weight steps converged
 # sol.theta has shape (4N,): [θ_out_topo, θ_in_topo, θ_β_out, θ_β_in]
@@ -677,20 +571,16 @@ converged = model.solve_tool(
     max_iter=5000,
     max_time=0,             # wall-clock timeout in seconds (0 = no limit)
     anderson_depth=10,
-    backend="auto",         # "auto" (default), "pytorch", or "numba"
-    num_threads=0,          # Numba threads: 0 = auto (all available CPUs)
     verbose=False,          # print iteration progress (timestamp, MRE, …)
     monitor=False,          # if True (with verbose), overwrite line in place (end="\r")
     hub_sk_threshold=0.0,   # >0: use 1D bisection for nodes with s/k > threshold (see §2.3)
     hub_bisect_max_sweeps=3,# raise (e.g. 10) only for a relaxed hub next to a very tight partner (see §2.8)
-    backtracking_gamma=0.0, # >0: line search — halve step if MRE increases by > gamma× (see §2.4)
     z_clamp=1e-6,           # floor on the pair sum eta_out+eta_in; tied to the residual's own clamp, don't change lightly
     block_newton_gate=0.0,  # >0: exact joint 2x2 (theta,eta) step on ill-conditioned (s~k) rows; opt-in, see §2.9
     block_newton_min_rel=None,  # None = 0.1*tol whenever the gate is active (recommended); see §2.9
     streak_fix_threshold=0, # >0: directly solve a (node,side) pair that monopolizes the argmax this many iters (see §2.8)
     streak_fix_n_sweeps=5,  # phi-fixed bisection sweeps per streak-fix call (see §2.8)
     streak_fix_n_bisect=60, # bisection halvings per sweep (see §2.8)
-    reduce_degeneracy=True, # collapse nodes sharing (k_out,k_in,s_out,s_in) into groups (see §2.5); default True
     blowup_factor=None,     # None = scale-adaptive default; lower (e.g. 20-50) to catch slow drift sooner (see §2.6)
     patience=250,           # stall ladder after this many iters without a significant record (see §2.6); was 750
     patience_rel_tol=0.1,   # only a record improvement by more than this fraction resets patience (0 = any; see §2.8)
@@ -702,7 +592,7 @@ converged = model.solve_tool(
     noise_growth=2.0,       # noise growth rate per consecutive failed restart (see §2.6)
     max_stalls=5,           # give up after this many restarts at max noise with no improvement (see §2.6)
     seed=None,              # seed for the restart RNG; irrelevant if no restart ever fires (see §2.6)
-    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32, needs reduce_degeneracy=True; see §2.7)
+    device="cpu",           # "cpu" (default, float64) or "mps"/"cuda" (float32; see §2.7)
                              # covers both the dense and chunked reduced-path steps; stagnation recovery (§2.6) stays CPU-only internally and interoperates transparently
 )
 # solve_tool returns True if converged and stores the full result:
@@ -890,74 +780,31 @@ result.last_mre        # float — MRE at last iterate theta
 
 ### 3.8 Standalone solvers (advanced)
 
-The underlying solvers can be called directly without the model wrapper, e.g. to pass a custom residual function or to interleave topology and weight steps manually:
+The underlying solvers can be called directly without the model wrapper, e.g. to interleave topology and weight steps manually:
 
 ```python
 from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 from dcms.solvers.fixed_point_dwcm import solve_fixed_point_dwcm
-from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm
+from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm, solve_fixed_point_qdecm_weight
 from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
 result = solve_fixed_point_dcm(
-    residual_fn,             # callable F(θ) → (2N,) tensor
     theta0,                  # initial guess (2N,)
     k_out, k_in,             # observed degree sequences
     tol=1e-6,
     max_iter=2000,
-    variant="theta-newton",  # "theta-newton" (default) or "gauss-seidel"
     anderson_depth=10,
     max_time=0,
-    backend="auto",          # "auto" (default), "pytorch", or "numba"
 )
 ```
 
-`solve_fixed_point_dwcm` and `solve_fixed_point_qdecm` share the same signature (replacing `k_out, k_in` with `s_out, s_in`; qDECM additionally requires `theta_topo`).
+`solve_fixed_point_dwcm` has the same signature with `s_out, s_in`; `solve_fixed_point_decm` takes `theta0` (4N, `[θ_out|θ_in|η_out|η_in]`) and `k_out, k_in, s_out, s_in`; `solve_fixed_point_qdecm_weight(theta_topo, theta_weight0, k_out, k_in, s_out, s_in, ...)` solves the weight step for a given topology and `solve_fixed_point_qdecm` does topology + weights. All of them group the nodes internally (§2.5), return a `SolverResult` expanded back to the original per-node shape, and accept `device: str = "cpu"` (§2.7: float32 off the CPU, `SolverResult` always CPU/float64).
 
-Each of the four models also has a **degeneracy-reduced** counterpart —
-`solve_fixed_point_dcm_degenerate`, `solve_fixed_point_dwcm_degenerate`,
-`solve_fixed_point_qdecm_degenerate`, `solve_fixed_point_decm_degenerate` —
-that automatically groups nodes with identical sufficient statistics and
-solves the resulting smaller system, expanding the result back to the
-original per-node shape. See §2.5 for the rationale, measured speedups, and
-a usage example. These four `*_degenerate` functions (and their non-reduced
-counterparts shown above) all accept `device: str = "cpu"` — see §2.7 for
-the GPU-acceleration semantics (float32 off-CPU, requires the reduced path,
-`SolverResult` always comes back CPU/float64).
+### 3.9 Parallelism and monitoring
 
-`solve_fixed_point_decm` requires `k_out, k_in, s_out, s_in` and an initial 4N guess `theta0 = [θ_out|θ_in|η_out|η_in]`.
-
-### 3.9 Compute backend and parallelism
-
-All solvers accept a `backend` parameter that controls which compute engine executes the N×N inner loops:
-
-| Value | Behaviour |
-|-------|-----------|
-| `"auto"` (default) | PyTorch chunked for N ≤ 100 000; Numba parallel scalar loops for N > 100 000. |
-| `"pytorch"` | Always use PyTorch (dense or chunked depending on N). |
-| `"numba"` | Always use Numba JIT-compiled scalar loops. |
-
-**Automatic fallback.** If the requested backend is not installed, the solver falls back to whichever is available and emits a `warnings.warn()` plus a `logging.warning()` message so the switch is never silent.
-
-**Why two backends?**
-
-Benchmarked on DECM at N = 50 000 / 100 000 / 200 000 (2026-07-13):
-
-* **Peak RAM is essentially identical between the two backends at every scale tested** (≈4.5 GB at N=50k, ≈7.2 GB at N=100k, ≈16.9 GB at N=200k for both PyTorch-chunked and Numba). Numba does **not** offer a RAM advantage in practice — the widely-assumed "Numba saves RAM" rationale is not borne out by measurement.
-* **Speed** is the only real differentiator, and it is scale-dependent: **PyTorch is faster up to N ≈ 50 000** (e.g. ≈307 s/iter vs ≈373 s/iter at N=50k on a representative server), while **Numba becomes ≈13–14% faster only at N ≥ 100 000** (e.g. 818 s/iter vs 955 s/iter at N=100k, 3305 s/iter vs 3820 s/iter at N=200k). The `"auto"` threshold (100 000) is set at this measured crossover point.
-* **Numba is not required for old Python versions either.** PyTorch alone runs correctly on Python 3.8 (tested); `pyproject.toml`'s `requires-python` floor is a packaging choice, not a technical necessity tied to the backend.
-* **Numba** (optional: `pip install numba`) compiles the update loop to native code and is parallelised with `prange` (OpenMP/TBB) so it can use multiple CPU cores; this is its main advantage over PyTorch at very large N, independent of RAM.
-
-**Controlling the number of threads (Numba only).**  Each `solve_tool()` accepts a `num_threads` parameter:
-
-```python
-model.solve_tool(backend="numba", num_threads=4)   # use 4 threads
-model.solve_tool(backend="numba", num_threads=0)   # auto: all CPUs available to the process
-```
-
-`num_threads=0` (default) automatically uses all CPUs visible to the current process via `os.sched_getaffinity()` on Linux (respects `taskset`/cgroup quotas) or `os.cpu_count()` elsewhere.  Positive values are **clamped** to the available CPU count so requesting more threads than the OS allows never raises a `libgomp: Thread creation failed` error on shared or resource-limited servers.
+The solvers are single-process PyTorch code (torch's own intra-op threads apply). Long runs can be watched with `verbose`/`monitor`.
 
 **Custom initial conditions (warm restart).**  See §3.10 for details and examples.
-
 
 ```python
 # Full log — a new line is printed at every iteration (default behaviour):
@@ -982,14 +829,6 @@ model_de.solve_tool(verbose=True, monitor=True)
 | `verbose=True, monitor=True` | Overwrites the same terminal line (`end='\r'`); ideal for interactive monitoring of long runs. |
 
 Each line shows: wall-clock timestamp, iteration count, total elapsed time, and the **Maximum Relative Error** (MRE = `max_i |F_i(θ)| / constraint_i`) split by type: `MRE_topo` for degree constraints, `MRE_weights` for strength constraints.
-
-To install with Numba support:
-
-```bash
-pip install dcms[numba]          # installs numba as an optional extra
-# or
-pip install dcms numba           # equivalent
-```
 
 ### 3.10 Custom initial conditions and warm restart
 
@@ -1043,7 +882,7 @@ For DCM, DWCM and DECM pass an array of shape (2N,), (2N,) and (4N,) respectivel
 
 ### 3.10.1 Checkpointed multi-chunk runs surviving a real crash/preemption
 
-Stagnation and repeated-blowup recovery are now **built into the DECM solver itself** (§2.6) — a single unattended `solve_tool()`/`solve_fixed_point_decm[_degenerate]` call handles those on its own via the stall ladder (`patience`/`patience_rel_tol`, block-Newton tier, then `noise_base`/`noise_cap_mult`/`max_stalls`), no external orchestration needed.
+Stagnation and repeated-blowup recovery are now **built into the DECM solver itself** (§2.6) — a single unattended `solve_tool()`/`solve_fixed_point_decm` call handles those on its own via the stall ladder (`patience`/`patience_rel_tol`, block-Newton tier, then `noise_base`/`noise_cap_mult`/`max_stalls`), no external orchestration needed.
 
 What a single in-process call *cannot* survive is an actual **crash, timeout, or preemption** of the process itself — a real concern for instances that need tens of thousands of iterations (hours) unattended. For that, run in **chunks** — `max_iter` iterations at a time, checkpointing state to disk after each chunk, so a killed process never loses more than one chunk of progress:
 
@@ -1052,7 +891,7 @@ global_best_theta, best_mre = None, float("inf")
 theta = None  # None => solver picks the default ic on the first chunk
 
 for chunk in range(n_chunks):
-    res = solve_fixed_point_decm_degenerate(
+    res = solve_fixed_point_decm(
         ..., theta0=theta,
         init_best_theta=global_best_theta, init_best_res=best_mre,
         max_iter=chunk_iters,
@@ -1092,78 +931,27 @@ k, s = k_s_generator_pl(
 
 ## 4. Performance
 
-All benchmarks use `k_s_generator_pl(N, rho=1e-3)` (power-law degree/strength sequences), `tol = 1e-5`, and the `--fast` flag.  Statistics are mean ± 2σ over converged runs.
+Measured on the 19 real networks of the project (N from 232 to 107 056, M from 20 to 7 305 groups), 24 threads, `tol = 1e-5`, seed 0, benchmark v2 (package at commit `4a1f492`, `benchmark_19/results_v2/`). All runs converged:
 
-### DCM — N = 5 000
+| Model | Networks converged | Iterations | Wall time | Remarks |
+|---|---|---|---|---|
+| DWCM | 19 / 19 | 13 – 59 | < 10 s | |
+| qDECM | 19 / 19 | 26 – 175 | < 2 min | **to be re-measured**: those runs predate the 2026-10-27 fix of the within-group pairs (§2.5), which changes the iteration counts |
+| DECM | 19 / 19 | 164 – 3 064 | 1 s – 10 h 19 | recipe `general` at the first attempt on every network (`anderson_depth=10, hub_sk_threshold=5, z_clamp=1e-6, noise_base=2e-3`); the three slowest networks (M ≈ 5 000–7 300) take 1–10 h |
 
-Benchmark: 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, `tol=1e-5`.
-
-| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
-|--------|------:|----------------:|-----------------:|--------------------:|
-| FP-GS Anderson(10)    | **100%** |  8 ± 3 | 3.52 ± 1.26 | 1.38e-06 ± 9.28e-07 |
-| θ-Newton Anderson(10) | **100%** | 13 ± 1 | 3.67 ± 0.78 | 8.94e-07 ± 1.30e-06 |
-
-### DWCM — N = 5 000
-
-Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`.
-
-| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
-|--------|------:|----------------:|-----------------:|--------------------:|
-| FP-GS Anderson(10) | **100%** | 24 ± 37 | 15.5 ± 33.8 | 9.5e-09 ± 3.2e-08 |
-| θ-Newton Anderson(10) | **100%** | 14 ± 7 | 11.2 ± 5.3 | 2.5e-08 ± 3.0e-08 |
-
-> The z-floor and Anderson blowup-reset mechanisms make both methods reliable even on hard seeds (high s/k hubs) that previously caused divergence.  θ-Newton is more consistent (lower variance in time and iterations).
-
-### qDECM — N = 5 000
-
-Benchmark over 5 seeds (0–4), `k_s_generator_pl(N=5000, rho=1e-3)`, 150 s per solver.
-
-| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
-|--------|------:|----------------:|-----------------:|--------------------:|
-| FP-GS Anderson(10) | 0% | — | — | — |
-| **θ-Newton Anderson(10)** | **100%** | **44 ± 10** | **36.1 ± 17.3** | **7.6e-08 ± 1.4e-07** |
-
-> FP-GS Anderson(10) fails for qDECM at N = 5 000 because the conditioned weight equations have spectral radius > 1 for power-law hubs: each `p_ij < 1` factor forces `β_i β_j` closer to 1 to satisfy the strength constraint, amplifying the fixed-point Jacobian.  The θ-Newton approach bypasses this limitation by working in log-space where the diagonal Hessian always stabilises the step.
-
-**Hard instances (s/k ≫ 1):** for real-world networks with a handful of nodes whose strength-to-degree ratio greatly exceeds 5, even θ-Newton can stagnate.  Use `hub_sk_threshold=5` (see §2.3); tested on a directed weighted network (N=22 754, with a hub reaching s/k = 152) where the standard solver stalled at MRE≈0.47 and the bisection option achieved **best_MRE=9.5×10⁻⁵** in 46 iterations.
-
-**Extreme hubs that cause Newton divergence:** on networks where the Newton step itself produces a large residual spike (MRE jumps from ~1 to 3–4), use the backtracking line search (see §2.4).  Combine `hub_sk_threshold` with `backtracking_gamma=1.2–2.0` and `anderson_depth=3–5` for the most challenging cases.  Convergence is guaranteed to be monotone but may be slow for very large networks (N > 10 000) where each residual evaluation is O(N²).
-
-### DECM — N = 1 000 and N = 5 000
-
-Benchmarks over 5 seeds each (`k_s_generator_pl(N, rho=1e-3)`, `tol=1e-5`).
-
-The DECM uses the alternating GS-Newton solver (`solve_fixed_point_decm`), which applies θ-Newton steps on both the degree (θ) and strength (η) multipliers within each iteration.  Anderson(10) is applied on the full 4N vector.  `solve_tool()` uses `multi_start=True` by default: if the primary IC ("degrees") does not converge, it automatically retries with the "qdecm" warm-start (run qDECM first and use its 4N solution as starting point) and then "random".
-
-**N = 1 000**
-
-| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
-|--------|------:|----------------:|-----------------:|--------------------:|
-| **θ-Newton Anderson(10)** | **100%** | **45 ± 8** | **2.3 ± 1.8** | **8.05e-07 ± 6.37e-07** |
-
-**N = 5 000**
-
-| Method | Conv% | Iters (mean±2σ) | Time s (mean±2σ) | MaxRelErr (mean±2σ) |
-|--------|------:|----------------:|-----------------:|--------------------:|
-| **θ-Newton Anderson(10)** | **100%** | **67 ± 20** | **77.9 ± 22.8** | **1.50e-07 ± 2.58e-07** |
-
-> The coupling between degree and strength equations makes the DECM more expensive per iteration than the qDECM (two passes over the N×N grid instead of one), but the alternating GS-Newton strategy with multi-start achieves 100% convergence across all tested seeds.  Hard seeds (high s/k hubs) that the "degrees" IC cannot handle are resolved by the "qdecm" warm-start fallback.
+DCM was not part of that benchmark; on the same inputs it converges in 14–24 iterations (tol 1e-8).
 
 ---
 
 ## 5. Complexity
 
-| Method | Model | Convergence | RAM per iteration | Scales to large N? |
-|--------|-------|-------------|-------------------|--------------------|
-| FP-GS Anderson(10) | DCM, DWCM, qDECM | linear + acceleration | O(chunk × N) | ✓ (chunked path for N > 5 000, or N > 2 000 for qDECM) |
-| θ-Newton Anderson(10) | DCM, DWCM, qDECM | superlinear | O(chunk × N) | ✓ (same chunked path) |
-| Alternating GS-Newton Anderson(10) | DECM | superlinear | O(chunk × N) | ✓ (2 passes per iteration, chunked path for N > 2 000) |
+| Model | Convergence | Memory per iteration | Compute per iteration |
+|--------|-------------|-------------------|--------------------|
+| DCM, DWCM | superlinear (θ-Newton + Anderson) | O(M²) | O(M²) |
+| qDECM | superlinear (topology, then weights) | O(M²) | O(M²) per stage |
+| DECM | superlinear (alternating GS-Newton on 4N) | O(M²), or O(chunk × M) when `M > 2000` | O(M²), two passes |
 
-All methods are **O(N)** in RAM (with the default chunked path) and **O(N²)** in compute per iteration.  The dense path materialises the full N×N matrix once per step (threshold: N ≤ 5 000 for DCM/DWCM, N ≤ 2 000 for qDECM/DECM); above the threshold rows are processed in chunks of 512, keeping peak RAM under ~1 GB at N = 50 000.
-
-The DECM solver performs 2 passes per iteration (out-group and in-group), compared to 1 pass for DCM/DWCM and 2 passes for qDECM.  This makes the per-iteration cost approximately equal to qDECM.
-
-**Degeneracy-reduced variants** (§2.5) replace the O(N²) pairwise compute with O(M²), where `M` is the number of distinct sufficient-statistics groups — on real-world networks with heavy-tailed degree/strength distributions, typically `M ≪ N`, giving 10–67× measured wall-clock speedups.
+`M` is the number of distinct sufficient-statistics groups (§2.5), `M ≤ N`; on real networks with heavy-tailed degree/strength distributions `M` is far smaller than `N` (N²/M² from 18 to 438 on the 19 networks of the project).
 
 ---
 
@@ -1173,33 +961,7 @@ The DECM solver performs 2 passes per iteration (out-group and in-group), compar
 pytest tests/
 ```
 
-## Running Benchmarks
-
-```bash
-# DCM comparison (two methods, N=1000, 10 seeds)
-python -m dcms.benchmarks.dcm_comparison --sizes 1000 --n_seeds 10 --fast
-
-# DCM scaling across sizes
-python -m dcms.benchmarks.dcm_scaling --sizes 1000 5000 10000
-
-# DWCM comparison
-python -m dcms.benchmarks.dwcm_comparison --sizes 1000 --n_seeds 10 --fast
-
-# DWCM at N=5000
-python -m dcms.benchmarks.dwcm_comparison --sizes 5000 --n_seeds 5 --fast
-
-# qDECM comparison (N=1000)
-python -m dcms.benchmarks.qdecm_comparison --sizes 1000 --n_seeds 10 --fast
-
-# qDECM at N=5000 (θ-Newton only reliable method)
-python -m dcms.benchmarks.qdecm_comparison --sizes 5000 --n_seeds 5 --timeout 0 --fast
-
-# DECM comparison (N=1000, 10 seeds)
-python -m dcms.benchmarks.decm_comparison --n 1000 --n_seeds 10
-
-# DECM at custom size/seeds
-python -m dcms.benchmarks.decm_comparison --n 500 --n_seeds 5
-```
+`tests/test_device.py` runs the non-CPU device tests only if the device exists (MPS on Apple Silicon yes; CUDA never run, see §2.7).
 
 ## References
 

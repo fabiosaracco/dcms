@@ -91,7 +91,7 @@ def _anderson_mixing(
         residuals_hist: List of r_k = g(θ_k) − θ_k values, each shape (M,).
         weights:        Optional per-component weight, shape (M,), used only
                         in the degeneracy-reduced path (see
-                        :func:`solve_fixed_point_decm_degenerate`). The
+                        :func:`solve_fixed_point_decm`). The
                         mixing coefficients are found by minimising a
                         WEIGHTED norm of the combined residual instead of
                         the plain L2 norm -- needed because in the reduced
@@ -210,193 +210,6 @@ def _project_pair_floor(
         new_in = torch.where(frozen_in, eta_in, new_in)
     return new_out, new_in
 
-
-def _decm_step_dense(
-    theta: torch.Tensor,
-    k_out: torch.Tensor,
-    k_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    zero_k_out: torch.Tensor,
-    zero_k_in: torch.Tensor,
-    zero_s_out: torch.Tensor,
-    zero_s_in: torch.Tensor,
-    max_step: float,
-    hub_out_mask: "torch.Tensor | None" = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One alternating GS-Newton step for the DECM (dense N×N computation).
-
-    Performs two passes:
-    1. Update θ_out and η_out using row sums at the current state.
-    2. Update θ_in and η_in using col sums at the updated (θ_out, η_out).
-
-    The residual returned is evaluated at the *input* theta (before update).
-
-    Args:
-        theta:      Current 4N parameter vector [θ_out|θ_in|η_out|η_in].
-        k_out:      Observed out-degree sequence, shape (N,).
-        k_in:       Observed in-degree sequence, shape (N,).
-        s_out:      Observed out-strength sequence, shape (N,).
-        s_in:       Observed in-strength sequence, shape (N,).
-        zero_k_out: Boolean mask of zero-out-degree nodes.
-        zero_k_in:  Boolean mask of zero-in-degree nodes.
-        zero_s_out: Boolean mask of zero-out-strength nodes.
-        zero_s_in:  Boolean mask of zero-in-strength nodes.
-        max_step:   Maximum |Δθ| per node per step.
-
-    Returns:
-        ``(theta_new, F_current)`` where F_current is the 4N residual at the
-        input state.
-    """
-    N = k_out.shape[0]
-    theta_out = theta[:N]
-    theta_in = theta[N : 2 * N]
-    eta_out = theta[2 * N : 3 * N]
-    eta_in = theta[3 * N :]
-
-    # ------- Pass 1: compute all sums at current state -------
-    eta = eta_out[:, None] + eta_in[None, :]       # (N, N)
-    eta_safe = eta.clamp(min=_Z_G_CLAMP)
-    G = -1.0 / torch.expm1(-eta_safe)              # G = 1/(1-z)
-    log_q = -torch.log(torch.expm1(eta_safe))
-    logit_p = -theta_out[:, None] - theta_in[None, :] + log_q
-    P = torch.sigmoid(logit_p)
-
-    P.fill_diagonal_(0.0)
-    G.fill_diagonal_(0.0)
-
-    W = P * G
-    pq = P * (1.0 - P)
-    pq.fill_diagonal_(0.0)
-    PGG1 = P * G * (G - 1.0)           # p·G²·z (= p·G·(G−1))
-    PGG1.fill_diagonal_(0.0)
-    CORR = pq * G.pow(2)
-    CORR.fill_diagonal_(0.0)
-
-    k_out_hat = P.sum(1)
-    k_in_hat = P.sum(0)
-    s_out_hat = W.sum(1)
-    s_in_hat = W.sum(0)
-
-    H_k_out = pq.sum(1).clamp(min=1e-15)
-    H_s_out = (PGG1 + CORR).sum(1).clamp(min=1e-15)
-
-    F_current = torch.cat(
-        [k_out_hat - k_out, k_in_hat - k_in,
-         s_out_hat - s_out, s_in_hat - s_in]
-    )
-
-    # ------- Update θ_out (Newton step on F_k_out) -------
-    delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_out_new = torch.where(zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new)
-
-    # ------- Update η_out (Newton step on F_s_out, with z-floor) -------
-    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
-
-    # z_min_out[i] = min over j of eta_ij (excluding diagonal)
-    eta_for_min = eta_safe.clone()
-    eta_for_min.fill_diagonal_(float("inf"))
-    z_min_out = eta_for_min.min(1).values.clamp(min=_Z_G_CLAMP)
-    # Global guard: include all non-zero-strength in-nodes
-    nz_in = s_in > 0
-    if nz_in.any():
-        z_min_out = torch.minimum(z_min_out, eta_out + eta_in[nz_in].min())
-
-    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
-    alpha_out = torch.where(
-        delta_eta_out < 0,
-        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
-    eta_out_new = torch.where(zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new)
-    if hub_out_mask is not None:
-        # Hub eta_out is owned by the hub bisection, not by this Newton
-        # step (the caller discards the raw value). Pass 2 must therefore
-        # see the eta_out that will actually be applied -- the input
-        # (previously bisected) value -- not the raw Newton proposal,
-        # otherwise every theta_in is corrected against a phantom
-        # environment (dominant for near-boundary in-hubs, z=eta_out+eta_in -> 0).
-        eta_out_new = torch.where(hub_out_mask, eta_out, eta_out_new)
-
-    # ------- Pass 2: recompute col sums with updated θ_out, η_out -------
-    eta2 = eta_out_new[:, None] + eta_in[None, :]
-    eta2_safe = eta2.clamp(min=_Z_G_CLAMP)
-    G2 = -1.0 / torch.expm1(-eta2_safe)
-    log_q2 = -torch.log(torch.expm1(eta2_safe))
-    logit_p2 = -theta_out_new[:, None] - theta_in[None, :] + log_q2
-    P2 = torch.sigmoid(logit_p2)
-
-    P2.fill_diagonal_(0.0)
-    G2.fill_diagonal_(0.0)
-
-    W2 = P2 * G2
-    pq2 = P2 * (1.0 - P2)
-    pq2.fill_diagonal_(0.0)
-    PGG1_2 = P2 * G2 * (G2 - 1.0)
-    PGG1_2.fill_diagonal_(0.0)
-    CORR_2 = pq2 * G2.pow(2)
-    CORR_2.fill_diagonal_(0.0)
-
-    k_in_hat2 = P2.sum(0)
-    s_in_hat2 = W2.sum(0)
-    H_k_in2 = pq2.sum(0).clamp(min=1e-15)
-    H_s_in2 = (PGG1_2 + CORR_2).sum(0).clamp(min=1e-15)
-
-    # ------- Update θ_in (Newton step on F_k_in) -------
-    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_in_new = torch.where(zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new)
-
-    # ------- Update η_in (Newton step on F_s_in, with z-floor) -------
-    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
-
-    eta2_for_min = eta2_safe.clone()
-    eta2_for_min.fill_diagonal_(float("inf"))
-    z_min_in = eta2_for_min.min(0).values.clamp(min=_Z_G_CLAMP)
-    nz_out = s_out > 0
-    if nz_out.any():
-        z_min_in = torch.minimum(z_min_in, eta_out_new[nz_out].min() + eta_in)
-
-    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
-    alpha_in = torch.where(
-        delta_eta_in < 0,
-        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
-    eta_in_new = torch.where(zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new)
-
-    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
-    return theta_new, F_current
-
-
-# -------------------------------------------------------------------------
-# Degenerate-multiplier reduction (Vallarano et al., Sci. Rep. 11:15227, 2021)
-# -------------------------------------------------------------------------
-# Nodes that share the exact same (k_out, s_out, k_in, s_in) 4-tuple have
-# identical (theta_out, eta_out, theta_in, eta_in) at the true DECM
-# solution. Proof sketch: the network log-likelihood is exactly invariant
-# under simultaneously swapping two such nodes' full identities (in AND out
-# roles together), and since the likelihood is strictly concave the unique
-# maximizer must respect that symmetry.
-#
-# IMPORTANT: this requires the FULL 4-tuple to match. Matching only
-# (k_out, s_out) or only (k_in, s_in) is NOT sufficient -- each node's own
-# equation structurally excludes its own self-loop term, and that excluded
-# term depends on the node's own (k_in, s_in) identity (for the out
-# equations) or (k_out, s_out) identity (for the in equations), breaking
-# exact degeneracy on either 2-tuple alone. Verified analytically (a
-# label-swap argument) and confirmed with the user 2026-07-16.
-#
-# Reducing the N per-node unknowns to M := #unique-4-tuples group-level
-# unknowns can shrink the problem substantially for real degree/strength
-# distributions with a heavy low-degree bulk (e.g. one real network in
-# production use: N=15168 -> M=3003, ~5x fewer unknowns and ~25x fewer
-# pairwise entries per iteration).
 
 def compute_degeneracy_groups(
     k_out: torch.Tensor,
@@ -701,225 +514,6 @@ def _decm_step_dense_weighted(
 # -------------------------------------------------------------------------
 # Chunked DECM step (for N > _LARGE_N_THRESHOLD)
 # -------------------------------------------------------------------------
-
-def _decm_step_chunked(
-    theta: torch.Tensor,
-    k_out: torch.Tensor,
-    k_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    zero_k_out: torch.Tensor,
-    zero_k_in: torch.Tensor,
-    zero_s_out: torch.Tensor,
-    zero_s_in: torch.Tensor,
-    chunk_size: int,
-    max_step: float,
-    hub_out_mask: "torch.Tensor | None" = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked alternating GS-Newton step for the DECM.
-
-    Mirrors :func:`_decm_step_dense` but processes the N×N matrices in
-    row chunks to keep memory usage at O(chunk_size × N).
-
-    Pass 1 accumulates row sums (F_k_out, F_s_out, H_k_out, H_s_out) and
-    preliminary col sums for the current-state residual.  Pass 2 recomputes
-    col sums (F_k_in, F_s_in, H_k_in, H_s_in) using the updated θ_out and
-    η_out.
-
-    Args:
-        theta:      Current 4N parameter vector.
-        k_out:      Observed out-degree sequence, shape (N,).
-        k_in:       Observed in-degree sequence, shape (N,).
-        s_out:      Observed out-strength sequence, shape (N,).
-        s_in:       Observed in-strength sequence, shape (N,).
-        zero_k_out: Boolean mask of zero-out-degree nodes.
-        zero_k_in:  Boolean mask of zero-in-degree nodes.
-        zero_s_out: Boolean mask of zero-out-strength nodes.
-        zero_s_in:  Boolean mask of zero-in-strength nodes.
-        chunk_size: Rows per processing chunk.
-        max_step:   Maximum |Δθ| per node per step.
-
-    Returns:
-        ``(theta_new, F_current)`` where F_current is evaluated at the input
-        state.
-    """
-    N = k_out.shape[0]
-    theta_out = theta[:N]
-    theta_in = theta[N : 2 * N]
-    eta_out = theta[2 * N : 3 * N]
-    eta_in = theta[3 * N :]
-
-    sig_log_thresh: float = math.log(0.5 / N) - math.log(1.0 - 0.5 / N)
-
-    # ------------------------------------------------------------------
-    # Pass 1: accumulate row sums + preliminary col sums
-    # ------------------------------------------------------------------
-    k_out_hat = torch.zeros(N, dtype=torch.float64)
-    k_in_hat = torch.zeros(N, dtype=torch.float64)
-    s_out_hat = torch.zeros(N, dtype=torch.float64)
-    s_in_hat = torch.zeros(N, dtype=torch.float64)
-    H_k_out = torch.zeros(N, dtype=torch.float64)
-    H_s_out = torch.zeros(N, dtype=torch.float64)
-    z_min_out = torch.full((N,), float("inf"), dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-
-        eta_chunk = eta_out[i_start:i_end, None] + eta_in[None, :]  # (chunk, N)
-        eta_safe = eta_chunk.clamp(min=_Z_G_CLAMP)
-        G_chunk = -1.0 / torch.expm1(-eta_safe)
-        log_q_chunk = -torch.log(torch.expm1(eta_safe))
-        logit_p_chunk = (
-            -theta_out[i_start:i_end, None] - theta_in[None, :] + log_q_chunk
-        )
-        p_chunk = torch.sigmoid(logit_p_chunk)
-        w_chunk = p_chunk * G_chunk
-
-        p_chunk[local_i, global_j] = 0.0
-        w_chunk[local_i, global_j] = 0.0
-        G_chunk[local_i, global_j] = 0.0
-
-        pq_chunk = p_chunk * (1.0 - p_chunk)
-        PGG1_chunk = p_chunk * G_chunk * (G_chunk - 1.0)
-        CORR_chunk = pq_chunk * G_chunk.pow(2)
-
-        k_out_hat[i_start:i_end] = p_chunk.sum(1)
-        k_in_hat += p_chunk.sum(0)
-        s_out_hat[i_start:i_end] = w_chunk.sum(1)
-        s_in_hat += w_chunk.sum(0)
-
-        H_k_out[i_start:i_end] = pq_chunk.sum(1)
-        H_s_out[i_start:i_end] = (PGG1_chunk + CORR_chunk).sum(1)
-
-        # Track z_min_out[i] for line-search (significant pairs only)
-        sig_mask = logit_p_chunk > sig_log_thresh
-        z_sig = torch.where(sig_mask, eta_chunk, torch.full_like(eta_chunk, float("inf")))
-        z_min_out[i_start:i_end] = torch.minimum(
-            z_min_out[i_start:i_end], z_sig.min(1).values
-        )
-
-    # Global z-floor guard for out-direction
-    nz_in = s_in > 0
-    if nz_in.any():
-        min_eta_in_nz = eta_in[nz_in].min()
-        z_min_out = torch.minimum(z_min_out, eta_out + min_eta_in_nz)
-
-    F_current = torch.cat(
-        [k_out_hat - k_out, k_in_hat - k_in,
-         s_out_hat - s_out, s_in_hat - s_in]
-    )
-
-    H_k_out = H_k_out.clamp(min=1e-15)
-    H_s_out = H_s_out.clamp(min=1e-15)
-
-    # ------- Update θ_out -------
-    delta_theta_out = ((k_out_hat - k_out) / H_k_out).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_theta_out).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_out_new = torch.where(
-        zero_k_out, torch.full_like(theta_out_new, _THETA_MAX), theta_out_new
-    )
-
-    # ------- Update η_out (with z-floor line-search) -------
-    delta_eta_out = ((s_out_hat - s_out) / H_s_out).clamp(-max_step, max_step)
-    z_floor_out = (z_min_out * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
-    alpha_out = torch.where(
-        delta_eta_out < 0,
-        (available_out / delta_eta_out.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_out_new = (eta_out + alpha_out * delta_eta_out).clamp(_ETA_MIN, _ETA_MAX)
-    eta_out_new = torch.where(
-        zero_s_out, torch.full_like(eta_out_new, _ETA_MAX), eta_out_new
-    )
-    if hub_out_mask is not None:
-        # Hub eta_out is owned by the hub bisection, not by this Newton
-        # step (the caller discards the raw value). Pass 2 must therefore
-        # see the eta_out that will actually be applied -- the input
-        # (previously bisected) value -- not the raw Newton proposal,
-        # otherwise every theta_in is corrected against a phantom
-        # environment (dominant for near-boundary in-hubs, z=eta_out+eta_in -> 0).
-        eta_out_new = torch.where(hub_out_mask, eta_out, eta_out_new)
-
-    # ------------------------------------------------------------------
-    # Pass 2: accumulate col sums using updated (θ_out_new, η_out_new)
-    # ------------------------------------------------------------------
-    k_in_hat2 = torch.zeros(N, dtype=torch.float64)
-    s_in_hat2 = torch.zeros(N, dtype=torch.float64)
-    H_k_in2 = torch.zeros(N, dtype=torch.float64)
-    H_s_in2 = torch.zeros(N, dtype=torch.float64)
-    z_min_in = torch.full((N,), float("inf"), dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-
-        eta2_chunk = eta_out_new[i_start:i_end, None] + eta_in[None, :]
-        eta2_safe = eta2_chunk.clamp(min=_Z_G_CLAMP)
-        G2_chunk = -1.0 / torch.expm1(-eta2_safe)
-        log_q2_chunk = -torch.log(torch.expm1(eta2_safe))
-        logit_p2_chunk = (
-            -theta_out_new[i_start:i_end, None] - theta_in[None, :] + log_q2_chunk
-        )
-        p2_chunk = torch.sigmoid(logit_p2_chunk)
-        w2_chunk = p2_chunk * G2_chunk
-
-        p2_chunk[local_i, global_j] = 0.0
-        w2_chunk[local_i, global_j] = 0.0
-        G2_chunk[local_i, global_j] = 0.0
-
-        pq2_chunk = p2_chunk * (1.0 - p2_chunk)
-        PGG1_2_chunk = p2_chunk * G2_chunk * (G2_chunk - 1.0)
-        CORR_2_chunk = pq2_chunk * G2_chunk.pow(2)
-
-        k_in_hat2 += p2_chunk.sum(0)
-        s_in_hat2 += w2_chunk.sum(0)
-        H_k_in2 += pq2_chunk.sum(0)
-        H_s_in2 += (PGG1_2_chunk + CORR_2_chunk).sum(0)
-
-        # Track z_min_in[j] for line-search
-        sig_mask2 = logit_p2_chunk > sig_log_thresh
-        z2_sig = torch.where(sig_mask2, eta2_chunk, torch.full_like(eta2_chunk, float("inf")))
-        z_min_in = torch.minimum(z_min_in, z2_sig.min(0).values)
-
-    # Global z-floor guard for in-direction
-    nz_out = s_out > 0
-    if nz_out.any():
-        min_eta_out_new_nz = eta_out_new[nz_out].min()
-        z_min_in = torch.minimum(z_min_in, min_eta_out_new_nz + eta_in)
-
-    H_k_in2 = H_k_in2.clamp(min=1e-15)
-    H_s_in2 = H_s_in2.clamp(min=1e-15)
-
-    # ------- Update θ_in -------
-    delta_theta_in = ((k_in_hat2 - k_in) / H_k_in2).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_theta_in).clamp(-_THETA_MAX, _THETA_MAX)
-    theta_in_new = torch.where(
-        zero_k_in, torch.full_like(theta_in_new, _THETA_MAX), theta_in_new
-    )
-
-    # ------- Update η_in (with z-floor line-search) -------
-    delta_eta_in = ((s_in_hat2 - s_in) / H_s_in2).clamp(-max_step, max_step)
-    z_floor_in = (z_min_in * _Z_NEWTON_FRAC).clamp(min=_Z_NEWTON_FLOOR)
-    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
-    alpha_in = torch.where(
-        delta_eta_in < 0,
-        (available_in / delta_eta_in.abs().clamp(min=1e-30)).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-    eta_in_new = (eta_in + alpha_in * delta_eta_in).clamp(_ETA_MIN, _ETA_MAX)
-    eta_in_new = torch.where(
-        zero_s_in, torch.full_like(eta_in_new, _ETA_MAX), eta_in_new
-    )
-
-    theta_new = torch.cat([theta_out_new, theta_in_new, eta_out_new, eta_in_new])
-    return theta_new, F_current
-
 
 def _decm_step_chunked_weighted(
     theta: torch.Tensor,
@@ -1487,22 +1081,19 @@ def _bisect_hub_eta_decm_batch(
 # Main solver
 # -------------------------------------------------------------------------
 
-def solve_fixed_point_decm(
-    residual_fn: Callable[[torch.Tensor], torch.Tensor],
+def _solve_decm_reduced(
     theta0: torch.Tensor,
     k_out: torch.Tensor,
     k_in: torch.Tensor,
     s_out: torch.Tensor,
     s_in: torch.Tensor,
+    mult: torch.Tensor,
     tol: float = 1e-8,
     max_iter: int = 5000,
-    variant: str = "theta-newton",
     chunk_size: int = 0,
     anderson_depth: int = 10,
     max_step: float = 0.5,
     max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
     topo_weig: bool = False,
@@ -1515,9 +1106,7 @@ def solve_fixed_point_decm(
     stall_block_newton_gate: float = 0.0,
     stall_block_newton_off_mre: float = 2e-4,
     stall_block_newton_revert: bool = True,
-    backtracking_gamma: float = 0.0,
     z_clamp: float = 1e-6,
-    mult: torch.Tensor | None = None,
     weight_anderson: bool = True,
     init_best_theta: torch.Tensor | None = None,
     init_best_res: float = float("inf"),
@@ -1547,9 +1136,6 @@ def solve_fixed_point_decm(
     4N vector with a feasibility guard that rejects infeasible mixes.
 
     Args:
-        residual_fn:    Function F(θ) → 4N residual tensor. Used for
-                        convergence bookkeeping only (residual is computed
-                        inside the step function for efficiency).
         theta0:         Initial guess [θ_out|θ_in|η_out|η_in], shape (4N,).
         k_out:          Observed out-degree sequence, shape (N,).
         k_in:           Observed in-degree sequence, shape (N,).
@@ -1557,20 +1143,12 @@ def solve_fixed_point_decm(
         s_in:           Observed in-strength sequence, shape (N,).
         tol:            Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
         max_iter:       Maximum number of iterations.
-        variant:        Solver variant: only ``"theta-newton"`` is supported.
         chunk_size:     If > 0, use chunked computation with this row-chunk
                         size.  If 0, auto-select: dense for
                         N ≤ ``_LARGE_N_THRESHOLD``, chunked otherwise.
         anderson_depth: Anderson acceleration depth (0 = plain Newton, no blowup guard; 1 = plain Newton WITH the blowup guard / rollback; >= 2 = Anderson mixing + guard).
         max_step:       Maximum |Δ| per node per Newton step.
         max_time:       Wall-clock time limit in seconds (0 = no limit).
-        backend:        Compute backend: ``"auto"`` (default), ``"pytorch"``,
-                        or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000
-                        and Numba for larger networks.  Falls back automatically
-                        with a warning if the requested backend is unavailable.
-        num_threads:    Number of Numba parallel threads.  0 (default) leaves
-                        the global Numba thread count unchanged.  Only takes
-                        effect when ``backend="numba"`` (or ``"auto"`` at large N).
         verbose:        If ``True``, print a progress line at every iteration
                         showing timestamp, iteration count, elapsed time, and MRE.
         monitor:        If ``True`` (and ``verbose=True``), overwrite the same
@@ -1620,14 +1198,6 @@ def solve_fixed_point_decm(
                         Use this for networks with a few nodes that have very
                         high ``s/k`` ratios (e.g. ``s/k > 5``) which cause the
                         global solver to stagnate.  Default=0.0 (disabled).
-        backtracking_gamma (float): When > 0, after each Newton step a
-                        backtracking line search is applied: the residual at
-                        the proposed ``theta_fp`` is evaluated, and if it
-                        exceeds ``backtracking_gamma × res_norm`` (residual at
-                        the current iterate), the step is halved up to 5 times
-                        until the condition is met.  Typical value: ``2.0``.
-                        Default 0 (disabled).  Anderson history is cleared
-                        whenever a dampened step is accepted.
         z_clamp:        Floor applied to the raw z=eta_out+eta_in sum in two
                         places, both of which govern the same trade-off
                         between damping near-degenerate-hub curvature
@@ -1657,18 +1227,10 @@ def solve_fixed_point_decm(
                         rule for picking another value -- see the DECM
                         z-clamp investigation notes
                         for the full experimental history.
-        mult:           Internal use by :func:`solve_fixed_point_decm_degenerate`.
-                        When provided (shape (M,)), ``k_out``/``k_in``/``s_out``/
-                        ``s_in``/``theta0`` are interpreted as *group-level*
-                        quantities (one entry per unique (k_out,s_out,k_in,s_in)
-                        4-tuple) and the step uses :func:`_decm_step_dense_weighted`
-                        instead of the per-node dense/chunked/Numba paths.
-                        ``hub_sk_threshold`` operates at group granularity
-                        when ``mult`` is given (the bisection helper accepts
-                        it). Not compatible with
-                        ``backtracking_gamma`` (not yet implemented for the
-                        reduced case) or ``backend="numba"``.  Default None
-                        (standard per-node behaviour, unaffected).
+        mult:           Group multiplicities, shape (M,). ``k_out``/``k_in``/``s_out``/``s_in``/``theta0`` are
+                        *group-level* quantities (one entry per unique (k_out,s_out,k_in,s_in) 4-tuple) and the
+                        step is :func:`_decm_step_dense_weighted` / :func:`_decm_step_chunked_weighted`.
+                        ``hub_sk_threshold`` operates at group granularity (the bisection helper accepts ``mult``).
         init_best_theta: Optional externally-supplied "best theta ever seen"
                         (same shape as ``theta0``), used to seed this call's
                         internal best-tracking and Anderson-blowup reference
@@ -1801,7 +1363,7 @@ def solve_fixed_point_decm(
                         4G-length concatenated ``[k_out|k_in|s_out|s_in]``
                         layout (G = len(k_out), i.e. N or M depending on
                         whether this is called directly or via
-                        :func:`solve_fixed_point_decm_degenerate`) --
+                        :func:`solve_fixed_point_decm`) --
                         decode with ``block, node = divmod(argmax_idx, G)``
                         (block 0..3 = k_out/k_in/s_out/s_in). Built to
                         answer the node-population-persistence question in
@@ -1871,11 +1433,7 @@ def solve_fixed_point_decm(
         device:         ``"cpu"`` (default, float64) or a torch device
                         string like ``"mps"``/``"cuda"`` (float32 -- MPS
                         has no float64 support, and CUDA float64 is slow
-                        enough that float32 is the practical choice too). Only
-                        supported together with ``mult`` (the degeneracy
-                        -reduced path) and ``backend`` resolving to
-                        ``"pytorch"`` -- the raw per-node
-                        dense/chunked/numba paths stay CPU-only. Covers
+                        enough that float32 is the practical choice too). Covers
                         the main Newton/Anderson loop and its dense-
                         weighted step; the (CPU-only by design) targeted
                         streak-fix interoperates with any setting (its
@@ -1886,14 +1444,6 @@ def solve_fixed_point_decm(
     Returns:
         :class:`~src.solvers.base.SolverResult` with the best iterate found.
     """
-    if variant not in ("theta-newton",):
-        raise ValueError(
-            f"Unknown variant {variant!r}. "
-            "Supported: 'theta-newton'."
-        )
-    if chunk_size < 0:
-        raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
-
     if z_clamp != 1e-6:
         warnings.warn(
             f"z_clamp={z_clamp:g} != 1e-6: the model's residual (max_relative_error) clamps the pair sums at 1e-6, so for pairs "
@@ -1903,23 +1453,6 @@ def solve_fixed_point_decm(
     global _Z_G_CLAMP, _Z_NEWTON_FLOOR
     _Z_G_CLAMP = z_clamp
     _Z_NEWTON_FLOOR = z_clamp
-
-    if mult is not None:
-        if backtracking_gamma > 0.0:
-            raise NotImplementedError(
-                "backtracking_gamma is not yet supported together with the "
-                "degeneracy-reduced (mult) path."
-            )
-        if backend == "numba":
-            raise NotImplementedError(
-                "backend='numba' is not yet supported together with the "
-                "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
-            )
-    if device != "cpu" and (mult is None or backend == "numba"):
-        raise NotImplementedError(
-            "device != 'cpu' is only supported together with the "
-            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
-        )
 
     _dev = torch.device(device)
     _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
@@ -1941,8 +1474,7 @@ def solve_fixed_point_decm(
     s_out = _t(s_out)
     s_in = _t(s_in)
     theta = _t(theta0).clone()
-    if mult is not None:
-        mult = _t(mult)
+    mult = _t(mult)
 
     N = k_out.shape[0]
 
@@ -1963,20 +1495,6 @@ def solve_fixed_point_decm(
     theta[:2*N] = theta[:2*N].clamp(-_THETA_MAX, _THETA_MAX)
     theta[2*N:] = theta[2*N:].clamp(_ETA_MIN, _ETA_MAX)
 
-    # Resolve compute backend
-    from dcms.utils.backend import resolve_backend
-    _backend = resolve_backend(backend, N)
-    _use_numba = (_backend == "numba")
-    _prev_numba_threads: int | None = None
-    if _use_numba:
-        import numpy as np
-        from dcms.solvers._numba_kernels import _decm_step_numba
-        from dcms.utils.backend import resolve_num_threads as _rnt
-        _safe_threads = _rnt(num_threads)
-        import numba as _numba_mod
-        _prev_numba_threads = _numba_mod.get_num_threads()
-        _numba_mod.set_num_threads(_safe_threads)
-
     # Decide chunked vs dense (PyTorch path only)
     if chunk_size == 0:
         effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
@@ -1990,67 +1508,24 @@ def solve_fixed_point_decm(
     _bn = [block_newton_gate, _bn_min_rel]
     _bn_on_res = [float('inf')]   # record at which the joint step was switched on (off_mre acts only if that was above it); a static gate counts as switched on at the starting residual
     _bn_stall_used = [False]   # stall tier already fired (so switching the gate off again does not re-arm it)
-    if stall_block_newton_gate > 0.0 and mult is None:
-        raise ValueError("stall_block_newton_gate requires the degeneracy-reduced path (mult given).")
     _stall_bn_min_rel = 0.1 * tol if block_newton_min_rel is None else float(block_newton_min_rel)
 
     # Step function with bound arguments
-    if mult is not None:
-        if effective_chunk > 0:
-            def _step(th, hub_out_mask=None, hub_in_mask=None):
-                return _decm_step_chunked_weighted(
-                    th, k_out, k_in, s_out, s_in,
-                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                    effective_chunk, max_step, mult,
-                    hub_out_mask=hub_out_mask, hub_in_mask=hub_in_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
-                )
-        else:
-            def _step(th, hub_out_mask=None, hub_in_mask=None):
-                return _decm_step_dense_weighted(
-                    th, k_out, k_in, s_out, s_in,
-                    zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                    max_step, mult,
-                    hub_out_mask=hub_out_mask, hub_in_mask=hub_in_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
-                )
-    elif _use_numba and variant == "theta-newton":
-        def _step(th, hub_out_mask=None, hub_in_mask=None):  # mask unused: numba path keeps the old hub behaviour
-            to_ = th[:N].numpy()
-            ti_ = th[N:2*N].numpy()
-            eo_ = th[2*N:3*N].numpy()
-            ei_ = th[3*N:].numpy()
-            result = _decm_step_numba(
-                to_, ti_, eo_, ei_,
-                k_out.numpy(), k_in.numpy(),
-                s_out.numpy(), s_in.numpy(),
-                zero_k_out.numpy(), zero_k_in.numpy(),
-                zero_s_out.numpy(), zero_s_in.numpy(),
-                max_step, _THETA_MAX, _ETA_MAX,
-                _Z_G_CLAMP, _Z_NEWTON_FLOOR, _Z_NEWTON_FRAC,
-            )
-            theta_new = torch.from_numpy(
-                np.concatenate([result[0], result[1], result[2], result[3]])
-            )
-            F_current = torch.from_numpy(
-                np.concatenate([result[4], result[5], result[6], result[7]])
-            )
-            return theta_new, F_current
-    if mult is not None:
-        pass  # _step already bound to _decm_step_dense_weighted above
-    elif effective_chunk > 0:
+    if effective_chunk > 0:
         def _step(th, hub_out_mask=None, hub_in_mask=None):
-            return _decm_step_chunked(
+            return _decm_step_chunked_weighted(
                 th, k_out, k_in, s_out, s_in,
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                effective_chunk, max_step,
-                hub_out_mask=hub_out_mask,
+                effective_chunk, max_step, mult,
+                hub_out_mask=hub_out_mask, hub_in_mask=hub_in_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
             )
     else:
         def _step(th, hub_out_mask=None, hub_in_mask=None):
-            return _decm_step_dense(
+            return _decm_step_dense_weighted(
                 th, k_out, k_in, s_out, s_in,
                 zero_k_out, zero_k_in, zero_s_out, zero_s_in,
-                max_step,
-                hub_out_mask=hub_out_mask,
+                max_step, mult,
+                hub_out_mask=hub_out_mask, hub_in_mask=hub_in_mask, block_newton_gate=_bn[0], block_newton_min_rel=_bn[1],
             )
 
     # Anderson mixing needs per-component weights in the degeneracy-reduced
@@ -2059,9 +1534,7 @@ def solve_fixed_point_decm(
     # mult[g] times in the mixing least-squares fit -- exactly like it would
     # if those mult[g] identical nodes were each their own row in the
     # unreduced (per-node) system (see _anderson_mixing's docstring).
-    _anderson_weights = (
-        torch.cat([mult, mult, mult, mult]) if (mult is not None and weight_anderson) else None
-    )
+    _anderson_weights = torch.cat([mult, mult, mult, mult]) if weight_anderson else None
 
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
@@ -2247,14 +1720,14 @@ def solve_fixed_point_decm(
     # ------------------------------------------------------------------
     import numpy as _np_hub
 
-    _hub_active = hub_sk_threshold > 0.0 and not _use_numba
+    _hub_active = hub_sk_threshold > 0.0
     _hub_out_mask: torch.Tensor | None = None   # shape (N,) bool
     _hub_in_mask: torch.Tensor | None = None
     # Group multiplicities as numpy, for the weighted hub-bisection sum
     # (degeneracy-reduced path only; None reproduces the per-node behaviour).
     # (.cpu() first: these may live on a non-CPU device under `device=...`,
     # and hub bisection itself always runs via numpy regardless.)
-    _mult_np = mult.detach().to(device="cpu").to(dtype=torch.float64).numpy() if mult is not None else None
+    _mult_np = mult.detach().to(device="cpu").to(dtype=torch.float64).numpy()
     # Precomputed once: target arrays as numpy, reused by every hub-bisection
     # call each iteration.
     _s_out_np = s_out.detach().to(device="cpu").to(dtype=torch.float64).numpy()
@@ -2599,45 +2072,6 @@ def solve_fixed_point_decm(
                 else:
                     _streak_id = _streak_key
                     _streak_len = 1
-
-            # --- Backtracking line search (PyTorch path only) ---
-            # Evaluate residual at the proposed theta_fp; if it exceeds
-            # backtracking_gamma × res_norm, halve the step up to 5 times.
-            # Anderson history is cleared whenever a dampened step is accepted.
-            if (
-                backtracking_gamma > 0.0
-                and res_norm > 0.0
-                and not _use_numba
-            ):
-                _F_fp = residual_fn(theta_fp)
-                _res_fp = (
-                    (_F_fp.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
-                    if _v_nonzero.any() else 0.0
-                )
-                if math.isfinite(_res_fp) and _res_fp > backtracking_gamma * res_norm:
-                    _bt_best_res = _res_fp
-                    _bt_best_theta = theta_fp.clone()
-                    _bt_alpha = 0.5
-                    for _ in range(5):  # min alpha = 1/32
-                        _theta_bt = theta + _bt_alpha * (theta_fp - theta)
-                        _theta_bt[:2 * N] = _theta_bt[:2 * N].clamp(-_THETA_MAX, _THETA_MAX)
-                        _theta_bt[2 * N:] = _theta_bt[2 * N:].clamp(min=_ETA_MIN, max=_ETA_MAX)
-                        _F_bt = residual_fn(_theta_bt)
-                        _res_bt = (
-                            (_F_bt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
-                            if _v_nonzero.any() else 0.0
-                        )
-                        if math.isfinite(_res_bt) and _res_bt < _bt_best_res:
-                            _bt_best_res = _res_bt
-                            _bt_best_theta = _theta_bt.clone()
-                        if math.isfinite(_res_bt) and _res_bt <= backtracking_gamma * res_norm:
-                            break
-                        _bt_alpha *= 0.5
-                    if _bt_best_res < _res_fp:
-                        theta_fp = _bt_best_theta
-                        _and_g.clear()
-                        _and_r.clear()
-                        _best_res_for_anderson = float("inf")
 
             n_iter += 1
             residuals.append(res_norm)
@@ -3001,9 +2435,6 @@ def solve_fixed_point_decm(
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)
         peak_ram = _peak_ram_monitor.peak_bytes
-        if _prev_numba_threads is not None:
-            import numba as _numba_mod
-            _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
         # NOTE: must split device+dtype into two .to() calls -- combining them
@@ -3020,7 +2451,7 @@ def solve_fixed_point_decm(
     )
 
 
-def solve_fixed_point_decm_degenerate(
+def solve_fixed_point_decm(
     theta0: torch.Tensor,
     k_out: torch.Tensor,
     k_in: torch.Tensor,
@@ -3031,8 +2462,6 @@ def solve_fixed_point_decm_degenerate(
     anderson_depth: int = 10,
     max_step: float = 0.5,
     max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
     chunk_size: int = 0,
     verbose: bool = False,
     monitor: bool = False,
@@ -3074,22 +2503,16 @@ def solve_fixed_point_decm_degenerate(
     above :func:`compute_degeneracy_groups` -- and solves the resulting
     M-unknown reduced system (M = number of unique 4-tuples <= N) instead
     of the full 4N-unknown system. The returned ``SolverResult`` is
-    expanded back to the original per-node shape (4N,) so it is a drop-in
-    replacement for :func:`solve_fixed_point_decm` at the call site.
+    expanded back to the original per-node shape (4N,).
 
     ``hub_sk_threshold`` IS supported: hub identification and its exact 1D
     bisection operate at group granularity, with the bisection sum weighted
     by group multiplicity (see :func:`_bisect_hub_eta_decm`'s ``mult``
     parameter). A group's degree/strength is shared by every member node
     by construction, so hub membership at group granularity is exactly
-    equivalent to per-node membership. Does not (yet) support
-    ``backtracking_gamma`` (unavailable in this reduced path -- see
-    :func:`solve_fixed_point_decm`'s ``mult`` parameter docs) or
-    ``backend="numba"``.
+    equivalent to per-node membership.
 
-    ``device`` IS supported (passthrough to :func:`solve_fixed_point_decm`
-    -- see its docstring) since this wrapper always runs the degeneracy
-    -reduced (``mult``) path.
+    ``device`` ("cpu", "mps", "cuda") selects where the main Newton/Anderson loop runs (float32 off the CPU).
 
     Args:
         theta0: Initial guess [theta_out|theta_in|eta_out|eta_in], shape
@@ -3098,11 +2521,11 @@ def solve_fixed_point_decm_degenerate(
             guess); if not, one representative member's value is used for
             the whole group.
         k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
-        z_clamp: Forwarded to :func:`solve_fixed_point_decm` unchanged
+        z_clamp: Forwarded to :func:`_solve_decm_reduced` unchanged
             (operates at group/M granularity here, since the reduced eta
             values are already one entry per degeneracy group). See its
             docstring for the full explanation.
-        (all other args): see :func:`solve_fixed_point_decm`.
+        (all other args): see :func:`_solve_decm_reduced`.
         init_best_theta: Optional externally-supplied record theta, same
             expanded per-node shape (4N,) as ``theta0``/``best_theta``
             (i.e. *not* pre-reduced) -- reduced internally the same way as
@@ -3110,13 +2533,13 @@ def solve_fixed_point_decm_degenerate(
             reduced solver is always exactly uniform within each degeneracy
             group already, this reduction is exact (not an approximation,
             unlike the analogous step for an arbitrary ``theta0``). See
-            :func:`solve_fixed_point_decm`'s ``init_best_theta`` docs for why
+            :func:`_solve_decm_reduced`'s ``init_best_theta`` docs for why
             this matters.
         init_best_res: The residual (MRE) achieved by ``init_best_theta``.
         blowup_factor, patience, noise_base, noise_cap_mult, max_stalls, seed:
             Blowup-guard threshold and perturbed restart on stagnation/
             repeated-blowup, operating at group (M-length) granularity --
-            see :func:`solve_fixed_point_decm`'s docstring for the full
+            see :func:`_solve_decm_reduced`'s docstring for the full
             explanation. Forwarded unchanged.
 
     Returns:
@@ -3183,34 +2606,18 @@ def solve_fixed_point_decm_degenerate(
             ]
         )
 
-    def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
-        zero_k_out_g = k_out_g == 0
-        zero_k_in_g = k_in_g == 0
-        zero_s_out_g = s_out_g == 0
-        zero_s_in_g = s_in_g == 0
-        return _decm_step_dense_weighted(
-            theta_m, k_out_g, k_in_g, s_out_g, s_in_g,
-            zero_k_out_g, zero_k_in_g, zero_s_out_g, zero_s_in_g,
-            max_step, mult,
-        )[1]
-
-    result_g = solve_fixed_point_decm(
-        _residual_fn_g,
+    result_g = _solve_decm_reduced(
         theta0_g,
-        k_out_g, k_in_g, s_out_g, s_in_g,
+        k_out_g, k_in_g, s_out_g, s_in_g, mult,
         tol=tol,
         max_iter=max_iter,
-        variant="theta-newton",
         anderson_depth=anderson_depth,
         max_step=max_step,
         max_time=max_time,
-        backend=backend,
-        num_threads=num_threads,
         chunk_size=chunk_size,
         verbose=verbose,
         monitor=monitor,
         topo_weig=topo_weig,
-        mult=mult,
         weight_anderson=weight_anderson,
         hub_sk_threshold=hub_sk_threshold,
         hub_bisect_max_sweeps=hub_bisect_max_sweeps,
@@ -3268,7 +2675,7 @@ def _targeted_bisection_fix(
     k_in: torch.Tensor,
     s_out: torch.Tensor,
     s_in: torch.Tensor,
-    mult: torch.Tensor | None,
+    mult: torch.Tensor,
     target_idx: torch.Tensor,
     side: str,
     n_sweeps: int = 5,
@@ -3319,8 +2726,7 @@ def _targeted_bisection_fix(
     k_in = k_in.to(device="cpu").to(dtype=torch.float64)
     s_out = s_out.to(device="cpu").to(dtype=torch.float64)
     s_in = s_in.to(device="cpu").to(dtype=torch.float64)
-    if mult is not None:
-        mult = mult.to(device="cpu").to(dtype=torch.float64)
+    mult = mult.to(device="cpu").to(dtype=torch.float64)
     target_idx = target_idx.to(device="cpu")
 
     M = k_out.shape[0]
@@ -3351,9 +2757,7 @@ def _targeted_bisection_fix(
             return torch.full((K,), float("inf"), dtype=torch.float64)
         v, ix = torch.topk(vec, 2, largest=False)
         om = torch.where(target_idx == ix[0], v[1].expand(K), v[0].expand(K))
-        if mult is not None:
-            om = torch.where(mult[target_idx] > 1, torch.minimum(om, vec[target_idx]), om)
-        return om
+        return torch.where(mult[target_idx] > 1, torch.minimum(om, vec[target_idx]), om)
 
     def _eta_lo(f: Callable[[torch.Tensor], torch.Tensor], other_min: torch.Tensor) -> torch.Tensor:
         """Lower bracket for eta. Only the pair sum z = eta + eta_partner must stay > 0, NOT eta >= 0: a node that is
@@ -3374,10 +2778,6 @@ def _targeted_bisection_fix(
                 logit_p = -cand[:, None] - theta_in[None, :] + log_q
                 P = torch.sigmoid(logit_p)
                 P_self = P[rows, target_idx]
-                if mult is None:
-                    P = P.clone()
-                    P[rows, target_idx] = 0.0
-                    return P.sum(1) - k_out[target_idx]
                 return (P * mult[None, :]).sum(1) - P_self - k_out[target_idx]
 
             theta_out[target_idx] = torch.where(
@@ -3401,10 +2801,6 @@ def _targeted_bisection_fix(
                 P = torch.sigmoid(logit_p)
                 W = P * G
                 W_self = W[rows, target_idx]
-                if mult is None:
-                    W = W.clone()
-                    W[rows, target_idx] = 0.0
-                    return W.sum(1) - s_out[target_idx]
                 return (W * mult[None, :]).sum(1) - W_self - s_out[target_idx]
 
             _eta_new = torch.where(
@@ -3424,10 +2820,6 @@ def _targeted_bisection_fix(
                 logit_p = -theta_out[:, None] - cand[None, :] + log_q3
                 P = torch.sigmoid(logit_p)
                 P_self = P[target_idx, rows]
-                if mult is None:
-                    P = P.clone()
-                    P[target_idx, rows] = 0.0
-                    return P.sum(0) - k_in[target_idx]
                 return (P * mult[:, None]).sum(0) - P_self - k_in[target_idx]
 
             theta_in[target_idx] = torch.where(
@@ -3448,10 +2840,6 @@ def _targeted_bisection_fix(
                 P = torch.sigmoid(logit_p)
                 W = P * G
                 W_self = W[target_idx, rows]
-                if mult is None:
-                    W = W.clone()
-                    W[target_idx, rows] = 0.0
-                    return W.sum(0) - s_in[target_idx]
                 return (W * mult[:, None]).sum(0) - W_self - s_in[target_idx]
 
             _eta_new = torch.where(

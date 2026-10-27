@@ -377,7 +377,7 @@ class DCMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic='degrees', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
+    def solve_tool(self, ic='degrees', tol:float=1e-6, max_iter:int=2000, max_time:int=0, anderson_depth:int=10, verbose:bool=False, monitor:bool=False, device:str='cpu')-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -388,41 +388,18 @@ class DCMModel:
                 ``sol.best_theta``).
             tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
             max_iter (int): the maximum number of iterations. Default=2000.
-            variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
             anderson_depth (int): Anderson acceleration depth. Default=10.
-            backend (str): Compute backend: ``"auto"`` (default), ``"pytorch"``,
-                or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
-                Numba for larger networks.
-            num_threads (int): Number of Numba parallel threads. 0 (default)
-                means *auto*: uses all CPUs available to the current process
-                (respects ``taskset``/cgroup quotas on Linux). Positive values
-                are clamped to the available CPU count to avoid thread-creation
-                errors on resource-limited servers. Only has effect when Numba
-                is selected as the backend.
             verbose (bool): If ``True``, print a progress line at every
                 iteration (timestamp, iteration count, elapsed time, MRE).
                 Default=False.
             monitor (bool): If ``True`` (and ``verbose=True``), overwrite the
                 same terminal line at each iteration (``end='\\r'``) so only
                 the latest status is visible.  Default=False.
-            reduce_degeneracy (bool): If ``True`` (default), nodes sharing the
-                exact same ``(k_out, k_in)`` pair are collapsed into a single
-                group before solving (see README §2.5) — solves M ≤ N group
-                unknowns instead of N per-node ones, often 10-40x faster on
-                real networks with heavy-tailed degree distributions.
-                Mathematically exact (not an approximation); the returned
-                ``theta``/``best_theta`` are expanded back to shape ``(2N,)``.
-                Only supported with ``variant="theta-newton"`` and
-                ``backend != "numba"``; silently falls back to the full
-                (unreduced) solver otherwise, with a printed note.
             device (str): ``"cpu"`` (default, float64) or a torch device
                 string like ``"mps"``/``"cuda"`` (float32 -- MPS has no
                 float64 support at all, and CUDA float64 is slow enough
-                that float32 is the practical choice too). Only supported
-                together with ``reduce_degeneracy=True`` (and the same
-                ``variant``/``backend`` constraints as that option) --
-                raises if requested without it. The stored ``self.sol``
-                is always CPU/float64 regardless of ``device``.
+                that float32 is the practical choice too). The stored
+                ``self.sol`` is always CPU/float64 regardless of ``device``.
 
         Returns:
             :class:`~src.solvers.base.SolverResult` instance.
@@ -432,19 +409,8 @@ class DCMModel:
         else:
             self.ic = torch.as_tensor(ic, dtype=torch.float64)
 
-        _use_reduced = reduce_degeneracy and variant == "theta-newton" and backend != "numba"
-        if reduce_degeneracy and not _use_reduced:
-            print(
-                "reduce_degeneracy=True requires variant='theta-newton' and "
-                "backend!='numba' -- falling back to the full (unreduced) solver."
-            )
-
-        if _use_reduced:
-            from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate  # lazy import to avoid circular dependency
-            self.sol = solve_fixed_point_dcm_degenerate(self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
-        else:
-            from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-            self.sol = solve_fixed_point_dcm(self.residual, self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
+        from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
+        self.sol = solve_fixed_point_dcm(self.ic, self.k_out, self.k_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, device=device)
         if len(self.sol.message)>0:
             print(self.sol.message+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 

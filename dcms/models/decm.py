@@ -592,29 +592,24 @@ class DECMModel:
         tol: float = 1e-6,
         max_iter: int = 2000,
         max_time: float = 0,
-        variant: str = "theta-newton",
         anderson_depth: int = 10,
         multi_start: bool = True,
-        backend: str = "auto",
-        num_threads: int = 0,
         verbose: bool = False,
         monitor: bool = False,
         topo_weig: bool = False,
         hub_sk_threshold: float = 0.0,
         hub_bisect_max_sweeps: int = 3,
         hub_root_method: str = "bisect",
-        backtracking_gamma: float = 0.0,
         z_clamp: float = 1e-6,
         block_newton_gate: float = 0.0,
         block_newton_min_rel: float | None = None,
-        stall_block_newton_gate: float | None = None,
+        stall_block_newton_gate: float = 0.05,
         stall_block_newton_off_mre: float = 2e-4,
         stall_block_newton_revert: bool = True,
         checkpoint_dir: str | None = None,
         streak_fix_threshold: int = 0,
         streak_fix_n_sweeps: int = 5,
         streak_fix_n_bisect: int = 60,
-        reduce_degeneracy: bool = True,
         blowup_factor: float | None = None,
         patience: int = 250,
         patience_rel_tol: float = 0.1,
@@ -651,22 +646,11 @@ class DECMModel:
             max_iter:      Maximum iterations per attempt.
             max_time:      Wall-clock time limit in seconds per attempt
                            (0 = no limit).
-            variant:       Solver variant: only ``"theta-newton"`` is supported.
             anderson_depth: Anderson acceleration depth.
             multi_start:   If ``True`` (default), retry with fallback ICs when
                            the primary IC does not converge.  Set to ``False``
                            for clean per-IC benchmarking.  Ignored when
                            ``ic`` is an array.
-            backend:       Compute backend: ``"auto"`` (default), ``"pytorch"``,
-                           or ``"numba"``.  ``"auto"`` uses PyTorch for
-                           N ≤ 5 000 and Numba for larger networks.
-            num_threads:   Number of Numba parallel threads. 0 (default)
-                           means *auto*: uses all CPUs available to the current
-                           process (respects ``taskset``/cgroup quotas on
-                           Linux). Positive values are clamped to the available
-                           CPU count to avoid thread-creation errors on
-                           resource-limited servers. Only has effect when Numba
-                           is selected as the backend.
             verbose:       If ``True``, print a progress line at every iteration
                            (timestamp, iteration count, elapsed time, MRE).
                            Default=False.
@@ -697,12 +681,6 @@ class DECMModel:
                            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm_degenerate`.
             hub_root_method: ``"bisect"`` (default, 60 halvings per hub per sweep) or ``"illinois"`` (same root to ~1e-14, ~3x cheaper
                            on hub-heavy networks such as q4/e1). See :func:`~dcms.solvers.fixed_point_decm._bisect_hub_eta_decm_batch`.
-            backtracking_gamma: When > 0, enables a per-step backtracking
-                           line search.  After each Newton step the residual
-                           at the proposed iterate is evaluated; if it exceeds
-                           ``backtracking_gamma`` times the current residual,
-                           the step is halved (up to 5 times).  Typical value:
-                           ``2.0``.  Default=0.0 (disabled).
             z_clamp:       Floor on the raw z=eta_out+eta_in sum, tied
                            between the G-curvature damping and the
                            per-step trust-region floor (both roles must
@@ -736,9 +714,9 @@ class DECMModel:
                            memory) -- opt in per network, not globally, and
                            always pair it with ``block_newton_min_rel``.
                            Non-hub rows only, out side.
-            stall_block_newton_gate: ``None`` (default) = 0.05 on the degeneracy-reduced path, 0 (off) otherwise; 0.0 = off. > 0: stall-ladder tier that switches the joint 2x2 block-Newton step on
-                           (with this gate) after the soft reset fails, before the noisy restart. Use together with
-                           ``patience_rel_tol`` > 0. See :func:`solve_fixed_point_decm`.
+            stall_block_newton_gate: Stall-ladder tier that switches the joint 2x2 block-Newton step on (with this gate) after the
+                           soft reset fails, before the noisy restart (0 = off). Default 0.05. Use together with
+                           ``patience_rel_tol`` > 0. See :func:`~dcms.solvers.fixed_point_decm._solve_decm_reduced`.
             stall_block_newton_off_mre: Switch the stall-tier block-Newton OFF once the record is below this MRE (0 = never; default 2e-4; acts only if the step was switched on above it).
             stall_block_newton_revert: Switch the stall-tier block-Newton off again if it sets no significant record within its patience window (default True).
             checkpoint_dir: ``None`` (default) = off. A directory: every time the solver restarts from its best iterate (soft reset,
@@ -768,18 +746,6 @@ class DECMModel:
                            call. Default 5.
             streak_fix_n_bisect: Bisection halvings per stage per streak-fix
                            call. Default 60.
-            reduce_degeneracy: If ``True`` (default), nodes sharing the exact
-                           same ``(k_out, k_in, s_out, s_in)`` 4-tuple are
-                           collapsed into a single group before solving (see
-                           README §2.5) — solves M ≤ N group unknowns instead
-                           of N per-node ones, often 10-25x faster on real
-                           networks with heavy-tailed degree/strength
-                           distributions. Mathematically exact (not an
-                           approximation). Only supported with
-                           ``variant="theta-newton"``, ``backend != "numba"``,
-                           and ``backtracking_gamma == 0.0``; silently falls
-                           back to the full (unreduced) solver otherwise,
-                           with a printed note.
             blowup_factor: Multiplicative threshold for the Anderson blowup
                            guard: a rollback triggers when the current
                            iteration's residual exceeds ``blowup_factor``
@@ -849,34 +815,16 @@ class DECMModel:
                            string like ``"mps"``/``"cuda"`` (float32 -- MPS
                            has no float64 support at all, and CUDA
                            float64 is slow enough that float32 is the
-                           practical choice too). Only supported together
-                           with ``reduce_degeneracy=True`` (and the same
-                           ``variant``/``backend`` constraints as that
-                           option) -- raises if requested without it. The
-                           stored ``self.sol`` is always CPU/float64
-                           regardless of ``device``.
+                           practical choice too). The stored ``self.sol`` is
+                           always CPU/float64 regardless of ``device``.
 
         Returns:
             ``True`` if any attempt converged, ``False`` otherwise.
         """
         import torch as _torch
-        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm, solve_fixed_point_decm_degenerate
+        from dcms.solvers.fixed_point_decm import solve_fixed_point_decm
 
         _FALLBACK_ICS = ["qdecm", "random"]
-
-        _use_reduced = (
-            reduce_degeneracy and variant == "theta-newton"
-            and backend != "numba" and backtracking_gamma == 0.0
-        )
-        if stall_block_newton_gate is None:
-            # default: block-Newton stall tier on the degeneracy-reduced path only (the joint step needs it)
-            stall_block_newton_gate = 0.05 if _use_reduced else 0.0
-        if reduce_degeneracy and not _use_reduced:
-            print(
-                "reduce_degeneracy=True requires variant='theta-newton', "
-                "backend!='numba', and backtracking_gamma==0.0 -- falling "
-                "back to the full (unreduced) solver."
-            )
 
         t_global_start = _time.perf_counter()
 
@@ -904,47 +852,7 @@ class DECMModel:
                 if theta0_override is not None
                 else self.initial_theta(ic_name)
             )
-            if _use_reduced:
-                return solve_fixed_point_decm_degenerate(
-                    theta0=theta0,
-                    k_out=self.k_out,
-                    k_in=self.k_in,
-                    s_out=self.s_out,
-                    s_in=self.s_in,
-                    tol=tol,
-                    max_iter=max_iter,
-                    anderson_depth=anderson_depth,
-                    max_time=_remaining(),
-                    backend=backend,
-                    num_threads=num_threads,
-                    verbose=verbose,
-                    monitor=monitor,
-                    topo_weig=topo_weig,
-                    hub_sk_threshold=hub_sk_threshold,
-                    hub_bisect_max_sweeps=hub_bisect_max_sweeps,
-                    hub_root_method=hub_root_method,
-                    z_clamp=z_clamp,
-                    block_newton_gate=block_newton_gate,
-                    block_newton_min_rel=block_newton_min_rel,
-                    stall_block_newton_gate=stall_block_newton_gate,
-                    stall_block_newton_off_mre=stall_block_newton_off_mre,
-                    stall_block_newton_revert=stall_block_newton_revert,
-                    checkpoint_fn=_ckpt_fn,
-                    streak_fix_threshold=streak_fix_threshold,
-                    streak_fix_n_sweeps=streak_fix_n_sweeps,
-                    streak_fix_n_bisect=streak_fix_n_bisect,
-                    blowup_factor=blowup_factor,
-                    patience=patience,
-                    patience_rel_tol=patience_rel_tol,
-                    noise_base=noise_base,
-                    noise_cap_mult=noise_cap_mult,
-                    noise_growth=noise_growth,
-                    max_stalls=max_stalls,
-                    seed=seed,
-                    device=device,
-                )
             return solve_fixed_point_decm(
-                residual_fn=self.residual,
                 theta0=theta0,
                 k_out=self.k_out,
                 k_in=self.k_in,
@@ -952,19 +860,14 @@ class DECMModel:
                 s_in=self.s_in,
                 tol=tol,
                 max_iter=max_iter,
-                variant=variant,
-                chunk_size=0,
                 anderson_depth=anderson_depth,
                 max_time=_remaining(),
-                backend=backend,
-                num_threads=num_threads,
                 verbose=verbose,
                 monitor=monitor,
                 topo_weig=topo_weig,
                 hub_sk_threshold=hub_sk_threshold,
                 hub_bisect_max_sweeps=hub_bisect_max_sweeps,
                 hub_root_method=hub_root_method,
-                backtracking_gamma=backtracking_gamma,
                 z_clamp=z_clamp,
                 block_newton_gate=block_newton_gate,
                 block_newton_min_rel=block_newton_min_rel,
@@ -982,8 +885,8 @@ class DECMModel:
                 noise_cap_mult=noise_cap_mult,
                 noise_growth=noise_growth,
                 max_stalls=max_stalls,
-                device=device,
                 seed=seed,
+                device=device,
             )
 
         if not isinstance(ic, str):
@@ -1070,7 +973,7 @@ class DECMModel:
         """Exact degeneracy-grouped sampler (see :mod:`dcms.utils.grouped_sampling`).
 
         Falls back to the per-pair sampler, with a warning, when the fitted parameters are not constant within
-        groups of identical constraints (e.g. a model solved with ``reduce_degeneracy=False``)."""
+        groups of identical constraints (e.g. a ``sol`` assigned by hand or loaded from an older, unreduced solve)."""
         import warnings
         import numpy as np
         from dcms.utils.grouped_sampling import sample_grouped

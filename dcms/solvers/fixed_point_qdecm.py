@@ -9,45 +9,21 @@ where z_ij = β_out_i · β_in_j and G_ij = 1/(1-z_ij) is the geometric-distribu
 correction factor.  Note: the numerator is p_ij (not p_ij · z_ij), because
 E[w_ij] = p_ij · E[w_ij | a_ij=1] = p_ij · G_ij.
 
-Two variants are implemented:
+Nodes sharing the same (k_out, k_in, s_out, s_in) have identical parameters at the solution, so the
+weight step works on the M-unknown reduced system and expands the solution back to the N nodes
+(the topology step is a plain DCM, itself reduced on the (k_out, k_in) pairs).
 
-* **Gauss-Seidel** — multiplicative β-space fixed-point; out-multipliers are
-  updated first using the scaling rule:
+The iteration is a θ-space Gauss-Seidel Newton step: out-multipliers are updated first (pass 1), then
+in-multipliers are updated using the fresh θ_β_out values (pass 2). For each group g in pass 1:
 
-      β_out_i^{new} = β_out_i · s_out_i / s_out_hat_i
-
-  where s_out_hat_i = Σ_{j≠i} p_ij · G_ij (computed at current β).  This is
-  a valid fixed-point iteration: at convergence s_out_hat_i = s_out_i.
-
-  Fresh β_out values are immediately used when computing the in-multiplier
-  update:
-
-      β_in_i^{new} = β_in_i · s_in_i / s_in_hat_i
-
-  where s_in_hat_i = Σ_{j≠i} p_ji · G_ji (at updated β_out).
-
-* **θ-Newton** — θ-space Gauss-Seidel Newton steps (analogous to the DWCM
-  θ-Newton variant).  Out-multipliers are updated first (pass 1), then
-  in-multipliers are updated using the fresh θ_β_out values (pass 2).
-
-  For each node i in pass 1:
-
-      Δθ_β_out_i = −F_out_i / F′_out_i
-
+      Δθ_β_out_g = −F_out_g / F′_out_g
   where:
-      F_out_i  = Σ_{j≠i} p_ij · G_ij − s_out_i
-      F′_out_i = −Σ_{j≠i} p_ij · G_ij · (G_ij − 1)   [= ∂F_out/∂θ_β_out_i]
-      G_ij     = −1 / expm1(−(θ_β_out_i + θ_β_in_j))  [= 1/(1−exp(−z))]
+      F_out_g  = Σ_h m_h p_gh · G_gh − p_gg G_gg − s_out_g
+      F′_out_g = −Σ_h m_h p_gh · G_gh · (G_gh − 1) + (diagonal term)   [= ∂F_out/∂θ_β_out_g]
+      G_gh     = −1 / expm1(−(θ_β_out_g + θ_β_in_h))  [= 1/(1−exp(−z))]
 
-  Note: G_ij > 1 for all z_ij > 0, so F′_out_i < 0 (the system is
-  well-conditioned for Newton in θ-space).  Pass 2 mirrors this for the
-  in-multipliers using the updated θ_β_out.
-  The per-node step is clipped to ``[−max_step, +max_step]``.
-
-**Anderson acceleration** is available for all variants (depth 0 = plain FP).
-
-For N > ``_LARGE_N_THRESHOLD`` the N×N matrices are never materialised;
-instead row chunks of size ``_DEFAULT_CHUNK`` are used.
+G > 1 for all z > 0, so F′ < 0 (the system is well-conditioned for Newton in θ-space). The per-group
+step is clipped to ``[−max_step, +max_step]`` and accelerated by Anderson mixing.
 """
 from __future__ import annotations
 
@@ -55,14 +31,11 @@ import datetime
 import math
 import sys
 import time
-import functools
 import warnings
-from typing import Callable
 
 import torch
 
-from dcms.models.parameters import qDECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
-from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
+from dcms.models.parameters import _ETA_MAX
 from dcms.solvers.base import SolverResult
 from dcms.utils.profiling import _PeakRAMMonitor
 
@@ -175,553 +148,6 @@ def _anderson_mixing(
 
     return G @ c
 
-
-def _fp_step_dense(
-    beta_out: torch.Tensor,
-    beta_in: torch.Tensor,
-    P: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    variant: str,
-    theta: torch.Tensor | None = None,
-    max_step: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One dense fixed-point update step for the qDECM weight equations.
-
-    Args:
-        beta_out: Current β_out values, shape (N,).
-        beta_in:  Current β_in values, shape (N,).
-        P:        DCM probability matrix, shape (N, N), diagonal zero.
-        s_out:    Observed out-strength sequence, shape (N,).
-        s_in:     Observed in-strength sequence, shape (N,).
-        variant:  ``"gauss-seidel"`` or ``"jacobi"``.
-        theta:    Full parameter vector [θ_out | θ_in], shape (2N,), used
-                  by the Newton fallback.  Pass ``None`` to disable.
-        max_step: Maximum |Δθ| per node for the Newton fallback step.
-
-    Returns:
-        ``(beta_out_new, beta_in_new, F_current)`` where F_current is the
-        residual at the pre-update state, shape (2N,).
-    """
-    N = beta_out.shape[0]
-
-    xy = beta_out[:, None] * beta_in[None, :]
-    denom = (1.0 - xy.clamp(max=_Q_MAX)).clamp(min=1e-8)
-    # G_new_ij = 1/(1 - β_out_i β_in_j) = 1/denom
-    PG_new = P / denom         # p_ij · G_new_ij (diagonal masked by P[i,i]=0)
-
-    # s_out_hat[i] = Σ_{j≠i} p_ij G_new_ij
-    s_out_hat = PG_new.sum(dim=1)
-    # s_in_hat_orig[j] = Σ_{i≠j} p_ij G_new_ij  (col sums, at current β_out)
-    s_in_hat_orig = PG_new.sum(dim=0)
-
-    F_current = torch.cat([s_out_hat - s_out, s_in_hat_orig - s_in])
-
-    beta_out_new = torch.where(s_out_hat > 0, beta_out * s_out / s_out_hat, beta_out)
-
-    if theta is not None:
-        theta_out = theta[:N]
-        _theta_out_fp = (-torch.log(beta_out_new.clamp(min=1e-300))).clamp(
-            -_ETA_MAX, _ETA_MAX
-        )
-        _use_newton_out = (_theta_out_fp - theta_out).abs() > _FP_NEWTON_FALLBACK_DELTA
-        if _use_newton_out.any():
-            _delta_out = (s_out_hat - s_out) / s_out_hat.clamp(min=1e-30)
-            _delta_out = _delta_out.clamp(-max_step, max_step)
-            _theta_out_nt = (theta_out + _delta_out).clamp(-_ETA_MAX, _ETA_MAX)
-            beta_out_new = torch.where(
-                _use_newton_out, torch.exp(-_theta_out_nt), beta_out_new
-            )
-
-    beta_out_upd = beta_out_new if variant == "gauss-seidel" else beta_out
-
-    xy2 = beta_out_upd[:, None] * beta_in[None, :]
-    denom2 = (1.0 - xy2.clamp(max=_Q_MAX)).clamp(min=1e-8)
-    PG_new2 = P / denom2
-    s_in_hat = PG_new2.sum(dim=0)
-
-    beta_in_new = torch.where(s_in_hat > 0, beta_in * s_in / s_in_hat, beta_in)
-
-    if theta is not None:
-        theta_in = theta[N:]
-        _theta_in_fp = (-torch.log(beta_in_new.clamp(min=1e-300))).clamp(
-            -_ETA_MAX, _ETA_MAX
-        )
-        _use_newton_in = (_theta_in_fp - theta_in).abs() > _FP_NEWTON_FALLBACK_DELTA
-        if _use_newton_in.any():
-            _delta_in = (s_in_hat - s_in) / s_in_hat.clamp(min=1e-30)
-            _delta_in = _delta_in.clamp(-max_step, max_step)
-            _theta_in_nt = (theta_in + _delta_in).clamp(-_ETA_MAX, _ETA_MAX)
-            beta_in_new = torch.where(
-                _use_newton_in, torch.exp(-_theta_in_nt), beta_in_new
-            )
-
-    return beta_out_new, beta_in_new, F_current
-
-
-def _fp_step_chunked(
-    beta_out: torch.Tensor,
-    beta_in: torch.Tensor,
-    theta_topo_out: torch.Tensor,
-    theta_topo_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    chunk_size: int,
-    variant: str,
-    theta: torch.Tensor | None = None,
-    max_step: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Chunked fixed-point update for qDECM weight equations.
-
-    Avoids materialising the full N×N P and β matrices.
-
-    Args:
-        beta_out:       Current β_out values, shape (N,).
-        beta_in:        Current β_in values, shape (N,).
-        theta_topo_out: Out-topology parameters, shape (N,).
-        theta_topo_in:  In-topology parameters, shape (N,).
-        s_out:          Observed out-strength sequence, shape (N,).
-        s_in:           Observed in-strength sequence, shape (N,).
-        chunk_size:     Rows per processing chunk.
-        variant:        ``"gauss-seidel"`` or ``"jacobi"``.
-        theta:          Full parameter vector [θ_out | θ_in], shape (2N,), used
-                        by the Newton fallback.  Pass ``None`` to disable.
-        max_step:       Maximum |Δθ| per node for the Newton fallback step.
-
-    Returns:
-        ``(beta_out_new, beta_in_new, F_current)`` where F_current is the
-        residual at the pre-update state, shape (2N,).
-    """
-    N = beta_out.shape[0]
-    D_out = torch.zeros(N, dtype=torch.float64)    # will hold s_out_hat = Σ p G_new
-    s_in_hat_orig = torch.zeros(N, dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-
-        # p_chunk[local_i, j] = p_{i,j} = sigmoid(-θ_out_i - θ_in_j)
-        log_xy = (
-            -theta_topo_out[i_start:i_end, None]
-            - theta_topo_in[None, :]
-        )  # (chunk, N)
-        p_chunk = torch.sigmoid(log_xy)
-
-        # β_out[i] · β_in[j] products for this chunk
-        xy_chunk = beta_out[i_start:i_end, None] * beta_in[None, :]
-        denom_chunk = (1.0 - xy_chunk.clamp(max=_Q_MAX)).clamp(min=1e-8)
-
-        # G_new_ij = 1/denom_ij; d_chunk = p_ij G_new_ij
-        d_chunk = p_chunk / denom_chunk   # (chunk, N)
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        d_chunk[local_i, global_j] = 0.0    # zero diagonal
-
-        # D_out[i] = Σ_{j≠i} p_ij G_new_ij  (= s_out_hat[i])
-        D_out[i_start:i_end] = d_chunk.sum(dim=1)
-
-        # s_in_hat_orig[j] = Σ_{i≠j} p_ij G_new_ij  (col sums at current β_out)
-        s_in_hat_orig += d_chunk.sum(dim=0)
-
-    # Residual at current β (D_out = s_out_hat)
-    s_out_hat = D_out
-    F_current = torch.cat([s_out_hat - s_out, s_in_hat_orig - s_in])
-
-    beta_out_new = torch.where(D_out > 0, beta_out * s_out / D_out, beta_out)
-
-    if theta is not None:
-        _theta_out_fp = (
-            -torch.log(beta_out_new.clamp(min=1e-300))
-        ).clamp(-_ETA_MAX, _ETA_MAX)
-        _use_newton_out = (
-            (_theta_out_fp - theta[:N]).abs() > _FP_NEWTON_FALLBACK_DELTA
-        )
-        if _use_newton_out.any():
-            _delta_out = (
-                (s_out_hat - s_out) / s_out_hat.clamp(min=1e-30)
-            ).clamp(-max_step, max_step)
-            _theta_out_nt = (theta[:N] + _delta_out).clamp(-_ETA_MAX, _ETA_MAX)
-            beta_out_new = torch.where(
-                _use_newton_out, torch.exp(-_theta_out_nt), beta_out_new
-            )
-
-    beta_out_upd = beta_out_new if variant == "gauss-seidel" else beta_out
-
-    # D_in[j] = Σ_{i≠j} p[i,j] · G_new_ij  (= s_in_hat[j])
-    D_in = torch.zeros(N, dtype=torch.float64)
-    for j_start in range(0, N, chunk_size):
-        j_end = min(j_start + chunk_size, N)
-        chunk_len = j_end - j_start
-
-        log_xy = (
-            -theta_topo_out[j_start:j_end, None]
-            - theta_topo_in[None, :]
-        )  # (chunk, N): rows are j, cols are i
-        p_chunk = torch.sigmoid(log_xy)
-
-        xy_chunk = beta_out_upd[j_start:j_end, None] * beta_in[None, :]  # (chunk, N)
-        denom_chunk = (1.0 - xy_chunk.clamp(max=_Q_MAX)).clamp(min=1e-8)
-
-        # d_chunk[j,i] = p_ji G_new_ji = p_ji / (1-β_out_j β_in_i)
-        d_chunk = p_chunk / denom_chunk   # (chunk, N)
-        local_j = torch.arange(chunk_len, dtype=torch.long)
-        global_i = torch.arange(j_start, j_end, dtype=torch.long)
-        d_chunk[local_j, global_i] = 0.0    # zero diagonal (j==i)
-        D_in += d_chunk.sum(dim=0)
-
-    s_in_hat = D_in
-    beta_in_new = torch.where(D_in > 0, beta_in * s_in / D_in, beta_in)
-
-    if theta is not None:
-        _theta_in_fp = (
-            -torch.log(beta_in_new.clamp(min=1e-300))
-        ).clamp(-_ETA_MAX, _ETA_MAX)
-        _use_newton_in = (
-            (_theta_in_fp - theta[N:]).abs() > _FP_NEWTON_FALLBACK_DELTA
-        )
-        if _use_newton_in.any():
-            _delta_in = (
-                (s_in_hat - s_in) / s_in_hat.clamp(min=1e-30)
-            ).clamp(-max_step, max_step)
-            _theta_in_nt = (theta[N:] + _delta_in).clamp(-_ETA_MAX, _ETA_MAX)
-            beta_in_new = torch.where(
-                _use_newton_in, torch.exp(-_theta_in_nt), beta_in_new
-            )
-
-    return beta_out_new, beta_in_new, F_current
-
-
-def _theta_newton_step_dense(
-    theta_weight: torch.Tensor,
-    P: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    max_step: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One θ-space coordinate Newton step for the qDECM weight equations (dense).
-
-    For each node i:
-        Δθ_β_out_i = (Σ_{j≠i} p_ij G_ij − s_out_i) / Σ_{j≠i} p_ij G_ij(G_ij−1)
-
-    where G_ij = −1/expm1(−(θ_β_out_i + θ_β_in_j)) = 1/(1−exp(−z_ij)).
-
-    A per-node z-floor line-search (identical to the chunked path) ensures that
-    z_ij = θ_β_out_i + θ_β_in_j never drops below
-    max(z_min_ij * _Z_NEWTON_FRAC, _Z_NEWTON_FLOOR) after the step, preventing
-    the G = 1/expm1(z) computation from blowing up when z → 0⁺.
-
-    Args:
-        theta_weight: Current weight parameters [θ_β_out | θ_β_in], shape (2N,).
-        P:            DCM probability matrix, shape (N, N), diagonal zero.
-        s_out:        Observed out-strength sequence, shape (N,).
-        s_in:         Observed in-strength sequence, shape (N,).
-        max_step:     Maximum |Δθ| per node per step.
-
-    Returns:
-        Tuple of (updated weight parameters, residual F(θ_current)).
-        The residual is evaluated at the *input* theta_weight (before update).
-        Shape: ((2N,), (2N,)).
-    """
-    N = s_out.shape[0]
-    theta_b_out = theta_weight[:N]
-    theta_b_in = theta_weight[N:]
-
-    z = theta_b_out[:, None] + theta_b_in[None, :]  # (N, N)
-    z_safe = z.clamp(min=_Z_G_CLAMP)
-    G = -1.0 / torch.expm1(-z_safe)   # G_new = 1/(1-exp(-z))
-    G.fill_diagonal_(0.0)
-
-    PG = P * G               # (N, N)  = p_ij G_new_ij
-    PGG1 = P * G * (G - 1.0)  # (N, N) = p_ij G_new_ij(G_new_ij-1) = p_ij G_new G_old
-
-    # Residual at current theta (before update)
-    F_out = PG.sum(dim=1) - s_out    # shape (N,)
-    F_in_current = PG.sum(dim=0) - s_in  # col sums at ORIGINAL theta
-    F_current = torch.cat([F_out, F_in_current])
-
-    # Out-multiplier Newton steps
-    H_out = -PGG1.sum(dim=1)                          # diagonal Hessian ≤ 0
-    neg_H_out = (-H_out).clamp(min=1e-15)
-    delta_out = F_out / neg_H_out                     # = -ΔF/|H|
-    delta_out = delta_out.clamp(-max_step, max_step)
-
-    # Per-node z-floor line-search (out-direction): prevent z from dropping
-    # below max(z_min * _Z_NEWTON_FRAC, _Z_NEWTON_FLOOR).
-    # z_min_out[i] = min_{j≠i, s_in_j>0} (theta_b_out_i + theta_b_in_j).
-    # The full z matrix is already materialised, so we can compute the exact
-    # row-wise minimum, masking out the diagonal (self-loop, excluded from G)
-    # and zero-s_in nodes.
-    nz_in_mask = s_in > 0
-    _z_ls_out = z.clone()          # shape (N, N): z[i,j] = theta_b_out[i] + theta_b_in[j]
-    _z_ls_out.fill_diagonal_(float("inf"))          # exclude self-loop
-    if not nz_in_mask.all():
-        _z_ls_out[:, ~nz_in_mask] = float("inf")   # exclude zero-s_in nodes
-    z_min_out = _z_ls_out.min(dim=1).values         # (N,); inf if no valid j
-    z_floor_out = torch.clamp(z_min_out * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
-    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
-    needed_out = delta_out.abs().clamp(min=1e-30)
-    alpha_out = torch.where(
-        delta_out < 0,
-        (available_out / needed_out).clamp(max=1.0),
-        torch.ones(N, dtype=theta_b_out.dtype),
-    )
-
-    theta_b_out_new = (theta_b_out + alpha_out * delta_out).clamp(-_ETA_MAX, _ETA_MAX)
-    # Zero-strength nodes: β = 0 exactly → θ = _ETA_MAX
-    theta_b_out_new = torch.where(
-        s_out == 0, torch.full_like(theta_b_out_new, _ETA_MAX), theta_b_out_new
-    )
-
-    # Recompute G with updated θ_β_out (Gauss-Seidel: use fresh θ_β_out)
-    z2 = theta_b_out_new[:, None] + theta_b_in[None, :]
-    z2_safe = z2.clamp(min=_Z_G_CLAMP)
-    G2 = -1.0 / torch.expm1(-z2_safe)
-    G2.fill_diagonal_(0.0)
-
-    PG2 = P * G2
-    PGG12 = P * G2 * (G2 - 1.0)
-
-    # In-multiplier Newton steps
-    F_in = PG2.sum(dim=0) - s_in                      # col sums of PG2
-    H_in = -PGG12.sum(dim=0)
-    neg_H_in = (-H_in).clamp(min=1e-15)
-    delta_in = F_in / neg_H_in
-    delta_in = delta_in.clamp(-max_step, max_step)
-
-    # Per-node z-floor line-search (in-direction): uses the updated theta_b_out_new.
-    # z_min_in[j] = min_{i≠j, s_out_i>0} (theta_b_out_new[i] + theta_b_in[j]).
-    # Use the exact column-wise minimum from z2 (already materialised),
-    # masking out the diagonal and zero-s_out nodes.
-    nz_out_mask = s_out > 0
-    _z_ls_in = z2.clone()          # shape (N, N): z2[i,j] = theta_b_out_new[i] + theta_b_in[j]
-    _z_ls_in.fill_diagonal_(float("inf"))          # exclude self-loop
-    if not nz_out_mask.all():
-        _z_ls_in[~nz_out_mask, :] = float("inf")  # exclude zero-s_out nodes
-    z_min_in = _z_ls_in.min(dim=0).values           # (N,); inf if no valid i
-    z_floor_in = torch.clamp(z_min_in * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
-    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
-    needed_in = delta_in.abs().clamp(min=1e-30)
-    alpha_in = torch.where(
-        delta_in < 0,
-        (available_in / needed_in).clamp(max=1.0),
-        torch.ones(N, dtype=theta_b_in.dtype),
-    )
-
-    theta_b_in_new = (theta_b_in + alpha_in * delta_in).clamp(-_ETA_MAX, _ETA_MAX)
-    theta_b_in_new = torch.where(
-        s_in == 0, torch.full_like(theta_b_in_new, _ETA_MAX), theta_b_in_new
-    )
-
-    return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
-
-
-def _theta_newton_step_chunked(
-    theta_weight: torch.Tensor,
-    theta_topo_out: torch.Tensor,
-    theta_topo_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    chunk_size: int,
-    max_step: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked θ-space Gauss-Seidel Newton step for qDECM weight equations.
-
-    Two passes over the (N, N) product matrix, mirroring the DWCM chunked
-    Newton step:
-
-    * **Pass 1** — row sums (F_out, neg_H_out) and column sums for the
-      current-state residual (F_in_current).  Accumulates z_min_out[i] =
-      min over significant j of z_ij = θ_β_out_i + θ_β_in_j.
-      Applies **out-direction** Newton step with a per-pass z-floor
-      line-search (z_LS = 0) that prevents any significant pair from
-      having z_ij go negative.
-    * **Pass 2** — column sums using the updated θ_β_out_new (Gauss-Seidel:
-      in-direction sees the fresh out-multipliers).  Accumulates z_min_in[j]
-      and applies the **in-direction** step with the same z-floor line-search.
-
-    **Why two separate line-searches (not one combined)**:
-    In GS mode the two directions are applied sequentially.  A combined
-    (Jacobi) line-search would be unnecessarily conservative for the first
-    direction (would account for δ_in that hasn't been applied yet).  Using
-    per-pass line-searches gives the largest safe step for each direction
-    independently.
-
-    **Why z_LS = 0 (not _Z_G_CLAMP)**:
-    Using z_LS = _Z_G_CLAMP caused stagnation: once z hit exactly the clamp
-    value, available = z − _Z_G_CLAMP = 0 → alpha_cand = 0 → zero step.
-    With z_LS = 0 the available space is z itself, which is always positive
-    until the physical boundary z = 0 is hit.  The G-computation clamp
-    (_Z_G_CLAMP) remains separate and only caps G numerically.
-
-    **z_min is computed over significant pairs only** (p_ij > 0.5/N), so
-    disconnected-pair columns/rows with extreme θ_β values do not force
-    alpha to near-zero unnecessarily.
-
-    Args:
-        theta_weight:   Current weight parameters [θ_β_out | θ_β_in], shape (2N,).
-        theta_topo_out: Out-topology parameters, shape (N,).
-        theta_topo_in:  In-topology parameters, shape (N,).
-        s_out:          Observed out-strength sequence, shape (N,).
-        s_in:           Observed in-strength sequence, shape (N,).
-        chunk_size:     Rows per processing chunk.
-        max_step:       Maximum |Δθ| per node per step.
-
-    Returns:
-        Tuple of (updated weight parameters, residual F(θ_current)).
-        F is evaluated at the *input* theta_weight (before update).
-        Shape: ((2N,), (2N,)).
-    """
-    N = s_out.shape[0]
-    theta_b_out = theta_weight[:N]
-    theta_b_in = theta_weight[N:]
-
-    sig_log_thresh: float = math.log(0.5 / N) - math.log(1.0 - 0.5 / N)
-
-    # ------------------------------------------------------------------
-    # Pass 1: out-direction Newton step
-    # Accumulate row sums (F_out, neg_H_out), col sums for F_current,
-    # and z_min_out[i] = min over significant j of z_ij (for line-search).
-    # ------------------------------------------------------------------
-    sum_PG_out = torch.zeros(N, dtype=torch.float64)
-    sum_PGG1_out = torch.zeros(N, dtype=torch.float64)
-    sum_PG_in_current = torch.zeros(N, dtype=torch.float64)
-    z_min_out = torch.full((N,), float("inf"), dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-
-        log_xy = (
-            -theta_topo_out[i_start:i_end, None]
-            - theta_topo_in[None, :]
-        )
-        p_chunk = torch.sigmoid(log_xy)  # (chunk, N)
-        sig_mask = log_xy > sig_log_thresh  # p > 0.5/N
-
-        z_chunk = theta_b_out[i_start:i_end, None] + theta_b_in[None, :]
-        z_safe = z_chunk.clamp(min=_Z_G_CLAMP)
-        G_chunk = -1.0 / torch.expm1(-z_safe)  # G_new = 1/(1-exp(-z))
-
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        G_chunk[local_i, global_j] = 0.0  # zero diagonal
-
-        PG_chunk = p_chunk * G_chunk
-        PGG1_chunk = PG_chunk * (G_chunk - 1.0)  # p G_new (G_new-1) = p G_new G_old
-
-        sum_PG_out[i_start:i_end] = PG_chunk.sum(dim=1)
-        sum_PGG1_out[i_start:i_end] = PGG1_chunk.sum(dim=1)
-        sum_PG_in_current += PG_chunk.sum(dim=0)
-
-        # z_min_out[i]: min over significant j of (theta_b_out_i + theta_b_in_j)
-        z_sig = torch.where(sig_mask, z_chunk, torch.full_like(z_chunk, float("inf")))
-        z_min_out[i_start:i_end] = torch.minimum(
-            z_min_out[i_start:i_end], z_sig.min(dim=1).values
-        )
-
-    # Global z-floor guard: significant-pair tracking misses insignificant pairs
-    # (p < 0.5/N) that can still blow up G when z < 0.  Use the global minimum
-    # of theta_b_in over non-zero-strength nodes to tighten z_min_out[i].
-    # z_min_out[i] = theta_b_out_i + min_j(theta_b_in_j) (all j with s_in_j > 0).
-    nz_in_mask = s_in > 0
-    if nz_in_mask.any():
-        min_theta_b_in_nz = theta_b_in[nz_in_mask].min()
-        z_min_out = torch.minimum(z_min_out, theta_b_out + min_theta_b_in_nz)
-
-    F_out = sum_PG_out - s_out
-    F_in_current = sum_PG_in_current - s_in
-    F_current = torch.cat([F_out, F_in_current])
-
-    neg_H_out = sum_PGG1_out.clamp(min=1e-15)
-    delta_out = (F_out / neg_H_out).clamp(-max_step, max_step)
-
-    # Per-node z-floor line-search for out-direction.
-    # Effective floor = max(z_min * _Z_NEWTON_FRAC, _Z_NEWTON_FLOOR).
-    # The relative term prevents z from jumping more than 50 % downward in one
-    # step (stops oscillation between z* and z_clamp); the hard floor enables
-    # the doubling self-escape at z = z_clamp.
-    z_floor_out = torch.clamp(z_min_out * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
-    available_out = (z_min_out - z_floor_out).clamp(min=0.0)
-    needed_out = delta_out.abs().clamp(min=1e-30)
-    alpha_out = torch.where(
-        delta_out < 0,
-        (available_out / needed_out).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-
-    theta_b_out_new = (theta_b_out + alpha_out * delta_out).clamp(-_ETA_MAX, _ETA_MAX)
-    theta_b_out_new = torch.where(
-        s_out == 0, torch.full_like(theta_b_out_new, _ETA_MAX), theta_b_out_new
-    )
-
-    # ------------------------------------------------------------------
-    # Pass 2: in-direction Newton step (GS: uses theta_b_out_new).
-    # Accumulate col sums (F_in, neg_H_in) and z_min_in[j] for line-search.
-    # ------------------------------------------------------------------
-    sum_PG_in = torch.zeros(N, dtype=torch.float64)
-    sum_PGG1_in = torch.zeros(N, dtype=torch.float64)
-    z_min_in = torch.full((N,), float("inf"), dtype=torch.float64)
-
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-
-        log_xy = (
-            -theta_topo_out[i_start:i_end, None]
-            - theta_topo_in[None, :]
-        )
-        p_chunk = torch.sigmoid(log_xy)  # (chunk, N)
-        sig_mask = log_xy > sig_log_thresh
-
-        z2_chunk = theta_b_out_new[i_start:i_end, None] + theta_b_in[None, :]
-        z2_safe = z2_chunk.clamp(min=_Z_G_CLAMP)
-        G2_chunk = -1.0 / torch.expm1(-z2_safe)  # G_new
-
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        G2_chunk[local_i, global_j] = 0.0  # zero diagonal
-
-        PG2_chunk = p_chunk * G2_chunk
-        PGG12_chunk = PG2_chunk * (G2_chunk - 1.0)  # p G_new (G_new-1)
-
-        sum_PG_in += PG2_chunk.sum(dim=0)    # col sums
-        sum_PGG1_in += PGG12_chunk.sum(dim=0)
-
-        # z_min_in[j]: min over significant i of (theta_b_out_new_i + theta_b_in_j)
-        z2_sig = torch.where(sig_mask, z2_chunk, torch.full_like(z2_chunk, float("inf")))
-        z_min_in = torch.minimum(z_min_in, z2_sig.min(dim=0).values)
-
-    # Global z-floor guard for in-direction (mirrors out-direction guard above).
-    nz_out_mask = s_out > 0
-    if nz_out_mask.any():
-        min_theta_b_out_new_nz = theta_b_out_new[nz_out_mask].min()
-        z_min_in = torch.minimum(z_min_in, min_theta_b_out_new_nz + theta_b_in)
-
-    F_in = sum_PG_in - s_in
-    neg_H_in = sum_PGG1_in.clamp(min=1e-15)
-    delta_in = (F_in / neg_H_in).clamp(-max_step, max_step)
-
-    # Per-node z-floor line-search for in-direction (same two-floor logic).
-    z_floor_in = torch.clamp(z_min_in * _Z_NEWTON_FRAC, min=_Z_NEWTON_FLOOR)
-    available_in = (z_min_in - z_floor_in).clamp(min=0.0)
-    needed_in = delta_in.abs().clamp(min=1e-30)
-    alpha_in = torch.where(
-        delta_in < 0,
-        (available_in / needed_in).clamp(max=1.0),
-        torch.ones(N, dtype=torch.float64),
-    )
-
-    theta_b_in_new = (theta_b_in + alpha_in * delta_in).clamp(-_ETA_MAX, _ETA_MAX)
-    theta_b_in_new = torch.where(
-        s_in == 0, torch.full_like(theta_b_in_new, _ETA_MAX), theta_b_in_new
-    )
-
-    return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
-
-
-# ---------------------------------------------------------------------------
-# 1D bisection for hub nodes (high s/k ratio)
-# ---------------------------------------------------------------------------
 
 def _bisect_hub_beta(
     p_row: "np.ndarray",
@@ -934,156 +360,27 @@ def _qdecm_step_dense_weighted(
     return torch.cat([theta_b_out_new, theta_b_in_new]), F_current
 
 
-def _solve_fixed_point_qdecm_impl(
-    residual_fn: Callable[[torch.Tensor], torch.Tensor],
-    theta0: "ArrayLike",  # type: ignore[name-defined]
-    s_out: "ArrayLike",  # type: ignore[name-defined]
-    s_in: "ArrayLike",  # type: ignore[name-defined]
-    theta_topo: "ArrayLike",  # type: ignore[name-defined]
-    P: "ArrayLike | None" = None,
-    tol: float = 1e-8,
-    max_iter: int = 10_000,
-    damping: float = 1.0,
-    variant: str = "gauss-seidel",
-    chunk_size: int = 0,
-    anderson_depth: int = 0,
-    max_step: float = 1.0,
-    max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
-    verbose: bool = False,
-    monitor: bool = False,
-    hub_sk_threshold: float = 0.0,
-    backtracking_gamma: float = 0.0,
-    mult: torch.Tensor | None = None,
-    weight_anderson: bool = True,
-    z_clamp: float = 1e-8,
-    device: str = "cpu",
+def _solve_qdecm_weights_reduced(
+    theta0: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    theta_topo: torch.Tensor,
+    P: torch.Tensor,
+    mult: torch.Tensor,
+    tol: float,
+    max_iter: int,
+    anderson_depth: int,
+    max_step: float,
+    max_time: float,
+    verbose: bool,
+    monitor: bool,
+    hub_sk_threshold: float,
+    weight_anderson: bool,
+    z_clamp: float,
+    device: str,
 ) -> SolverResult:
-    """Fixed-point iteration for the qDECM weight step.
-
-    Args:
-        residual_fn: Function F_w(θ_β) → strength residual tensor (2N,).
-                     Used for convergence checks.
-        theta0:      Initial weight parameter vector [θ_β_out | θ_β_in], shape (2N,).
-                     All entries must be strictly positive.
-        s_out:       Observed out-strength sequence, shape (N,).
-        s_in:        Observed in-strength sequence, shape (N,).
-        theta_topo:  Fixed topology parameters [θ_out | θ_in] from the DCM
-                     solution, shape (2N,).  Used to compute p_ij at each step.
-        P:           Pre-computed DCM probability matrix, shape (N, N).
-                     If ``None``, computed from ``theta_topo`` at the start.
-                     Pass a pre-computed matrix to avoid recomputing every call.
-        tol:         Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
-        max_iter:    Maximum number of iterations.
-        damping:     Damping factor α ∈ (0, 1] for the ``"gauss-seidel"`` and
-                     ``"jacobi"`` variants.  α=1 → no damping.  Not used by
-                     ``"theta-newton"``; use ``max_step`` instead.
-        variant:     One of ``"gauss-seidel"``, ``"jacobi"``, or
-                     ``"theta-newton"``.
-        chunk_size:  If > 0, process the N×N products in chunks of this size.
-                     If 0, auto-select: dense for N ≤ ``_LARGE_N_THRESHOLD``,
-                     chunked (``_DEFAULT_CHUNK``) otherwise.
-        anderson_depth: Anderson acceleration depth.  0 = plain FP.
-        max_step:    Maximum per-node Newton step in ``"theta-newton"`` variant.
-        max_time:    Wall-clock time limit in seconds.  If > 0, the solver
-                     stops after this many seconds even if ``max_iter`` has not
-                     been reached.  Default 0 (no time limit).
-        backend:     Compute backend: ``"auto"`` (default), ``"pytorch"``, or
-                     ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
-                     Numba for larger networks.  Falls back automatically with
-                     a warning if the requested backend is unavailable.
-        num_threads: Number of Numba parallel threads.  0 (default) leaves
-                     the global Numba thread count unchanged.  Only takes
-                     effect when ``backend="numba"`` (or ``"auto"`` at large N).
-        verbose:     If ``True``, print a progress line at every iteration
-                     showing timestamp, iteration count, elapsed time, and MRE.
-        monitor:     If ``True`` (and ``verbose=True``), overwrite the same
-                     terminal line at each iteration (``end='\\r'``) so only
-                     the latest status is visible.  Default=False.
-        hub_sk_threshold: When > 0, nodes whose observed s_i / k_hat_i exceeds
-                     this threshold are treated as *hub nodes* and have their
-                     β updated by an exact 1D bisection instead of the global
-                     Newton/FP step.  k_hat_i = Σ_j p_ij is the expected degree
-                     from the DCM topology.  Typical value: 20–50.  Default 0
-                     (disabled).
-        backtracking_gamma (float): When > 0, after each ``"theta-newton"``
-                     step a backtracking line search is applied: the residual
-                     at the proposed ``theta_fp`` is evaluated, and if it
-                     exceeds ``backtracking_gamma × res_norm`` (residual at
-                     the current iterate), the step is halved up to 5 times
-                     until the condition is met.  Typical value: ``2.0``
-                     (allow at most a 2× residual increase).  Default 0
-                     (disabled).  Anderson history is cleared whenever a
-                     dampened step is accepted.
-        mult:        Internal use by :func:`solve_fixed_point_qdecm_degenerate`.
-                     When provided (shape (M,)), ``s_out``/``s_in``/``theta0``/
-                     ``theta_topo``/``P`` are interpreted as *group-level*
-                     quantities (one entry per unique weight-degeneracy
-                     group) and the step uses
-                     :func:`_qdecm_step_dense_weighted`. Only supported with
-                     ``variant="theta-newton"`` and ``backend="pytorch"``.
-                     Default None.
-        weight_anderson: Makes Anderson mixing multiplicity-aware in the
-                     reduced (``mult``) path -- see
-                     :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
-                     parameter of the same name. Default True.
-        z_clamp:     Floor on the raw z (the argument of the ``1/expm1(z)``
-                     weight factor) at every clamp site in the weight step,
-                     module-wide for the duration of this call (overrides
-                     the module constant ``_Z_G_CLAMP``/``_Z_NEWTON_FLOOR``
-                     via ``global``, same mechanism as DECM's ``z_clamp`` --
-                     see :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`).
-                     Default 1e-8 (previous hard-coded value, unchanged).
-                     :meth:`~dcms.models.qdecm.qDECMModel.max_relative_error`
-                     and the rest of ``qdecm.py`` still hard-code 1e-8
-                     independently of this override -- unlike DECM's
-                     z_clamp, this one has NOT been "tied" to the model's
-                     own residual computation (that was a dedicated,
-                     multi-day investigation for DECM specifically, see
-                     decm_ita_dico3_zclamp_investigation memory; qDECM has
-                     never needed it, being 19/19 converged with the
-                     default). Exposed for symmetry/debuggability by the
-                     2026-09-29 audit, not because a different value is
-                     known to help -- a warning fires if you pass anything
-                     other than 1e-8, since equations solved with any other
-                     clamp would then disagree with what the model's own
-                     residual judges.
-        device:      ``"cpu"`` (default, float64) or a torch device string
-                     like ``"mps"``/``"cuda"`` (float32, as for DECM). Only supported
-                     together with ``mult`` (the degeneracy-reduced path)
-                     and ``backend`` resolving to ``"pytorch"``. The
-                     returned ``SolverResult`` is always CPU/float64
-                     regardless of ``device``.
-
-    Returns:
-        :class:`~src.solvers.base.SolverResult` instance.
-    """
-    if mult is not None:
-        if variant != "theta-newton":
-            raise NotImplementedError(
-                "mult (degeneracy-reduced path) only supports "
-                "variant='theta-newton'."
-            )
-        if backend == "numba":
-            raise NotImplementedError(
-                "backend='numba' is not yet supported together with the "
-                "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
-            )
-    if variant not in ("jacobi", "gauss-seidel", "theta-newton"):
-        raise ValueError(
-            f"Unknown variant {variant!r}. "
-            "Choose 'jacobi', 'gauss-seidel', or 'theta-newton'."
-        )
-    if not (0.0 < damping <= 1.0):
-        raise ValueError(f"damping must be in (0, 1], got {damping}")
-    if chunk_size < 0:
-        raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
-    if device != "cpu" and (mult is None or backend == "numba"):
-        raise NotImplementedError(
-            "device != 'cpu' is only supported together with the "
-            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
-        )
+    """Newton/Anderson loop of the qDECM weight step on the reduced system (M groups, multiplicities ``mult``,
+    group-level topology probabilities ``P`` of shape (M, M)); see :func:`solve_fixed_point_qdecm_weight`."""
     if z_clamp != 1e-8:
         warnings.warn(
             f"z_clamp={z_clamp:g} != 1e-8: qDECMModel's own residual/weight computations "
@@ -1100,104 +397,29 @@ def _solve_fixed_point_qdecm_impl(
     _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
 
     # Convert inputs to tensors
-    if not isinstance(s_out, torch.Tensor):
-        s_out = torch.tensor(s_out, dtype=_dtype, device=_dev)
-    else:
-        s_out = s_out.to(dtype=_dtype, device=_dev)
-    if not isinstance(s_in, torch.Tensor):
-        s_in = torch.tensor(s_in, dtype=_dtype, device=_dev)
-    else:
-        s_in = s_in.to(dtype=_dtype, device=_dev)
-    if not isinstance(theta_topo, torch.Tensor):
-        theta_topo = torch.tensor(theta_topo, dtype=_dtype, device=_dev)
-    else:
-        theta_topo = theta_topo.to(dtype=_dtype, device=_dev)
-    if not isinstance(theta0, torch.Tensor):
-        theta = torch.tensor(theta0, dtype=_dtype, device=_dev)
-    else:
-        theta = theta0.clone().to(dtype=_dtype, device=_dev)
-    if mult is not None:
-        mult = mult.to(dtype=_dtype, device=_dev)
+    s_out = s_out.to(dtype=_dtype, device=_dev)
+    s_in = s_in.to(dtype=_dtype, device=_dev)
+    theta = theta0.clone().to(dtype=_dtype, device=_dev)
+    mult = mult.to(dtype=_dtype, device=_dev)
+    P_mat = P.to(dtype=_dtype, device=_dev)
 
     N = s_out.shape[0]
     theta = theta.clamp(-_ETA_MAX, _ETA_MAX)  # allow β>1 (negative θ)
-
-    # Resolve compute backend
-    from dcms.utils.backend import resolve_backend
-    _backend = resolve_backend(backend, N)
-    _use_numba = (_backend == "numba")
-    _prev_numba_threads: int | None = None
-    if _use_numba:
-        import numpy as np
-        from dcms.solvers._numba_kernels import (
-            _qdecm_theta_newton_numba,
-            _qdecm_fp_gs_numba,
-        )
-        from dcms.utils.backend import resolve_num_threads as _rnt
-        _safe_threads = _rnt(num_threads)
-        import numba as _numba_mod
-        _prev_numba_threads = _numba_mod.get_num_threads()
-        _numba_mod.set_num_threads(_safe_threads)
-
-    # Decide chunked vs dense (PyTorch path only)
-    if mult is not None:
-        # The reduced (mult) path only implements a dense weighted step
-        # (_qdecm_step_dense_weighted) -- M is always << N by construction,
-        # so this mirrors DECM/DCM/DWCM's reduced solvers, which are dense
-        # only too. Force dense regardless of the (M-based) auto-threshold.
-        effective_chunk = 0
-    elif chunk_size == 0:
-        effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
-    else:
-        effective_chunk = chunk_size
-
-    # Pre-compute DCM probability matrix (or use caller-supplied one)
-    if _use_numba:
-        theta_topo_out_chunked = theta_topo[:N]
-        theta_topo_in_chunked = theta_topo[N:]
-    elif effective_chunk == 0:  # dense path: pre-compute P once
-        if P is None:
-            theta_topo_out = theta_topo[:N]
-            theta_topo_in = theta_topo[N:]
-            log_xy = -theta_topo_out[:, None] - theta_topo_in[None, :]
-            P_mat = torch.sigmoid(log_xy)  # (N, N)
-            P_mat.fill_diagonal_(0.0)
-        elif not isinstance(P, torch.Tensor):
-            P_mat = torch.tensor(P, dtype=_dtype, device=_dev)
-        else:
-            P_mat: torch.Tensor = P.to(dtype=_dtype, device=_dev)
-    else:
-        theta_topo_out_chunked = theta_topo[:N]
-        theta_topo_in_chunked = theta_topo[N:]
 
     # --- Hub bisection pre-computation ---
     # Identify hub nodes (s/k_hat > hub_sk_threshold) and precompute their
     # full p-rows/columns (one row per out-hub, one col per in-hub).
     # Hub β values are solved exactly via 1D bisection each iteration instead
     # of the global Newton/FP step, which stagnates when z_ij ≈ 0.
-    _hub_active = (hub_sk_threshold > 0.0) and (not _use_numba)
+    _hub_active = hub_sk_threshold > 0.0
     _hub_out_idx: list[int] = []
     _hub_in_idx: list[int] = []
     _hub_P_out_rows: list[torch.Tensor] = []  # p_ij row for each out-hub
     _hub_P_in_cols: list[torch.Tensor] = []   # p_ij col for each in-hub
     if _hub_active:
-        import numpy as _hub_np
-        # Compute expected degree k_hat = sum_j p_ij for each node
-        if effective_chunk == 0:
-            k_hat_out = P_mat.sum(1)   # (N,)
-            k_hat_in  = P_mat.sum(0)   # (N,)
-        else:
-            k_hat_out = torch.zeros(N, dtype=torch.float64)
-            k_hat_in  = torch.zeros(N, dtype=torch.float64)
-            _tto = theta_topo_out_chunked
-            _tti = theta_topo_in_chunked
-            for _i0 in range(0, N, effective_chunk):
-                _i1 = min(_i0 + effective_chunk, N)
-                _log_xy = -_tto[_i0:_i1, None] - _tti[None, :]
-                _p_chunk = torch.sigmoid(_log_xy)
-                _p_chunk[:, _i0:_i1].fill_diagonal_(0.0)
-                k_hat_out[_i0:_i1] = _p_chunk.sum(1)
-                k_hat_in += _p_chunk.sum(0)
+        # Expected degree k_hat = sum_j p_ij for each group
+        k_hat_out = P_mat.sum(1)   # (N,)
+        k_hat_in  = P_mat.sum(0)   # (N,)
 
         hub_out_mask = (
             (s_out > 0)
@@ -1213,31 +435,10 @@ def _solve_fixed_point_qdecm_impl(
         _hub_in_idx  = hub_in_mask.nonzero(as_tuple=True)[0].tolist()
 
         # Precompute the full p-row / p-col for each hub (small number of rows)
-        if effective_chunk == 0:
-            for _i in _hub_out_idx:
-                _hub_P_out_rows.append(P_mat[_i].clone())
-            for _j in _hub_in_idx:
-                _hub_P_in_cols.append(P_mat[:, _j].clone())
-        else:
-            _tto = theta_topo_out_chunked
-            _tti = theta_topo_in_chunked
-            # Accumulate full row/col for each hub across chunks
-            _hub_out_rows_acc = [torch.zeros(N, dtype=torch.float64) for _ in _hub_out_idx]
-            _hub_in_cols_acc  = [torch.zeros(N, dtype=torch.float64) for _ in _hub_in_idx]
-            for _i0 in range(0, N, effective_chunk):
-                _i1 = min(_i0 + effective_chunk, N)
-                _log_xy = -_tto[_i0:_i1, None] - _tti[None, :]
-                _p_chunk = torch.sigmoid(_log_xy)
-                _p_chunk[:, _i0:_i1].fill_diagonal_(0.0)
-                # Row contribution: out-hub i in range [i0, i1) → direct slice
-                for _k, _i in enumerate(_hub_out_idx):
-                    if _i0 <= _i < _i1:
-                        _hub_out_rows_acc[_k] = _p_chunk[_i - _i0].clone()
-                # Col contribution: accumulate from column slice
-                for _k, _j in enumerate(_hub_in_idx):
-                    _hub_in_cols_acc[_k][_i0:_i1] += _p_chunk[:, _j]
-            _hub_P_out_rows = _hub_out_rows_acc
-            _hub_P_in_cols  = _hub_in_cols_acc
+        for _i in _hub_out_idx:
+            _hub_P_out_rows.append(P_mat[_i].clone())
+        for _j in _hub_in_idx:
+            _hub_P_in_cols.append(P_mat[:, _j].clone())
 
         if verbose and (_hub_out_idx or _hub_in_idx):
             print(
@@ -1271,10 +472,6 @@ def _solve_fixed_point_qdecm_impl(
     # Running minimum of the equation-residual for blowup detection
     _best_res_for_anderson: float = float("inf")
 
-    # FP-GS periodic Newton correction stagnation counter
-    _fpgs_best_local: float = float("inf")
-    _fpgs_stagnation_count: int = 0
-
     # θ-Newton Anderson reset counter (revert to best_theta when stagnant)
     _tn_best_local: float = float("inf")
     _tn_stagnation_count: int = 0
@@ -1285,13 +482,11 @@ def _solve_fixed_point_qdecm_impl(
 
     # Anderson mixing needs per-component weights in the degeneracy-reduced
     # path -- see _anderson_mixing's docstring and the analogous DECM/DCM/DWCM fix.
-    _anderson_weights = (
-        torch.cat([mult, mult]) if (mult is not None and weight_anderson) else None
-    )
+    _anderson_weights = torch.cat([mult, mult]) if weight_anderson else None
     # Group multiplicities as numpy, for the weighted hub-bisection sum.
     # (.cpu() first: mult may live on a non-CPU device, e.g. under `device="mps"`,
     # and this small, occasional-use array is only ever consumed via numpy.)
-    _mult_np = mult.detach().to(device="cpu").to(dtype=torch.float64).numpy() if mult is not None else None
+    _mult_np = mult.detach().to(device="cpu").to(dtype=torch.float64).numpy()
 
     try:
         for _ in range(max_iter):
@@ -1302,87 +497,9 @@ def _solve_fixed_point_qdecm_impl(
                 )
                 break
 
-            if mult is not None:
-                theta_fp, F_current = _qdecm_step_dense_weighted(
-                    theta, P_mat, s_out, s_in, max_step, mult
-                )
-            elif variant == "theta-newton":
-                # θ-space coordinate Newton step.
-                if _use_numba:
-                    tbo = theta[:N].numpy()
-                    tbi = theta[N:].numpy()
-                    tbo_new, tbi_new, fo, fi = _qdecm_theta_newton_numba(
-                        tbo, tbi,
-                        theta_topo_out_chunked.numpy(),
-                        theta_topo_in_chunked.numpy(),
-                        s_out.numpy(), s_in.numpy(),
-                        max_step, _ETA_MIN, _ETA_MAX,
-                        _Z_G_CLAMP, _Z_NEWTON_FLOOR, _Z_NEWTON_FRAC,
-                    )
-                    theta_fp = torch.from_numpy(np.concatenate([tbo_new, tbi_new]))
-                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
-                elif effective_chunk > 0:
-                    theta_fp, F_current = _theta_newton_step_chunked(
-                        theta,
-                        theta_topo_out_chunked,
-                        theta_topo_in_chunked,
-                        s_out,
-                        s_in,
-                        effective_chunk,
-                        max_step,
-                    )
-                else:
-                    theta_fp, F_current = _theta_newton_step_dense(
-                        theta, P_mat, s_out, s_in, max_step,
-                    )
-            else:
-                # β-space fixed-point iteration (Gauss-Seidel or Jacobi)
-                if _use_numba:
-                    bo = torch.exp(-theta[:N]).numpy()
-                    bi = torch.exp(-theta[N:]).numpy()
-                    bon, bin_, fo, fi = _qdecm_fp_gs_numba(
-                        bo, bi,
-                        theta_topo_out_chunked.numpy(),
-                        theta_topo_in_chunked.numpy(),
-                        s_out.numpy(), s_in.numpy(),
-                        theta[:N].numpy(), theta[N:].numpy(),
-                        max_step, _ETA_MIN, _ETA_MAX,
-                        _Q_MAX, _FP_NEWTON_FALLBACK_DELTA, True,
-                    )
-                    beta_out_new = torch.from_numpy(bon)
-                    beta_in_new = torch.from_numpy(bin_)
-                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
-                elif effective_chunk > 0:
-                    beta_out = torch.exp(-theta[:N])
-                    beta_in = torch.exp(-theta[N:])
-                    beta_out_new, beta_in_new, F_current = _fp_step_chunked(
-                        beta_out, beta_in,
-                        theta_topo_out_chunked, theta_topo_in_chunked,
-                        s_out, s_in, effective_chunk, variant,
-                        theta=theta, max_step=max_step,
-                    )
-                else:
-                    beta_out = torch.exp(-theta[:N])
-                    beta_in = torch.exp(-theta[N:])
-                    beta_out_new, beta_in_new, F_current = _fp_step_dense(
-                        beta_out, beta_in, P_mat, s_out, s_in, variant,
-                        theta=theta, max_step=max_step,
-                    )
-
-                # Clamp β to (0, ∞) to maintain non-negativity; product cap is
-                # enforced via _Q_MAX in the step functions.
-                beta_out_new = beta_out_new.clamp(min=1e-300)
-                beta_in_new = beta_in_new.clamp(min=1e-300)
-
-                # Convert to θ-space and apply damping
-                theta_out_new = (-torch.log(beta_out_new)).clamp(-_ETA_MAX, _ETA_MAX)
-                theta_in_new = (-torch.log(beta_in_new)).clamp(-_ETA_MAX, _ETA_MAX)
-                fp_raw = torch.cat([theta_out_new, theta_in_new])
-
-                # Damped FP output: g(θ) = α * FP_raw(θ) + (1−α) * θ
-                theta_fp = (damping * fp_raw + (1.0 - damping) * theta).clamp(
-                    -_ETA_MAX, _ETA_MAX
-                )
+            theta_fp, F_current = _qdecm_step_dense_weighted(
+                theta, P_mat, s_out, s_in, max_step, mult
+            )
 
             # Universal single-step floor: prevent any θ from dropping below
             # _ANDERSON_THETA_FLOOR × its current value in a single iteration.
@@ -1411,7 +528,7 @@ def _solve_fixed_point_qdecm_impl(
                         _p_row = _hub_P_out_rows[_hk].numpy()
                         _new_beta = _bisect_hub_beta(
                             _p_row, _beta_in_fp, s_out[_hi].item(),
-                            self_idx=(_hi if mult is not None else None),
+                            self_idx=_hi,
                             mult=_mult_np,
                         )
                         if _new_beta > 0.0:
@@ -1423,7 +540,7 @@ def _solve_fixed_point_qdecm_impl(
                         _p_col = _hub_P_in_cols[_hk].numpy()
                         _new_beta = _bisect_hub_beta(
                             _p_col, _beta_out_fp, s_in[_hj].item(),
-                            self_idx=(_hj if mult is not None else None),
+                            self_idx=_hj,
                             mult=_mult_np,
                         )
                         if _new_beta > 0.0:
@@ -1447,50 +564,6 @@ def _solve_fixed_point_qdecm_impl(
             if not math.isfinite(res_norm):
                 message = f"NaN/Inf detected at iteration {n_iter}."
                 break
-
-            # --- Backtracking line search (theta-newton only, PyTorch path) ---
-            # Evaluate the residual at the proposed theta_fp.  If it exceeds
-            # backtracking_gamma × res_norm (residual at the current theta),
-            # halve the step up to 5 times and accept the best dampened iterate.
-            # Anderson history is cleared on each successful backtrack because the
-            # shorter step invalidates the mixing history accumulated so far.
-            if (
-                backtracking_gamma > 0.0
-                and variant == "theta-newton"
-                and res_norm > 0.0
-                and not _use_numba
-            ):
-                _F_fp = residual_fn(theta_fp)
-                _res_fp = (
-                    (_F_fp.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
-                    if _v_nonzero.any() else 0.0
-                )
-                if math.isfinite(_res_fp) and _res_fp > backtracking_gamma * res_norm:
-                    _bt_best_res = _res_fp
-                    _bt_best_theta = theta_fp.clone()
-                    _bt_alpha = 0.5
-                    for _ in range(5):  # min alpha = 1/32
-                        _theta_bt = (
-                            theta + _bt_alpha * (theta_fp - theta)
-                        ).clamp(-_ETA_MAX, _ETA_MAX)
-                        _F_bt = residual_fn(_theta_bt)
-                        _res_bt = (
-                            (_F_bt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item()
-                            if _v_nonzero.any() else 0.0
-                        )
-                        if math.isfinite(_res_bt) and _res_bt < _bt_best_res:
-                            _bt_best_res = _res_bt
-                            _bt_best_theta = _theta_bt.clone()
-                        if math.isfinite(_res_bt) and _res_bt <= backtracking_gamma * res_norm:
-                            break
-                        _bt_alpha *= 0.5
-                    if _bt_best_res < _res_fp:
-                        theta_fp = _bt_best_theta
-                        _and_g.clear()
-                        _and_r.clear()
-                        _best_res_for_anderson = float("inf")
-                        _tn_stagnation_count = 0
-                        _tn_best_local = float("inf")
 
             n_iter += 1
             residuals.append(res_norm)
@@ -1539,29 +612,12 @@ def _solve_fixed_point_qdecm_impl(
                 best_res_old = best_res_recent
                 best_res_recent = float("inf")
 
-            _fpgs_newton_fired = False
-            if variant != "theta-newton" and anderson_depth > 1:
-                if res_norm < _fpgs_best_local * 0.99:
-                    _fpgs_best_local = res_norm
-                    _fpgs_stagnation_count = 0
-                else:
-                    _fpgs_stagnation_count += 1
-                    if (
-                        _fpgs_stagnation_count >= _FPGS_NEWTON_RESET_WINDOW
-                        and res_norm > tol
-                    ):
-                        _fpgs_newton_fired = True
-                        _fpgs_stagnation_count = 0
-                        _fpgs_best_local = float("inf")
-                        _and_g.clear()
-                        _and_r.clear()
-
             # θ-Newton Anderson reset: when Anderson has been stagnant for
             # _TN_RESET_WINDOW iterations, clear its history and revert to
             # best_theta so the next Newton step starts from the best-seen
             # iterate rather than a contaminated Anderson mix.
             _tn_revert_triggered = False
-            if variant == "theta-newton" and anderson_depth > 1:
+            if anderson_depth > 1:
                 if res_norm < _tn_best_local * 0.99:
                     _tn_best_local = res_norm
                     _tn_stagnation_count = 0
@@ -1613,9 +669,7 @@ def _solve_fixed_point_qdecm_impl(
                         for _hj in _hub_in_idx:
                             r_k[N + _hj] = 0.0
                     r_k_norm = r_k.abs().max().item()
-                    if math.isfinite(r_k_norm) and (
-                        variant != "theta-newton" or r_k_norm < _ANDERSON_MAX_NORM
-                    ):
+                    if math.isfinite(r_k_norm) and r_k_norm < _ANDERSON_MAX_NORM:
                         _and_g.append(theta_fp.clone())
                         _and_r.append(r_k.clone())
 
@@ -1671,83 +725,11 @@ def _solve_fixed_point_qdecm_impl(
                 for _hj in _hub_in_idx:
                     theta_next[N + _hj] = theta_fp[N + _hj]
 
-            # --- FP-GS post-Anderson Newton-Anderson mini-loop ---
-            if _fpgs_newton_fired:
-                theta_nt = best_theta.clone()
-                _nt_and_g: list[torch.Tensor] = []
-                _nt_and_r: list[torch.Tensor] = []
-                for _ in range(_FPGS_NEWTON_STEPS):
-                    if _use_numba:
-                        tbo = theta_nt[:N].numpy()
-                        tbi = theta_nt[N:].numpy()
-                        tbo_new, tbi_new, fo, fi = _qdecm_theta_newton_numba(
-                            tbo, tbi,
-                            theta_topo_out_chunked.numpy(),
-                            theta_topo_in_chunked.numpy(),
-                            s_out.numpy(), s_in.numpy(),
-                            max_step, _ETA_MIN, _ETA_MAX,
-                            _Z_G_CLAMP, _Z_NEWTON_FLOOR, _Z_NEWTON_FRAC,
-                        )
-                        theta_nt_fp = torch.from_numpy(np.concatenate([tbo_new, tbi_new]))
-                        F_nt = torch.from_numpy(np.concatenate([fo, fi]))
-                    elif effective_chunk > 0:
-                        theta_nt_fp, F_nt = _theta_newton_step_chunked(
-                            theta_nt,
-                            theta_topo_out_chunked,
-                            theta_topo_in_chunked,
-                            s_out,
-                            s_in,
-                            effective_chunk,
-                            max_step,
-                        )
-                    else:
-                        theta_nt_fp, F_nt = _theta_newton_step_dense(
-                            theta_nt, P_mat, s_out, s_in, max_step
-                        )
-                    # Per-step floor (same as main loop): only when positive
-                    _nt_floor = (theta_nt * _ANDERSON_THETA_FLOOR).clamp(min=-_ETA_MAX)
-                    theta_nt_fp = torch.where(
-                        theta_nt_fp > 0,
-                        torch.maximum(theta_nt_fp, _nt_floor),
-                        theta_nt_fp,
-                    ).clamp(-_ETA_MAX, _ETA_MAX)
-                    nt_res = (F_nt.abs()[_v_nonzero] / _v_targets[_v_nonzero]).max().item() if _v_nonzero.any() else 0.0
-                    if nt_res < tol:
-                        theta_nt = theta_nt_fp
-                        break
-                    # Anderson mixing within the mini-loop
-                    r_nt = theta_nt_fp - theta_nt
-                    r_nt_norm = r_nt.abs().max().item()
-                    if math.isfinite(r_nt_norm) and r_nt_norm < _ANDERSON_MAX_NORM:
-                        _nt_and_g.append(theta_nt_fp.clone())
-                        _nt_and_r.append(r_nt.clone())
-                    if len(_nt_and_g) > _FPGS_NEWTON_AND_DEPTH:
-                        _nt_and_g.pop(0)
-                        _nt_and_r.pop(0)
-                    if len(_nt_and_g) >= 2:
-                        theta_nt_next = _anderson_mixing(_nt_and_g, _nt_and_r)
-                        eff_floor = torch.minimum(
-                            _nt_floor, theta_nt_fp
-                        )
-                        theta_nt_next = torch.maximum(theta_nt_next, eff_floor).clamp(
-                            -_ETA_MAX, _ETA_MAX
-                        )
-                    else:
-                        theta_nt_next = theta_nt_fp
-                    theta_nt = theta_nt_next
-                theta_next = theta_nt
-                # Reset blowup threshold so post-Newton residuals don't trigger
-                # a false blowup on the very next main-loop iteration.
-                _best_res_for_anderson = float("inf")
-
             theta = theta_next
     finally:
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)
         peak_ram = _peak_ram_monitor.peak_bytes
-        if _prev_numba_threads is not None:
-            import numba as _numba_mod
-            _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
         # NOTE: must split device+dtype into two .to() calls -- combining them
@@ -1763,18 +745,7 @@ def _solve_fixed_point_qdecm_impl(
     )
 
 
-@functools.wraps(_solve_fixed_point_qdecm_impl)
-def solve_fixed_point_qdecm(*args, **kwargs):
-    """Sets the module-level z clamp for the call and restores it afterwards (see ``z_clamp``)."""
-    global _Z_G_CLAMP, _Z_NEWTON_FLOOR
-    saved = (_Z_G_CLAMP, _Z_NEWTON_FLOOR)
-    try:
-        return _solve_fixed_point_qdecm_impl(*args, **kwargs)
-    finally:
-        _Z_G_CLAMP, _Z_NEWTON_FLOOR = saved
-
-
-def solve_fixed_point_qdecm_degenerate(
+def solve_fixed_point_qdecm(
     theta_topo0: "ArrayLike",  # type: ignore[name-defined]
     theta_weight0: "ArrayLike",  # type: ignore[name-defined]
     k_out: "ArrayLike",  # type: ignore[name-defined]
@@ -1787,8 +758,6 @@ def solve_fixed_point_qdecm_degenerate(
     anderson_depth: int = 10,
     max_step: float = 1.0,
     max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
@@ -1817,14 +786,17 @@ def solve_fixed_point_qdecm_degenerate(
             solve_fixed_point_dcm_degenerate's own tol which is set equal).
         max_iter: Max iterations for the weight step.
         topo_max_iter: Max iterations for the topology (DCM) step.
-        (all other args): see :func:`solve_fixed_point_qdecm`.
+        anderson_depth, max_step, max_time, verbose, monitor, device: as in
+            :func:`~dcms.solvers.fixed_point_dcm.solve_fixed_point_dcm`; hub_sk_threshold: see the module docstring of
+            the hub bisection (0 = off); weight_anderson: weight the Anderson rows by the group multiplicities;
+            z_clamp: minimum z in G = 1/expm1(z) (module constant for the duration of the call).
 
     Returns:
         :class:`~dcms.solvers.base.SolverResult` for the *weight* step, with
         ``theta``/``best_theta`` expanded to shape (2N,). The topology
         solver's convergence status is folded into ``message``.
     """
-    from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate
+    from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm
 
     k_out = k_out if isinstance(k_out, torch.Tensor) else torch.tensor(k_out, dtype=torch.float64)
     k_in = k_in if isinstance(k_in, torch.Tensor) else torch.tensor(k_in, dtype=torch.float64)
@@ -1839,21 +811,19 @@ def solve_fixed_point_qdecm_degenerate(
     # qDECMModel.solve_tool's established practice): better topology
     # precision helps the weight step converge, since p_ij feeds into it
     # as a fixed input.
-    _topo_tol_help = 1e-3
-    topo_res = solve_fixed_point_dcm_degenerate(
+    _topo_tol_help = 1e-3   # TEMPORARY: removed after the refactor is verified bit-identical
+    topo_res = solve_fixed_point_dcm(
         theta_topo0, k_out, k_in,
         tol=tol * _topo_tol_help, max_iter=topo_max_iter, anderson_depth=anderson_depth,
-        max_step=max_step, max_time=max_time, backend=backend,
-        num_threads=num_threads, verbose=verbose, monitor=monitor,
+        max_step=max_step, max_time=max_time, verbose=verbose, monitor=monitor,
         device=device,
     )
     theta_topo = torch.as_tensor(topo_res.best_theta, dtype=torch.float64)
 
-    weight_res = solve_fixed_point_qdecm_weight_degenerate(
+    weight_res = solve_fixed_point_qdecm_weight(
         theta_topo, theta_weight0, k_out, k_in, s_out, s_in,
         tol=tol, max_iter=max_iter, anderson_depth=anderson_depth,
-        max_step=max_step, max_time=max_time, backend=backend,
-        num_threads=num_threads, verbose=verbose, monitor=monitor,
+        max_step=max_step, max_time=max_time, verbose=verbose, monitor=monitor,
         hub_sk_threshold=hub_sk_threshold, weight_anderson=weight_anderson,
         z_clamp=z_clamp, device=device,
     )
@@ -1870,7 +840,7 @@ def solve_fixed_point_qdecm_degenerate(
     )
 
 
-def solve_fixed_point_qdecm_weight_degenerate(
+def solve_fixed_point_qdecm_weight(
     theta_topo: "ArrayLike",  # type: ignore[name-defined]
     theta_weight0: "ArrayLike",  # type: ignore[name-defined]
     k_out: "ArrayLike",  # type: ignore[name-defined]
@@ -1882,8 +852,6 @@ def solve_fixed_point_qdecm_weight_degenerate(
     anderson_depth: int = 10,
     max_step: float = 1.0,
     max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
     hub_sk_threshold: float = 0.0,
@@ -1908,7 +876,10 @@ def solve_fixed_point_qdecm_weight_degenerate(
             (e.g. from :func:`~dcms.solvers.fixed_point_dcm.solve_fixed_point_dcm_degenerate`).
         theta_weight0: Initial weight guess [theta_b_out|theta_b_in], shape (2N,).
         k_out, k_in, s_out, s_in: Observed sequences, each shape (N,).
-        (all other args): see :func:`solve_fixed_point_qdecm`.
+        anderson_depth, max_step, max_time, verbose, monitor, device: as in
+            :func:`~dcms.solvers.fixed_point_dcm.solve_fixed_point_dcm`; hub_sk_threshold: see the module docstring of
+            the hub bisection (0 = off); weight_anderson: weight the Anderson rows by the group multiplicities;
+            z_clamp: minimum z in G = 1/expm1(z) (module constant for the duration of the call).
 
     Returns:
         :class:`~dcms.solvers.base.SolverResult` for the weight step, with
@@ -1962,31 +933,17 @@ def solve_fixed_point_qdecm_weight_degenerate(
         [theta_weight0[:N][_first_idx], theta_weight0[N:][_first_idx]]
     )
 
-    def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
-        return _qdecm_step_dense_weighted(theta_m, P_g, s_out_g, s_in_g, max_step, mult)[1]
-
-    result_g = solve_fixed_point_qdecm(
-        _residual_fn_g,
-        theta_weight0_g,
-        s_out_g, s_in_g,
-        torch.cat([theta_topo_out_g, theta_topo_in_g]),
-        P=P_g,
-        tol=tol,
-        max_iter=max_iter,
-        variant="theta-newton",
-        anderson_depth=anderson_depth,
-        max_step=max_step,
-        max_time=max_time,
-        backend=backend,
-        num_threads=num_threads,
-        verbose=verbose,
-        monitor=monitor,
-        hub_sk_threshold=hub_sk_threshold,
-        mult=mult,
-        weight_anderson=weight_anderson,
-        z_clamp=z_clamp,
-        device=device,
-    )
+    global _Z_G_CLAMP, _Z_NEWTON_FLOOR
+    saved_clamp = (_Z_G_CLAMP, _Z_NEWTON_FLOOR)       # the core sets the module-level z clamp for the duration of the call
+    try:
+        result_g = _solve_qdecm_weights_reduced(
+            theta_weight0_g, s_out_g, s_in_g, torch.cat([theta_topo_out_g, theta_topo_in_g]), P_g, mult,
+            tol=tol, max_iter=max_iter, anderson_depth=anderson_depth, max_step=max_step, max_time=max_time,
+            verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, weight_anderson=weight_anderson,
+            z_clamp=z_clamp, device=device,
+        )
+    finally:
+        _Z_G_CLAMP, _Z_NEWTON_FLOOR = saved_clamp
 
     def _expand(theta_m):
         import numpy as np

@@ -1,9 +1,7 @@
 """Numerical solvers for MaxEnt network models.
 
-Two methods are implemented for each model:
-
-* **FP-GS Anderson(10)** — Gauss-Seidel fixed-point with Anderson(10) acceleration
-* **θ-Newton Anderson(10)** — coordinate-wise Newton in θ-space with Anderson(10) acceleration
+Each solver is a θ-space Newton iteration with Anderson acceleration on the degeneracy-reduced system
+(nodes with identical constraints share their parameters), expanded back to the N nodes on return.
 """
 from .base import SolverResult
 from .fixed_point_dcm import solve_fixed_point_dcm

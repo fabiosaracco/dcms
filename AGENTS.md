@@ -96,14 +96,8 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 - **Non applicabile al DECM** (dove le equazioni di k dipendono da β)
 
 ### Dettagli implementativi comuni
-- Chunked computation per N > 5000: non materializzare mai la matrice N×N completa, calcolare a blocchi di chunk×N
-- **Backend selezionabile**: ogni solver accetta un parametro `backend` (`"auto"`, `"pytorch"`, `"numba"`).
-  - `"auto"` (default): PyTorch chunked per N ≤ 100 000, Numba scalar per N > 100 000 (soglia aggiornata al 2026-07-13 in base a benchmark reali su DECM N=50k/100k/200k su stella: RAM di picco praticamente identica tra i due backend a tutte le scale — Numba NON offre vantaggio di RAM come si credeva in origine; PyTorch è più veloce fino a N≈50k, Numba diventa ~13-14% più veloce solo da N≥100k)
-  - `"pytorch"`: forza PyTorch (dense o chunked a seconda di N)
-  - `"numba"`: forza Numba JIT-compilato
-  - Fallback automatico con warning se il backend richiesto non è disponibile
-  - Numba è opzionale: `pip install dcms[numba]`
-  - Nota: Numba non è necessario per supportare Python < 3.9 — PyTorch da solo gira correttamente su Python 3.8 (testato); il vincolo `requires-python>=3.9` in `pyproject.toml` è una scelta di packaging, non un limite tecnico legato al backend
+- **Solo sistema ridotto** (2026-10-27): ogni solver lavora sul sistema ridotto per degenerazione (nodi con gli stessi vincoli hanno gli stessi parametri; M gruppi invece di N nodi) e riespande la soluzione a N nodi. Il solver non ridotto per nodo, il backend Numba, la variante Gauss-Seidel e il backtracking sono stati rimossi: la riduzione è esatta (non un'approssimazione) e il confronto ridotto/non ridotto era già stato fatto.
+- Per il DECM il passo ridotto è denso fino a M ≤ 2000 e a blocchi (chunk×M) oltre: non si materializza mai una matrice più grande del necessario
 - Zero-strength/zero-degree nodes: fissare θ = θ_MAX e non aggiornare mai
 - Convergenza: ‖F‖∞ < tol (default 1e-5)
 - Profiling: ogni solver restituisce `SolverResult` con theta, converged, iterations, residuals, elapsed_time, peak_ram_bytes
@@ -111,7 +105,7 @@ I modelli da implementare sono quattro, in ordine crescente di complessità:
 ## Piano di lavoro — SEGUI QUESTO ORDINE
 
 ### Fase 1: Infrastruttura ✅ COMPLETATA
-1. Struttura del progetto: `src/models/`, `src/solvers/`, `src/benchmarks/`, `src/utils/`, `tests/`
+1. Struttura del progetto: `dcms/models/`, `dcms/solvers/`, `dcms/utils/`, `tests/`
 2. `SolverResult` dataclass con profiling
 3. Degree/strength reduction
 4. Generatore reti di test: `src/utils/wng.py` → `k_s_generator_pl`

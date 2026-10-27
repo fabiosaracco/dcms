@@ -5,34 +5,21 @@ The DWCM strength equations are
     s_out_i = Σ_{j≠i} β_out_i · β_in_j / (1 − β_out_i · β_in_j)
     s_in_i  = Σ_{j≠i} β_out_j · β_in_i / (1 − β_out_j · β_in_i)
 
-with β = exp(−θ).  Two variants are implemented:
+with β = exp(−θ). Nodes sharing the same (s_out, s_in) pair have identical parameters at the
+solution (see :func:`compute_degeneracy_groups_dwcm`), so the solver works on the M-unknown
+reduced system (M = number of distinct pairs <= N) and expands the solution back to the N nodes.
 
-* **Gauss-Seidel** — β-space fixed-point; out-multipliers are updated
-  first; the updated values are immediately used when computing new
-  in-multipliers.  Update: β_out_i^{new} = s_out_i / D_out_i.
-* **theta-newton** — θ-space coordinate Newton step.  For each node i
-  the exact 1-D Newton step is computed directly in θ-space:
+The iteration is a θ-space coordinate Newton step. For each group g the exact 1-D Newton step is
 
-      Δθ_out_i = −F_i / F′_i
-      where F_i  = Σ_{j≠i} W_ij − s_out_i   (residual)
-            F′_i = −Σ_{j≠i} W_ij(1+W_ij)    (diagonal Hessian, ≤ 0)
-            W_ij = 1/expm1(θ_out_i + θ_in_j)
+      Δθ_out_g = −F_g / F′_g
+      where F_g  = Σ_h m_h W_gh − W_gg − s_out_g   (residual)
+            F′_g = −(Σ_h m_h W_gh(1+W_gh) − W_gg(1+W_gg))   (diagonal Hessian, ≤ 0)
+            W_gh = 1/expm1(θ_out_g + θ_in_h)
 
-  The per-node step is clipped to ``[−max_step, +max_step]``.  Because
-  the update is additive in θ, β > 1 is never produced — this variant
-  is robust to high-strength hub nodes that cause the β-space variants
-  to oscillate.
-
-The Gauss-Seidel variant supports an optional damping factor α ∈ (0, 1]:
-
-    θ_i^{t+1} = α · (−log β_i^{new}) + (1−α) · θ_i^{t}
-
-θ is clamped to [_ETA_MIN, _ETA_MAX] after each step to maintain the
-feasibility constraint β_out_i · β_in_j < 1 for all i, j.
-
-For N > ``_LARGE_N_THRESHOLD`` the N×N intermediate matrix is never
-materialised; instead the update denominators are computed in row/column
-chunks of size ``_DEFAULT_CHUNK``, using O(chunk × N) RAM per chunk.
+clipped to ``[−max_step, +max_step]`` and accelerated by Anderson mixing. Because the update is
+additive in θ, β > 1 is never produced, which makes the iteration robust to high-strength hub nodes.
+θ is clamped to [_ETA_MIN, _ETA_MAX] after each step to maintain the feasibility constraint
+β_out_i · β_in_j < 1 for all i, j.
 """
 from __future__ import annotations
 
@@ -40,14 +27,12 @@ import datetime
 import math
 import sys
 import time
-from typing import Callable
 
 import torch
 
 from .base import SolverResult
 from dcms.utils.profiling import _PeakRAMMonitor
-from dcms.models.parameters import DWCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
-from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
+from dcms.models.parameters import _ETA_MIN, _ETA_MAX
 # Maximum ℓ∞ norm of the Anderson FP-residual r_k = g(θ_k) − θ_k accepted
 # into the mixing history.  Iterates beyond this threshold are skipped to
 # prevent Anderson mixing from being contaminated by extreme values.  The
@@ -306,130 +291,28 @@ def _dwcm_step_dense_weighted(
     return torch.cat([theta_out_new, theta_in_new]), F_current
 
 
-def solve_fixed_point_dwcm(
-    residual_fn: Callable[[torch.Tensor], torch.Tensor],
-    theta0: "ArrayLike",  # type: ignore[name-defined]
-    s_out: "ArrayLike",  # type: ignore[name-defined]
-    s_in: "ArrayLike",  # type: ignore[name-defined]
-    tol: float = 1e-8,
-    max_iter: int = 10_000,
-    damping: float = 1.0,
-    variant: str = "gauss-seidel",
-    chunk_size: int = 0,
-    anderson_depth: int = 0,
-    max_step: float = 1.0,
-    max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
-    verbose: bool = False,
-    monitor: bool = False,
-    mult: torch.Tensor | None = None,
-    weight_anderson: bool = True,
-    device: str = "cpu",
-    seed: int | None = None,
+def _solve_dwcm_reduced(
+    theta0: torch.Tensor,
+    s_out: torch.Tensor,
+    s_in: torch.Tensor,
+    mult: torch.Tensor,
+    tol: float,
+    max_iter: int,
+    anderson_depth: int,
+    max_step: float,
+    max_time: float,
+    verbose: bool,
+    monitor: bool,
+    weight_anderson: bool,
+    device: str,
+    seed: int | None,
 ) -> SolverResult:
-    """Fixed-point iteration for the DWCM.
-
-    Args:
-        residual_fn: Function F(θ) → residual tensor (used for convergence check).
-        theta0: Initial parameter vector [θ_out | θ_in], shape (2N,).
-                All entries should be strictly positive.
-        s_out:  Observed out-strength sequence, shape (N,).
-        s_in:   Observed in-strength sequence, shape (N,).
-        tol:    Convergence tolerance on the ℓ∞ relative residual (MRE = max|F_i|/target_i).
-        max_iter: Maximum number of iterations.
-        damping: Damping factor α ∈ (0, 1] for the ``"gauss-seidel"``
-            variant.  α=1 → no damping (pure FP update).
-            Not used by the ``"theta-newton"`` variant; use ``max_step``
-            instead to control the Newton step size for that variant.
-        variant: One of ``"gauss-seidel"`` or ``"theta-newton"``.
-            ``"gauss-seidel"`` solves in β-space; ``"theta-newton"``
-            performs coordinate Newton steps directly in θ-space, which avoids
-            the β > 1 clamping oscillation that affects high-strength hub nodes.
-        chunk_size: If > 0, process the N×N products in chunks of this size
-            to avoid materialising the full matrix (useful for large N).
-            If 0, auto-select: dense for N ≤ ``_LARGE_N_THRESHOLD``, chunked
-            (with ``_DEFAULT_CHUNK``) otherwise.
-        anderson_depth: Depth of Anderson acceleration history.  0 disables
-            Anderson mixing (plain fixed-point).  Values of 5–10 typically
-            give the best convergence acceleration.  Uses the m most recent
-            FP outputs to compute the next iterate via constrained
-            least-squares mixing (Walker & Ni 2011).
-        max_step: Maximum per-node Newton step |Δθ| allowed in the
-            ``"theta-newton"`` variant.  Ignored by ``"gauss-seidel"``.  Default 1.0 (one unit in log-space);
-            reduce to ~0.5 for very heterogeneous networks to improve
-            robustness at the cost of slower convergence per iteration.
-        max_time: Wall-clock time limit in seconds.  If > 0, the solver
-            stops after this many seconds even if max_iter has not been
-            reached.  Default 0 (no time limit).
-        backend: Compute backend: ``"auto"`` (default), ``"pytorch"``, or
-            ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and Numba
-            for larger networks.  Falls back automatically with a warning
-            if the requested backend is unavailable.
-        num_threads: Number of Numba parallel threads.  0 (default) leaves
-            the global Numba thread count unchanged.  Only takes effect when
-            ``backend="numba"`` (or ``"auto"`` at large N).
-        verbose: If ``True``, print a progress line at every iteration
-            showing timestamp, iteration count, elapsed time, and MRE.
-        monitor: If ``True`` (and ``verbose=True``), overwrite the same
-            terminal line at each iteration (``end='\\r'``) so only the
-            latest status is visible.  Default=False.
-        mult: Internal use by :func:`solve_fixed_point_dwcm_degenerate`.
-            When provided (shape (M,)), ``s_out``/``s_in``/``theta0`` are
-            interpreted as *group-level* quantities (one entry per unique
-            (s_out,s_in) pair) and the step uses
-            :func:`_dwcm_step_dense_weighted`. Only supported with
-            ``variant="theta-newton"`` and ``backend="pytorch"`` (not yet
-            "numba"). Default None (standard per-node behaviour).
-        weight_anderson: Makes Anderson mixing multiplicity-aware in the
-            reduced (``mult``) path -- see
-            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
-            parameter of the same name. Default True.
-        device: ``"cpu"`` (default, float64) or a torch device string like
-            ``"mps"``/``"cuda"`` (float32, as for DECM). Only supported together with ``mult`` (the
-            degeneracy-reduced path) and ``backend`` resolving to
-            ``"pytorch"``. The returned ``SolverResult`` is always
-            CPU/float64 regardless of ``device``.
-        seed: Seed for the mini-loop's retry-noise RNG (see
-            ``_FPGS_NEWTON_RETRY_NOISE_BASE`` and the ``if _fpgs_newton_fired:``
-            block) -- private, does not touch global RNG state, mirrors
-            :func:`~dcms.solvers.fixed_point_decm.solve_fixed_point_decm`'s
-            parameter of the same name. ``None`` (default) uses the fixed default
-            state of a fresh ``torch.Generator``, so the run is deterministic anyway
-            -- only relevant for instances that actually hit a diverging mini-loop firing.
-
-    Returns:
-        :class:`~src.solvers.base.SolverResult` instance.
-    """
+    """Newton/Anderson loop on the reduced system (M groups, multiplicities ``mult``); see :func:`solve_fixed_point_dwcm`."""
     _mini_loop_failed = 0          # consecutive firings in which every retry diverged
     _mini_loop_disabled = False
     _mini_loop_gen = torch.Generator()
     if seed is not None:
         _mini_loop_gen.manual_seed(seed)
-    if mult is not None:
-        if variant != "theta-newton":
-            raise NotImplementedError(
-                "mult (degeneracy-reduced path) only supports "
-                "variant='theta-newton'."
-            )
-        if backend == "numba":
-            raise NotImplementedError(
-                "backend='numba' is not yet supported together with the "
-                "degeneracy-reduced (mult) path; use 'pytorch' or 'auto'."
-            )
-    if variant not in ("gauss-seidel", "theta-newton"):
-        raise ValueError(
-            f"Unknown variant {variant!r}. Choose 'gauss-seidel' or 'theta-newton'."
-        )
-    if not (0.0 < damping <= 1.0):
-        raise ValueError(f"damping must be in (0, 1], got {damping}")
-    if chunk_size < 0:
-        raise ValueError(f"chunk_size must be ≥ 0 (0 = auto), got {chunk_size}")
-    if device != "cpu" and (mult is None or backend == "numba"):
-        raise NotImplementedError(
-            "device != 'cpu' is only supported together with the "
-            "degeneracy-reduced (mult) path and backend='pytorch'/'auto'."
-        )
 
     _dev = torch.device(device)
     _dtype = torch.float64 if _dev.type == "cpu" else torch.float32
@@ -442,10 +325,8 @@ def solve_fixed_point_dwcm(
         s_in = torch.tensor(s_in, dtype=_dtype, device=_dev)
     else:
         s_in = s_in.to(dtype=_dtype, device=_dev)
-    if mult is not None:
-        mult = mult.to(dtype=_dtype, device=_dev)
+    mult = mult.to(dtype=_dtype, device=_dev)
 
-    N = s_out.shape[0]
 
     if not isinstance(theta0, torch.Tensor):
         theta = torch.tensor(theta0, dtype=_dtype, device=_dev)
@@ -455,29 +336,6 @@ def solve_fixed_point_dwcm(
     # Clamp initial theta to feasible range
     _eta_lo = _ETA_MIN
     theta = theta.clamp(_eta_lo, _ETA_MAX)
-
-    # Resolve compute backend
-    from dcms.utils.backend import resolve_backend
-    _backend = resolve_backend(backend, N)
-    _use_numba = (_backend == "numba")
-    _prev_numba_threads: int | None = None
-    if _use_numba:
-        import numpy as np
-        from dcms.solvers._numba_kernels import (
-            _dwcm_theta_newton_numba,
-            _dwcm_fp_gs_numba,
-        )
-        from dcms.utils.backend import resolve_num_threads as _rnt
-        _safe_threads = _rnt(num_threads)
-        import numba as _numba_mod
-        _prev_numba_threads = _numba_mod.get_num_threads()
-        _numba_mod.set_num_threads(_safe_threads)
-
-    # Decide whether to use chunked computation (PyTorch path only)
-    if chunk_size == 0:
-        effective_chunk = 0 if N <= _LARGE_N_THRESHOLD else _DEFAULT_CHUNK
-    else:
-        effective_chunk = chunk_size
 
     _peak_ram_monitor = _PeakRAMMonitor()
     _peak_ram_monitor.__enter__()
@@ -524,9 +382,7 @@ def solve_fixed_point_dwcm(
 
     # Anderson mixing needs per-component weights in the degeneracy-reduced
     # path -- see _anderson_mixing's docstring and the analogous DECM/DCM fix.
-    _anderson_weights = (
-        torch.cat([mult, mult]) if (mult is not None and weight_anderson) else None
-    )
+    _anderson_weights = torch.cat([mult, mult]) if weight_anderson else None
 
     try:
         for _ in range(max_iter):
@@ -537,159 +393,9 @@ def solve_fixed_point_dwcm(
                 )
                 break
 
-            if mult is not None:
-                theta_fp, F_current = _dwcm_step_dense_weighted(
-                    theta, s_out, s_in, max_step, mult, eta_lo=_ETA_MIN
-                )
-            elif variant == "theta-newton":
-                # θ-space coordinate Newton step.
-                # Returns (theta_new, F_current) where F_current = F(θ)
-                # at the *input* θ (before the update).
-                if _use_numba:
-                    to = theta[:N].numpy()
-                    ti = theta[N:].numpy()
-                    to_new, ti_new, fo, fi = _dwcm_theta_newton_numba(
-                        to, ti, s_out.numpy(), s_in.numpy(),
-                        max_step, _ETA_MIN, _ETA_MAX,
-                    )
-                    theta_fp = torch.from_numpy(np.concatenate([to_new, ti_new]))
-                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
-                elif effective_chunk > 0:
-                    theta_fp, F_current = _theta_newton_step_chunked(
-                        theta, s_out, s_in, effective_chunk, max_step,
-                        eta_lo=_ETA_MIN,
-                    )
-                else:
-                    theta_fp, F_current = _theta_newton_step_dense(
-                        theta, s_out, s_in, max_step,
-                        eta_lo=_ETA_MIN,
-                    )
-            else:
-                # β-space fixed-point iteration (Gauss-Seidel or Jacobi)
-                if _use_numba:
-                    bo = torch.exp(-theta[:N]).numpy()
-                    bi = torch.exp(-theta[N:]).numpy()
-                    bon, bin_, fo, fi = _dwcm_fp_gs_numba(
-                        bo, bi, s_out.numpy(), s_in.numpy(),
-                        theta[:N].numpy(), theta[N:].numpy(),
-                        max_step, _ETA_MIN, _ETA_MAX,
-                        _FP_NEWTON_FALLBACK_DELTA, True,
-                    )
-                    beta_out_new = torch.from_numpy(bon)
-                    beta_in_new = torch.from_numpy(bin_)
-                    F_current = torch.from_numpy(np.concatenate([fo, fi]))
-                elif effective_chunk > 0:
-                    beta_out = torch.exp(-theta[:N])
-                    beta_in = torch.exp(-theta[N:])
-                    beta_out_new, beta_in_new, F_current = _fp_step_chunked_dwcm(
-                        beta_out, beta_in, s_out, s_in, effective_chunk,
-                        theta=theta, max_step=max_step,
-                    )
-                else:
-                    beta_out = torch.exp(-theta[:N])
-                    beta_in = torch.exp(-theta[N:])
-                    # Dense path (materialises full N×N matrix)
-                    xy = beta_out[:, None] * beta_in[None, :]
-
-                    # D_out[i] = Σ_{j≠i} β_in_j / (1 - β_out_i * β_in_j)
-                    denom = (1.0 - xy).clamp(min=1e-15)
-                    D_out_mat = beta_in[None, :] / denom   # (N, N)
-                    D_out_mat.fill_diagonal_(0.0)
-                    D_out = D_out_mat.sum(dim=1)
-
-                    # Residual at current β (free from D_out_mat):
-                    # s_out_hat = β_out * D_out,  s_in_hat = Σ_i β_out_i * D_out_mat[i,j]
-                    s_out_hat = beta_out * D_out
-                    s_in_hat = D_out_mat.T @ beta_out     # (N,) — O(N²) FLOPS, O(N) memory
-                    F_current = torch.cat([s_out_hat - s_out, s_in_hat - s_in])
-
-                    beta_out_new = torch.where(D_out > 0, s_out / D_out, beta_out)
-
-                    # Newton fallback: replace the β-FP step with a bounded exact
-                    # θ-Newton step for any node where the β-FP map would produce
-                    # a large θ-step (|Δθ| > _FP_NEWTON_FALLBACK_DELTA).  This
-                    # catches two failure modes:
-                    #   1. Infeasible overshoot (β_new ≥ 1): |Δθ| >> threshold.
-                    #   2. Non-contractive oscillation (SR_FP > 1): hub nodes
-                    #      oscillate with |Δθ| ≈ 0.12–0.15 per step even when
-                    #      β_new < 1; their spectral radius just exceeds 1.0 so
-                    #      Anderson(10) cannot converge the growing oscillation.
-                    # We use the *exact* diagonal Newton step
-                    #   Δθ_out_i = (ŝ_i − s_i) / H_out_i
-                    # where H_out_i = Σ_j W_ij(1+W_ij) = β_out_i·D_out_i + β_out_i²·‖D_out_mat[i,:]‖².
-                    # Using the approximation H ≈ ŝ (first-order) would give a 2×
-                    # over-step for extreme hubs (high-W pairs), keeping SR ≈ 1.
-                    _s_hat_out = beta_out * D_out  # s_hat_out[i] = β_out_i·D_out_i
-                    _theta_out_fp_val = (
-                        -torch.log(beta_out_new.clamp(1e-300, 1.0 - 1e-15))
-                    ).clamp(_ETA_MIN, _ETA_MAX)
-                    _use_newton_out = (
-                        (_theta_out_fp_val - theta[:N]).abs() > _FP_NEWTON_FALLBACK_DELTA
-                    )
-                    if _use_newton_out.any():
-                        # H_out[i] = β_out_i·D_out[i] + β_out_i²·Σ_j D_out_mat[i,j]²
-                        _H_out = (
-                            _s_hat_out
-                            + beta_out ** 2 * (D_out_mat ** 2).sum(dim=1)
-                        ).clamp(min=1e-30)
-                        _delta_nt_out = (
-                            (_s_hat_out - s_out) / _H_out
-                        ).clamp(-max_step, max_step)
-                        _theta_out_nt = (theta[:N] + _delta_nt_out).clamp(
-                            _ETA_MIN, _ETA_MAX
-                        )
-                        beta_out_new = torch.where(
-                            _use_newton_out, torch.exp(-_theta_out_nt), beta_out_new
-                        )
-
-                    beta_out_upd = beta_out_new  # Gauss-Seidel: use updated values immediately
-
-                    # D_in[i] = Σ_{j≠i} β_out_j / (1 - β_out_j * β_in_i)
-                    xy2 = beta_out_upd[:, None] * beta_in[None, :]
-                    denom2 = (1.0 - xy2).clamp(min=1e-15)
-                    D_in_mat = beta_out_upd[:, None] / denom2  # (N, N)
-                    D_in_mat.fill_diagonal_(0.0)
-                    D_in = D_in_mat.sum(dim=0)
-
-                    beta_in_new = torch.where(D_in > 0, s_in / D_in, beta_in)
-
-                    # Newton fallback for in-direction (same |Δθ| criterion,
-                    # exact H_in[j] = β_in_j·D_in[j] + β_in_j²·Σ_i D_in_mat[i,j]²)
-                    _s_hat_in = beta_in * D_in
-                    _theta_in_fp_val = (
-                        -torch.log(beta_in_new.clamp(1e-300, 1.0 - 1e-15))
-                    ).clamp(_ETA_MIN, _ETA_MAX)
-                    _use_newton_in = (
-                        (_theta_in_fp_val - theta[N:]).abs() > _FP_NEWTON_FALLBACK_DELTA
-                    )
-                    if _use_newton_in.any():
-                        _H_in = (
-                            _s_hat_in
-                            + beta_in ** 2 * (D_in_mat ** 2).sum(dim=0)
-                        ).clamp(min=1e-30)
-                        _delta_nt_in = (
-                            (_s_hat_in - s_in) / _H_in
-                        ).clamp(-max_step, max_step)
-                        _theta_in_nt = (theta[N:] + _delta_nt_in).clamp(
-                            _ETA_MIN, _ETA_MAX
-                        )
-                        beta_in_new = torch.where(
-                            _use_newton_in, torch.exp(-_theta_in_nt), beta_in_new
-                        )
-
-                # Clamp β to (0, 1) strictly to maintain feasibility
-                beta_out_new = beta_out_new.clamp(1e-300, 1.0 - 1e-15)
-                beta_in_new = beta_in_new.clamp(1e-300, 1.0 - 1e-15)
-
-                # Convert to θ-space and apply damping
-                theta_out_new = (-torch.log(beta_out_new)).clamp(_ETA_MIN, _ETA_MAX)
-                theta_in_new = (-torch.log(beta_in_new)).clamp(_ETA_MIN, _ETA_MAX)
-                fp_raw = torch.cat([theta_out_new, theta_in_new])
-
-                # Damped FP output: g(θ) = α * FP_raw(θ) + (1−α) * θ
-                theta_fp = (damping * fp_raw + (1.0 - damping) * theta).clamp(
-                    _ETA_MIN, _ETA_MAX
-                )
+            theta_fp, F_current = _dwcm_step_dense_weighted(
+                theta, s_out, s_in, max_step, mult, eta_lo=_ETA_MIN
+            )
 
             # Universal single-step floor: prevent any θ from dropping below
             # _ANDERSON_THETA_FLOOR × its current value in a single iteration.
@@ -778,23 +484,8 @@ def solve_fixed_point_dwcm(
             # replaces theta_next unconditionally, so blowup recovery cannot
             # silently discard the Newton correction.
             #
-            # Originally gated to `variant != "theta-newton"` only, on the
-            # assumption (stated in the module docstring) that theta-newton
-            # is immune to this kind of stagnation. Empirically false for the
-            # degeneracy-reduced (`mult`) path: solve_fixed_point_dwcm_degenerate
-            # always calls with variant="theta-newton" (enforced above), which
-            # made this escape hatch structurally unreachable for that path --
-            # confirmed on 4 real networks (crisi_dico3/4, ita_elections_dico1,
-            # quirinale_dico1) stuck in an exact repeating cycle (crisi_dico3:
-            # period 6, bit-identical every cycle) for the full run, correctly
-            # detected by the stagnation check above but never escaped. `mult
-            # is not None` always implies variant=="theta-newton" (validated at
-            # entry), so this condition specifically re-enables the escape for
-            # that case without touching the plain (non-degenerate) theta-newton
-            # path, which has no evidence of needing it. See
-            # decm_dwcm_degenerate_stagnation_bug memory.
             _fpgs_newton_fired = False
-            if (variant != "theta-newton" or mult is not None) and anderson_depth > 1:
+            if anderson_depth > 1:
                 if res_norm < _fpgs_best_local * 0.99:
                     _fpgs_best_local = res_norm
                     _fpgs_stagnation_count = 0
@@ -847,9 +538,7 @@ def solve_fixed_point_dwcm(
                 else:
                     r_k = theta_fp - theta
                     r_k_norm = r_k.abs().max().item()
-                    if math.isfinite(r_k_norm) and (
-                        variant != "theta-newton" or r_k_norm < _ANDERSON_MAX_NORM
-                    ):
+                    if math.isfinite(r_k_norm) and r_k_norm < _ANDERSON_MAX_NORM:
                         _and_g.append(theta_fp.clone())
                         _and_r.append(r_k.clone())
 
@@ -892,37 +581,9 @@ def solve_fixed_point_dwcm(
             # silently discard the correction.
             if _fpgs_newton_fired:
                 def _nt_step(th: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-                    """One theta-Newton substep from `th`, same branching (mult/numba/
-                    chunked/dense) the mini-loop below has always used -- factored out
-                    so it can also be called once more, after the loop, to score the
-                    mini-loop's own final output (see the acceptance check below)."""
-                    if mult is not None:
-                        # Degeneracy-reduced path: use the mult-weighted step
-                        # (same one the main loop uses), never the plain
-                        # per-group formula -- that would silently drop each
-                        # group's multiplicity and solve the wrong equations.
-                        return _dwcm_step_dense_weighted(
-                            th, s_out, s_in, max_step, mult, eta_lo=_ETA_MIN
-                        )
-                    elif _use_numba:
-                        to = th[:N].numpy()
-                        ti = th[N:].numpy()
-                        to_new, ti_new, fo, fi = _dwcm_theta_newton_numba(
-                            to, ti, s_out.numpy(), s_in.numpy(),
-                            max_step, _ETA_MIN, _ETA_MAX,
-                        )
-                        return (
-                            torch.from_numpy(np.concatenate([to_new, ti_new])),
-                            torch.from_numpy(np.concatenate([fo, fi])),
-                        )
-                    elif effective_chunk > 0:
-                        return _theta_newton_step_chunked(
-                            th, s_out, s_in, effective_chunk, max_step, eta_lo=_ETA_MIN,
-                        )
-                    else:
-                        return _theta_newton_step_dense(
-                            th, s_out, s_in, max_step, eta_lo=_ETA_MIN,
-                        )
+                    """One theta-Newton substep from `th`, with the mult-weighted step the main loop uses (the plain per-group
+                    formula would silently drop each group's multiplicity and solve the wrong equations)."""
+                    return _dwcm_step_dense_weighted(th, s_out, s_in, max_step, mult, eta_lo=_ETA_MIN)
 
                 def _run_mini_loop(start: torch.Tensor) -> tuple[torch.Tensor, float]:
                     """30 steps of theta-Newton + Anderson(_FPGS_NEWTON_AND_DEPTH) from
@@ -1060,9 +721,6 @@ def solve_fixed_point_dwcm(
         elapsed = time.perf_counter() - t0
         _peak_ram_monitor.__exit__(None, None, None)
         peak_ram = _peak_ram_monitor.peak_bytes
-        if _prev_numba_threads is not None:
-            import numba as _numba_mod
-            _numba_mod.set_num_threads(_prev_numba_threads)
 
     return SolverResult(
         # NOTE: must split device+dtype into two .to() calls -- combining them
@@ -1078,7 +736,7 @@ def solve_fixed_point_dwcm(
     )
 
 
-def solve_fixed_point_dwcm_degenerate(
+def solve_fixed_point_dwcm(
     theta0: "ArrayLike",  # type: ignore[name-defined]
     s_out: "ArrayLike",  # type: ignore[name-defined]
     s_in: "ArrayLike",  # type: ignore[name-defined]
@@ -1087,8 +745,6 @@ def solve_fixed_point_dwcm_degenerate(
     anderson_depth: int = 10,
     max_step: float = 1.0,
     max_time: float = 0.0,
-    backend: str = "auto",
-    num_threads: int = 0,
     verbose: bool = False,
     monitor: bool = False,
     weight_anderson: bool = True,
@@ -1101,9 +757,8 @@ def solve_fixed_point_dwcm_degenerate(
     proven to share identical (theta_out, theta_in) at the true DWCM
     solution, see :func:`compute_degeneracy_groups_dwcm` -- and solves the
     resulting M-unknown reduced system (M = number of unique pairs <= N)
-    instead of the full 2N-unknown system. The returned ``SolverResult`` is
-    expanded back to the original per-node shape (2N,) so it is a drop-in
-    replacement for :func:`solve_fixed_point_dwcm` at the call site.
+    The returned ``SolverResult`` is expanded back to the original per-node
+    shape (2N,).
 
     Args:
         theta0: Initial guess [theta_out|theta_in], shape (2N,). Nodes
@@ -1112,7 +767,11 @@ def solve_fixed_point_dwcm_degenerate(
             guess); if not, one representative member's value is used for
             the whole group.
         s_out, s_in: Observed sequences, each shape (N,).
-        (all other args): see :func:`solve_fixed_point_dwcm`.
+        tol, max_iter, anderson_depth, max_step, max_time, verbose, monitor, weight_anderson, device: as in
+            :func:`~dcms.solvers.fixed_point_dcm.solve_fixed_point_dcm` (``device`` != ``"cpu"`` runs in float32).
+        seed: Seed for the retry-noise RNG of the stagnation-escape mini-loop (see ``_FPGS_NEWTON_RETRY_NOISE_BASE`` and the
+            ``if _fpgs_newton_fired:`` block); ``None`` (default) uses the fixed default state of a fresh
+            ``torch.Generator``, so the run is deterministic anyway.
 
     Returns:
         :class:`~dcms.solvers.base.SolverResult` with ``theta``/``best_theta``
@@ -1139,27 +798,10 @@ def solve_fixed_point_dwcm_degenerate(
             _first_idx[_g] = _i
     theta0_g = torch.cat([theta0[:N][_first_idx], theta0[N:][_first_idx]])
 
-    def _residual_fn_g(theta_m: torch.Tensor) -> torch.Tensor:
-        return _dwcm_step_dense_weighted(theta_m, s_out_g, s_in_g, max_step, mult)[1]
-
-    result_g = solve_fixed_point_dwcm(
-        _residual_fn_g,
-        theta0_g,
-        s_out_g, s_in_g,
-        tol=tol,
-        max_iter=max_iter,
-        variant="theta-newton",
-        anderson_depth=anderson_depth,
-        max_step=max_step,
-        max_time=max_time,
-        backend=backend,
-        num_threads=num_threads,
-        verbose=verbose,
-        monitor=monitor,
-        mult=mult,
-        weight_anderson=weight_anderson,
-        device=device,
-        seed=seed,
+    result_g = _solve_dwcm_reduced(
+        theta0_g, s_out_g, s_in_g, mult,
+        tol=tol, max_iter=max_iter, anderson_depth=anderson_depth, max_step=max_step, max_time=max_time,
+        verbose=verbose, monitor=monitor, weight_anderson=weight_anderson, device=device, seed=seed,
     )
 
     def _expand(theta_m):
@@ -1179,308 +821,3 @@ def solve_fixed_point_dwcm_degenerate(
         peak_ram_bytes=result_g.peak_ram_bytes,
         message=result_g.message + f" [degeneracy-reduced: N={N} -> M={M}]",
     )
-
-
-def _fp_step_chunked_dwcm(
-    beta_out: torch.Tensor,
-    beta_in: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    chunk_size: int,
-    theta: torch.Tensor | None = None,
-    max_step: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One Gauss-Seidel fixed-point update step for DWCM using chunked matrix products.
-
-    Computes the update denominators D_out and D_in without ever building
-    the full N×N product matrix, using at most O(chunk_size × N) RAM per chunk.
-
-    Also computes the residual F(θ_current) = [s_out_hat − s_out | s_in_hat − s_in]
-    at the *current* (pre-update) β values, at negligible extra cost.
-
-    When *theta* is provided, a Newton fallback is applied for any node where
-    the β-FP step would produce β_new ≥ 1 (hub overshoot).  For those nodes a
-    bounded θ-space Newton step replaces the infeasible β-FP result.
-
-    Args:
-        beta_out:   Current out-strength multipliers β_out_i = exp(−θ_out_i),
-                    shape (N,), values in (0, 1).
-        beta_in:    Current in-strength multipliers β_in_i = exp(−θ_in_i),
-                    shape (N,), values in (0, 1).
-        s_out:      Observed out-strength sequence, shape (N,).
-        s_in:       Observed in-strength sequence, shape (N,).
-        chunk_size: Number of rows (or columns) per chunk.
-        theta:      Full parameter vector [θ_out | θ_in], shape (2N,), used
-                    by the Newton fallback.  Pass ``None`` to disable.
-        max_step:   Maximum |Δθ| per node for the Newton fallback step.
-
-    Returns:
-        ``(beta_out_new, beta_in_new, F_current)`` where F_current is the
-        residual at the pre-update state, shape (2N,).
-    """
-    N = beta_out.shape[0]
-
-    # -------------------------------------------------------------------
-    # D_out[i] = Σ_{j≠i} β_in_j / (1 - β_out_i * β_in_j)
-    # Process rows i in chunks.
-    # Also accumulate s_in_hat = Σ_i w_ij for the residual at current β.
-    # -------------------------------------------------------------------
-    D_out = torch.zeros(N, dtype=torch.float64)
-    s_in_hat = torch.zeros(N, dtype=torch.float64)
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        b_out_chunk = beta_out[i_start:i_end]           # (chunk,)
-        xy_chunk = b_out_chunk[:, None] * beta_in[None, :]  # (chunk, N)
-        denom = (1.0 - xy_chunk).clamp(min=1e-15)
-        d_chunk = beta_in[None, :] / denom              # (chunk, N)
-        # Zero out diagonal entries (j == i)
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        d_chunk[local_i, global_j] = 0.0
-        D_out[i_start:i_end] = d_chunk.sum(dim=1)
-        # w_ij = β_out_i * d_chunk[i,j]; accumulate column sums for s_in_hat
-        s_in_hat += d_chunk.T @ b_out_chunk              # (N,)
-
-    # Residual at current β
-    s_out_hat = beta_out * D_out
-    F_current = torch.cat([s_out_hat - s_out, s_in_hat - s_in])
-
-    beta_out_new = torch.where(D_out > 0, s_out / D_out, beta_out)
-
-    # Newton fallback: for hub nodes where the β-FP step would produce a large
-    # θ-step (|Δθ| > _FP_NEWTON_FALLBACK_DELTA), use a bounded θ-Newton step
-    # instead.  This catches both infeasible overshoots (β_new ≥ 1) and slowly
-    # diverging oscillations (spectral radius of the β-FP map slightly > 1).
-    if theta is not None:
-        _theta_out_fp_val = (
-            -torch.log(beta_out_new.clamp(1e-300, 1.0 - 1e-15))
-        ).clamp(_ETA_MIN, _ETA_MAX)
-        _use_newton_out = (
-            (_theta_out_fp_val - theta[:N]).abs() > _FP_NEWTON_FALLBACK_DELTA
-        )
-        if _use_newton_out.any():
-            _delta_out = (
-                (s_out_hat - s_out) / s_out_hat.clamp(min=1e-30)
-            ).clamp(-max_step, max_step)
-            _theta_out_nt = (theta[:N] + _delta_out).clamp(_ETA_MIN, _ETA_MAX)
-            beta_out_new = torch.where(
-                _use_newton_out, torch.exp(-_theta_out_nt), beta_out_new
-            )
-
-    # Gauss-Seidel: use updated β_out immediately for the D_in computation
-    beta_out_upd = beta_out_new
-
-    # -------------------------------------------------------------------
-    # D_in[i] = Σ_{j≠i} β_out_j / (1 - β_out_j * β_in_i)
-    # Process chunks of j (sources) and accumulate column sums into D_in.
-    # -------------------------------------------------------------------
-    D_in = torch.zeros(N, dtype=torch.float64)
-    for j_start in range(0, N, chunk_size):
-        j_end = min(j_start + chunk_size, N)
-        chunk_len = j_end - j_start
-        b_out_chunk = beta_out_upd[j_start:j_end]       # (chunk,)
-        # xy_chunk[j_local, i] = β_out_j * β_in_i
-        xy_chunk = b_out_chunk[:, None] * beta_in[None, :]  # (chunk, N)
-        denom = (1.0 - xy_chunk).clamp(min=1e-15)
-        d_chunk = b_out_chunk[:, None] / denom          # (chunk, N)
-        # Zero out diagonal entries (j == i, i.e., global j == i)
-        local_j = torch.arange(chunk_len, dtype=torch.long)
-        global_i = torch.arange(j_start, j_end, dtype=torch.long)
-        d_chunk[local_j, global_i] = 0.0
-        # Accumulate column sums into D_in[i]
-        D_in += d_chunk.sum(dim=0)
-
-    beta_in_new = torch.where(D_in > 0, s_in / D_in, beta_in)
-
-    # Newton fallback for in-direction (same |Δθ| criterion)
-    if theta is not None:
-        _s_in_hat_cur = beta_in * D_in
-        _theta_in_fp_val = (
-            -torch.log(beta_in_new.clamp(1e-300, 1.0 - 1e-15))
-        ).clamp(_ETA_MIN, _ETA_MAX)
-        _use_newton_in = (
-            (_theta_in_fp_val - theta[N:]).abs() > _FP_NEWTON_FALLBACK_DELTA
-        )
-        if _use_newton_in.any():
-            _delta_in = (
-                (_s_in_hat_cur - s_in) / _s_in_hat_cur.clamp(min=1e-30)
-            ).clamp(-max_step, max_step)
-            _theta_in_nt = (theta[N:] + _delta_in).clamp(_ETA_MIN, _ETA_MAX)
-            beta_in_new = torch.where(
-                _use_newton_in, torch.exp(-_theta_in_nt), beta_in_new
-            )
-
-    return beta_out_new, beta_in_new, F_current
-
-
-# ---------------------------------------------------------------------------
-# θ-space coordinate Newton helpers
-# ---------------------------------------------------------------------------
-
-def _theta_newton_step_dense(
-    theta: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    max_step: float,
-    eta_lo: float = _ETA_MIN,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One θ-space coordinate Newton step (dense N×N path).
-
-    For each node i, computes the exact Newton step on the 1-D equation::
-
-        F_i(θ_out_i) = Σ_{j≠i} W_ij(θ) − s_out_i = 0
-
-    where W_ij = 1 / expm1(θ_out_i + θ_in_j).  The Newton step is::
-
-        Δθ_out_i = −F_i / F′_i = (Σ_j W_ij − s_out_i) / Σ_j W_ij(1+W_ij)
-
-    Because the update is additive in θ (not in β), it naturally stays in the
-    feasible domain after clamping to [eta_lo, _ETA_MAX] — unlike the β-space
-    fixed-point which can produce β > 1 for high-strength hub nodes.
-
-    Zero-strength nodes (s_i = 0) are kept at _ETA_MAX throughout.
-
-    The per-node step is clipped to ``[-max_step, +max_step]`` to prevent
-    overshooting when the initial θ is far from the solution.  The GS ordering
-    (update θ_out first, then θ_in using the fresh θ_out) is always used.
-
-    Args:
-        theta:    Current parameter vector [θ_out | θ_in], shape (2N,).
-        s_out:    Observed out-strength sequence, shape (N,).
-        s_in:     Observed in-strength sequence, shape (N,).
-        max_step: Maximum allowed |Δθ| per node per step.
-        eta_lo:   Lower bound for the clamped output θ values.  Default
-                  ``_ETA_MIN`` (normal mode).  Pass ``-_ETA_MAX`` for gauge
-                  mode where negative θ is allowed.
-
-    Returns:
-        Tuple of (updated parameter vector, residual F(θ_current)).
-        The residual is F(θ) evaluated at the *input* θ (before the update),
-        shape (2N,), clamped to [eta_lo, _ETA_MAX].
-    """
-    N = s_out.shape[0]
-    theta_out = theta[:N]
-    theta_in = theta[N:]
-
-    # W_ij = 1/expm1(θ_out_i + θ_in_j),  W[i,i] = 0 (no self-loops)
-    z = theta_out[:, None] + theta_in[None, :]          # (N, N)
-    W = 1.0 / torch.expm1(z.clamp(min=_Z_G_CLAMP))          # (N, N)
-    W.fill_diagonal_(0.0)
-
-    # Residual at current θ (free from the already-computed W)
-    F_out = W.sum(dim=1) - s_out                        # (N,)
-    F_in = W.sum(dim=0) - s_in                          # (N,)
-    F_current = torch.cat([F_out, F_in])
-
-    # Out-direction Newton step (using current θ_in)
-    h_out = -(W * (1.0 + W)).sum(dim=1)                 # (N,), ≤ 0
-    delta_out = (-F_out / (h_out - 1e-30)).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_out).clamp(eta_lo, _ETA_MAX)
-    # Zero-strength nodes: β = 0 exactly → θ = _ETA_MAX
-    theta_out_new = torch.where(
-        s_out == 0, torch.full_like(theta_out_new, _ETA_MAX), theta_out_new
-    )
-
-    # In-direction Newton step (GS: use updated θ_out_new)
-    z2 = theta_out_new[:, None] + theta_in[None, :]     # (N, N)
-    W2 = 1.0 / torch.expm1(z2.clamp(min=_Z_G_CLAMP))        # (N, N)
-    W2.fill_diagonal_(0.0)
-
-    F_in2 = W2.sum(dim=0) - s_in                        # (N,)
-    h_in = -(W2 * (1.0 + W2)).sum(dim=0)                # (N,), ≤ 0
-    delta_in = (-F_in2 / (h_in - 1e-30)).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_in).clamp(eta_lo, _ETA_MAX)
-    theta_in_new = torch.where(
-        s_in == 0, torch.full_like(theta_in_new, _ETA_MAX), theta_in_new
-    )
-
-    return torch.cat([theta_out_new, theta_in_new]), F_current
-
-
-def _theta_newton_step_chunked(
-    theta: torch.Tensor,
-    s_out: torch.Tensor,
-    s_in: torch.Tensor,
-    chunk_size: int,
-    max_step: float,
-    eta_lo: float = _ETA_MIN,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked version of :func:`_theta_newton_step_dense` for large N.
-
-    Computes the θ-space Newton step without materialising the full N×N
-    matrix, using O(chunk_size × N) working memory.
-
-    Args:
-        theta:      Current parameter vector [θ_out | θ_in], shape (2N,).
-        s_out:      Observed out-strength sequence, shape (N,).
-        s_in:       Observed in-strength sequence, shape (N,).
-        chunk_size: Number of rows processed per chunk (≥ 1).
-        max_step:   Maximum allowed |Δθ| per node per step.
-        eta_lo:     Lower bound for clamped output θ values.  Default
-                    ``_ETA_MIN`` (normal mode).  Pass ``-_ETA_MAX`` for
-                    gauge mode where negative θ is allowed.
-
-    Returns:
-        Tuple of (updated parameter vector, residual F(θ_current)).
-        The residual is F(θ) evaluated at the *input* θ (before the update),
-        shape (2N,), clamped to [eta_lo, _ETA_MAX].
-    """
-    N = s_out.shape[0]
-    theta_out = theta[:N]
-    theta_in = theta[N:]
-
-    # -------------------------------------------------------------------
-    # Out-direction: accumulate F_out, h_out, and F_in_current row-by-row
-    # -------------------------------------------------------------------
-    F_out = torch.zeros(N, dtype=torch.float64)
-    h_out = torch.zeros(N, dtype=torch.float64)
-    F_in_current = torch.zeros(N, dtype=torch.float64)
-    for i_start in range(0, N, chunk_size):
-        i_end = min(i_start + chunk_size, N)
-        chunk_len = i_end - i_start
-        z_chunk = theta_out[i_start:i_end, None] + theta_in[None, :]   # (chunk, N)
-        W_chunk = 1.0 / torch.expm1(z_chunk.clamp(min=_Z_G_CLAMP))
-        local_i = torch.arange(chunk_len, dtype=torch.long)
-        global_j = torch.arange(i_start, i_end, dtype=torch.long)
-        W_chunk[local_i, global_j] = 0.0
-        F_out[i_start:i_end] = W_chunk.sum(dim=1) - s_out[i_start:i_end]
-        h_out[i_start:i_end] = -(W_chunk * (1.0 + W_chunk)).sum(dim=1)
-        # Accumulate column sums for F_in at current θ (free from same W_chunk)
-        F_in_current += W_chunk.sum(dim=0)
-
-    F_in_current -= s_in
-    F_current = torch.cat([F_out, F_in_current])
-
-    delta_out = (-F_out / (h_out - 1e-30)).clamp(-max_step, max_step)
-    theta_out_new = (theta_out + delta_out).clamp(eta_lo, _ETA_MAX)
-    theta_out_new = torch.where(
-        s_out == 0, torch.full_like(theta_out_new, _ETA_MAX), theta_out_new
-    )
-
-    # -------------------------------------------------------------------
-    # In-direction: use updated θ_out_new (GS), accumulate column sums
-    # -------------------------------------------------------------------
-    F_in = torch.zeros(N, dtype=torch.float64)
-    h_in = torch.zeros(N, dtype=torch.float64)
-    for j_start in range(0, N, chunk_size):
-        j_end = min(j_start + chunk_size, N)
-        chunk_len = j_end - j_start
-        # z2[j_local, i] = θ_out_new[j] + θ_in[i]
-        z2_chunk = theta_out_new[j_start:j_end, None] + theta_in[None, :]  # (chunk, N)
-        W2_chunk = 1.0 / torch.expm1(z2_chunk.clamp(min=_Z_G_CLAMP))
-        local_j = torch.arange(chunk_len, dtype=torch.long)
-        global_i = torch.arange(j_start, j_end, dtype=torch.long)
-        W2_chunk[local_j, global_i] = 0.0
-        F_in += W2_chunk.sum(dim=0)
-        h_in += -(W2_chunk * (1.0 + W2_chunk)).sum(dim=0)
-    F_in -= s_in
-
-    delta_in = (-F_in / (h_in - 1e-30)).clamp(-max_step, max_step)
-    theta_in_new = (theta_in + delta_in).clamp(eta_lo, _ETA_MAX)
-    theta_in_new = torch.where(
-        s_in == 0, torch.full_like(theta_in_new, _ETA_MAX), theta_in_new
-    )
-
-    return torch.cat([theta_out_new, theta_in_new]), F_current
-

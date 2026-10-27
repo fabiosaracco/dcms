@@ -672,7 +672,7 @@ class qDECMModel:
     # Using the solve function
     # ------------------------------------------------------------------
 
-    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, variant:str='theta-newton', anderson_depth:int=10, backend:str='auto', num_threads:int=0, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, backtracking_gamma:float=0.0, z_clamp:float=1e-8, reduce_degeneracy:bool=True, device:str='cpu')-> SolverResult:
+    def solve_tool(self, ic_topo='degrees', ic_wei='topology', tol:float=1e-6, max_iter:int=2000, max_time:int=0, anderson_depth:int=10, verbose:bool=False, monitor:bool=False, hub_sk_threshold:float=0.0, z_clamp:float=1e-8, device:str='cpu')-> SolverResult:
         """Select an initial condition on thetas and solve the equation, using the fixed-point solvers.
 
         Args:
@@ -687,17 +687,7 @@ class qDECMModel:
                 ``sol.best_theta[2*N:]``).
             tol (float): the maximum tolerance allowed on the residual. Default=1e-6.
             max_iter (int): the maximum number of iterations. Default=2000.
-            variant (str): the numerical method implemented. Default="theta-newton", another possible choice is "gauss-seidel".
             anderson_depth (int): Anderson acceleration depth. Default=10.
-            backend (str): Compute backend: ``"auto"`` (default), ``"pytorch"``,
-                or ``"numba"``.  ``"auto"`` uses PyTorch for N ≤ 5 000 and
-                Numba for larger networks.
-            num_threads (int): Number of Numba parallel threads. 0 (default)
-                means *auto*: uses all CPUs available to the current process
-                (respects ``taskset``/cgroup quotas on Linux). Positive values
-                are clamped to the available CPU count to avoid thread-creation
-                errors on resource-limited servers. Only has effect when Numba
-                is selected as the backend.
             verbose (bool): If ``True``, print a progress line at every
                 iteration (timestamp, iteration count, elapsed time, MRE)
                 for both the topology and weight steps. Default=False.
@@ -711,28 +701,10 @@ class qDECMModel:
                 this for networks with a few nodes that have very high
                 ``s/k`` ratios (e.g. ``s/k > 5``) which cause the global
                 solver to stagnate.  Default=0.0 (disabled).
-            backtracking_gamma (float): When > 0, enables a per-step
-                backtracking line search in the ``"theta-newton"`` variant.
-                After each Newton step the residual at the proposed iterate is
-                evaluated; if it exceeds ``backtracking_gamma`` times the
-                current residual, the step is halved (up to 5 times) until the
-                condition is met.  Typical value: ``2.0``.  Default=0.0
-                (disabled).  Combine with ``hub_sk_threshold`` for networks
-                with extreme hubs.
-            reduce_degeneracy (bool): If ``True`` (default), nodes sharing the
-                exact same ``(k_out, k_in)`` pair are collapsed into a single
-                group for the topology step, and nodes sharing the full
-                ``(k_out, k_in, s_out, s_in)`` 4-tuple for the weight step
-                (see README §2.5) — solves M ≤ N group unknowns instead of N
-                per-node ones per step, often 10-40x faster on real networks.
-                Mathematically exact (not an approximation). Only supported
-                with ``variant="theta-newton"``, ``backend != "numba"``, and
-                ``backtracking_gamma == 0.0``; silently falls back to the
-                full (unreduced) solver otherwise, with a printed note.
             z_clamp (float): Floor on the raw z (the argument of the
                 ``1/expm1(z)`` weight factor) in the weight step, module-wide
                 for the duration of the call -- see
-                :func:`~dcms.solvers.fixed_point_qdecm.solve_fixed_point_qdecm`'s
+                :func:`~dcms.solvers.fixed_point_qdecm.solve_fixed_point_qdecm_weight`'s
                 ``z_clamp`` docs. Default 1e-8 (previous hard-coded value,
                 unchanged; the model's own residual computations elsewhere
                 in this file still hard-code 1e-8 independently of this
@@ -742,11 +714,8 @@ class qDECMModel:
                 string like ``"mps"``/``"cuda"`` (float32 -- MPS has no
                 float64 support at all, and CUDA float64 is slow enough
                 that float32 is the practical choice too). Applies to
-                both the topology and weight steps; only supported
-                together with ``reduce_degeneracy=True`` (and the same
-                constraints as that option) -- raises if requested
-                without it. The stored ``self.sol`` is always
-                CPU/float64 regardless of ``device``.
+                both the topology and weight steps. The stored
+                ``self.sol`` is always CPU/float64 regardless of ``device``.
 
         Returns:
             :class:`~dcms.solvers.base.SolverResult` instance.  The combined
@@ -758,17 +727,6 @@ class qDECMModel:
         """
         import torch as _torch
 
-        _use_reduced = (
-            reduce_degeneracy and variant == "theta-newton"
-            and backend != "numba" and backtracking_gamma == 0.0
-        )
-        if reduce_degeneracy and not _use_reduced:
-            print(
-                "reduce_degeneracy=True requires variant='theta-newton', "
-                "backend!='numba', and backtracking_gamma==0.0 -- falling "
-                "back to the full (unreduced) solver."
-            )
-
         # Step 1: solve the DCM topology
         if isinstance(ic_topo, str):
             self.ic_topo = self.initial_theta_topo(ic_topo)
@@ -776,12 +734,8 @@ class qDECMModel:
             self.ic_topo = _torch.as_tensor(ic_topo, dtype=_torch.float64)
         # note: as the topology always work, using a better precision on th esolution may help the convergence of the weights
         topo_tol_help=10**-3
-        if _use_reduced:
-            from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm_degenerate  # lazy import to avoid circular dependency
-            _sol_topo = solve_fixed_point_dcm_degenerate(self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
-        else:
-            from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
-            _sol_topo = solve_fixed_point_dcm(self._dcm.residual, self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, device=device)
+        from dcms.solvers.fixed_point_dcm import solve_fixed_point_dcm  # lazy import to avoid circular dependency
+        _sol_topo = solve_fixed_point_dcm(self.ic_topo, self.k_out, self.k_in, tol=tol*topo_tol_help, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, device=device)
 
         if len(_sol_topo.message)>0:
             print(f'Topology: {_sol_topo.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
@@ -794,14 +748,8 @@ class qDECMModel:
         else:
             self.ic_weig = _torch.as_tensor(ic_wei, dtype=_torch.float64)
 
-        if _use_reduced:
-            from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm_weight_degenerate  # lazy import to avoid circular dependency
-            _sol_weights = solve_fixed_point_qdecm_weight_degenerate(_sol_topo.best_theta, self.ic_weig, self.k_out, self.k_in, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, z_clamp=z_clamp, device=device)
-        else:
-            # Build the residual function that fixes theta_topo
-            res_weight = lambda tb: self.residual_strength(_sol_topo.best_theta, tb)
-            from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm  # lazy import to avoid circular dependency
-            _sol_weights = solve_fixed_point_qdecm(res_weight, self.ic_weig, self.s_out, self.s_in, theta_topo=_sol_topo.best_theta, P=None, tol=tol, max_iter=max_iter, max_time=max_time, variant=variant, anderson_depth=anderson_depth, backend=backend, num_threads=num_threads, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, backtracking_gamma=backtracking_gamma, z_clamp=z_clamp, device=device)
+        from dcms.solvers.fixed_point_qdecm import solve_fixed_point_qdecm_weight  # lazy import to avoid circular dependency
+        _sol_weights = solve_fixed_point_qdecm_weight(_sol_topo.best_theta, self.ic_weig, self.k_out, self.k_in, self.s_out, self.s_in, tol=tol, max_iter=max_iter, max_time=max_time, anderson_depth=anderson_depth, verbose=verbose, monitor=monitor, hub_sk_threshold=hub_sk_threshold, z_clamp=z_clamp, device=device)
         if len(_sol_weights.message)>0:
             print(f'Weights: {_sol_weights.message}'+" "*50) # the +" "*50 is necessary to avoid the output to be badly overwritten in the case of monitor=True
 

@@ -464,7 +464,7 @@ Additional model methods:
 | `model.bic(theta)` | float | Bayesian Information Criterion, `2N·ln(N(N−1)) − 2·ln L` |
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess: `"degrees"` (default) or `"random"` |
-| `model.sample(seed, chunk_size)` | `list[[i,j]]` | Sample a binary network from the fitted DCM (see §3.5) |
+| `model.sample(seed, chunk_size, method)` | `(L, 2)` array `[i, j]` | Sample a binary network from the fitted DCM; `method="grouped"` (default) or `"exact"` (see §3.5) |
 
 ### 3.2 DWCM — `DWCMModel`
 
@@ -497,7 +497,7 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ)‖` |
 | `model.max_relative_error(theta)` | float | `max‖F_i‖ / s_i` |
 | `model.initial_theta(method)` | `(2N,)` tensor | Initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DWCM (see §3.5) |
+| `model.sample(seed, chunk_size, method)` | `(L, 3)` array `[i, j, w]` | Sample a weighted network from the fitted DWCM; `method="grouped"` (default) or `"exact"` (see §3.5) |
 | `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted DWCM (see §3.6) |
 
 `initial_theta` methods for DWCM:
@@ -549,7 +549,7 @@ Additional model methods:
 | `model.max_relative_error(theta_topo, theta_weight)` | float | Max relative error over all 4N constraints |
 | `model.initial_theta_topo(method)` | `(2N,)` tensor | Topology initial guess (`"degrees"` or `"random"`) |
 | `model.initial_theta_weight(theta_topo, method)` | `(2N,)` tensor | Weight initial guess (see below) |
-| `model.sample(seed, chunk_size)` | `list[[i,j,w]]` | Sample a weighted network from the fitted qDECM (see §3.5) |
+| `model.sample(seed, chunk_size, method)` | `(L, 3)` array `[i, j, w]` | Sample a weighted network from the fitted qDECM; `method="grouped"` (default) or `"exact"` (see §3.5) |
 | `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted qDECM (see §3.6) |
 
 `initial_theta_weight` methods for qDECM:
@@ -614,7 +614,7 @@ Additional model methods:
 | `model.constraint_error(theta)` | float | `max‖F(θ,η)‖` |
 | `model.max_relative_error(theta)` | float | Max relative error over all 4N non-zero constraints |
 | `model.initial_theta(method)` | `(4N,)` tensor | Initial guess (see below) |
-| `model.sample(seed, chunk_size, method)` | `list[[i,j,w]]` | Sample a weighted network from the fitted DECM; `method="grouped"` (default) is an exact, much faster sampler; `"exact"` is the O(N²) one (see §3.5) |
+| `model.sample(seed, chunk_size, method)` | `(L, 3)` array `[i, j, w]` | Sample a weighted network from the fitted DECM; `method="grouped"` (default) is an exact, much faster sampler; `"exact"` is the O(N²) one (see §3.5) |
 | `model.p_value_calculator(edgelist)` | structured array `[(source_id, target_id, p_value)]` | Edge-weight p-values under the fitted DECM (see §3.6) |
 
 `initial_theta` methods for DECM:
@@ -632,7 +632,8 @@ After calling `solve_tool()`, every model exposes two sampling methods:
 # Single sample — returns a NumPy array (no Python list overhead)
 edges = model.sample(
     seed=42,          # integer or None — random seed for reproducibility
-    chunk_size=512,   # rows processed per iteration (exact fallback only)
+    chunk_size=512,   # rows processed per iteration (method="exact" only)
+    method="grouped", # or "exact" (per-pair O(N^2))
 )
 # DCM:   np.ndarray shape (L, 2), columns [source, target]
 # other: np.ndarray shape (L, 3), columns [source, target, weight]
@@ -646,6 +647,8 @@ samples = model.sample_many(
 )
 # each element: np.ndarray of shape (L_k, 2) for DCM, (L_k, 3) for weighted
 ```
+
+Both take `method="grouped"` (default, exact and fast when many nodes share their constraints) or `method="exact"` (per-pair, O(N²)); see below.
 
 Both methods return `np.ndarray` — iterating `for i, j in arr` or `for i, j, w in arr` works the same as with lists.
 
@@ -665,36 +668,28 @@ The geometric distributions follow Mastrandrea et al. (2014) / Vallarano et al. 
 - **DWCM**: integer weights `w ≥ 0`, `P(w=k) = (1−β_ij) β_ij^k`.  The expected weight is `β_ij / (1−β_ij)`, matching the constraint `s_out_i = Σ_j ⟨w_ij⟩`.
 - **qDECM / DECM**: integer weights `w ≥ 1` conditional on the link existing, `P(w=k|A=1) = (1−β_ij) β_ij^{k−1}`.  The unconditional expected weight is `p_ij / (1−β_ij)`.
 
-#### Fast sparse sampler (default for sparse networks)
+#### Grouped exact sampler (`method="grouped"`, the default of all four models)
 
-For sparse networks (mean p < 5 %) DCM, DWCM and qDECM use an O(L) **Poisson-intensity sampler** instead of the O(N²) chunk-based sampler.  The algorithm is:
+`sample(method="grouped")` (the default; also `sample_many(..., method=...)`) draws from the **same** distribution as the per-pair O(N²) sampler (`method="exact"`), exploiting that nodes with identical constraints have identical fitted parameters (DCM: k_out, k_in; DWCM: s_out, s_in; qDECM and DECM: k_out, k_in, s_out, s_in). For two groups a, b all ordered pairs between them are i.i.d. with the same link probability p_ab, so the number of links of a group pair is drawn from a Binomial(n_ab, p_ab), the links are placed on distinct uniformly chosen pairs of the block, and the weights are geometric as above. Cost O(M² + L), with M the number of groups. On the 19 empirical networks N²/M² ranges from 18 to 438 (e.g. N=107 056, M=5 117: 3 s instead of ~530 s per DECM sample). No gain when all nodes are distinct. Realizations differ between the two methods for the same seed (same law, different random stream). If the fitted parameters are not constant within groups (a `sol` assigned by hand, or loaded from an older unreduced solve) the sampler warns and falls back to `method="exact"`.
 
-1. Draw `n_cand ~ Poisson(S_x · S_y)` edge candidates, where `S_x = Σ x_i`, `S_y = Σ y_j`.
-2. Sample `src ~ x/S_x` and `dst ~ y/S_y` via the alias method — O(N + L) total.
-3. Accept candidate `(i,j)` with probability `1/(1 + x_i y_j) ∈ (0,1]`.
-4. Remove self-loops and deduplicate (1D integer encoding, 13× faster than 2D sort).
-
-After deduplication the edge probability is `P(A_ij = 1) = 1 − exp(−p_ij)`, which differs from the exact `p_ij` by `p_ij²/2`.  For typical sparse networks with `p_ij ~ 10⁻³` this error is `~5×10⁻⁷` per edge — negligible for any ensemble observable.
-
-> **Note**: this is *not* the Chung–Lu approximation.  Chung–Lu would skip step 3, giving `P ≈ x_i y_j` rather than `x_i y_j/(1+x_i y_j)`.  The acceptance step in step 3 ensures the exact DCM probabilities are respected; only the Poisson-to-Bernoulli conversion introduces a second-order error.
-
-Dense networks (mean p ≥ 5 %) fall back to the exact chunk-based sampler; `chunk_size` controls peak RAM in that path.
-
-#### Grouped exact sampler for DECM (`method="grouped"`, the default)
-
-`DECMModel.sample(method="grouped")` (the default; also `sample_many(..., method=...)`) draws from the **same** distribution as the default O(N²) sampler, exploiting that nodes with identical constraints (k_out, k_in, s_out, s_in) have identical fitted parameters. For two groups a, b all ordered pairs between them are i.i.d. Bernoulli(p_ab), so the number of links of a group pair is drawn from a Binomial(n_ab, p_ab), the links are placed on distinct uniformly chosen pairs, and the weights are geometric as usual. Cost O(M² + L), with M the number of groups. On the 19 empirical networks N²/M² ranges from 18 to 438 (e.g. N=107 056, M=5 117: 3 s instead of ~530 s per sample). No gain when all nodes are distinct. Pass `method="exact"` for the per-pair O(N²) sampler. Realizations differ between the two for the same seed (same law, different random stream).
+> **Correction (0.7.0).** Until 0.6.x DCM, DWCM and qDECM sampled with an O(L) Poisson-intensity sampler whenever the mean p was below 5 %. It gave `P(link) = 1 − exp(−p_ij)` instead of `p_ij`; this README called the difference `p_ij²/2` "negligible", an estimate that assumed `p_ij ~ 10⁻³` for every pair. On the real networks the hubs have many pairs with `p_ij` of order 1, so the samples had too few links and too little weight: −4 % of the links (DCM, `crisi_dico4`), −12 % of the total weight (DWCM, `crisi_dico4`), −5 % to −10 % of the links (qDECM, four large networks). The sampler has been removed; `method="exact"` is now always the per-pair sampler. Anything computed by sampling from DCM, DWCM or qDECM with 0.6.x (for example Monte-Carlo p-values) has to be recomputed. The DECM was not affected (it never used the Poisson sampler).
 
 #### Parallel batch sampling with `sample_many()`
 
 `sample_many()` uses `ThreadPoolExecutor` to generate samples in parallel.  NumPy releases the GIL during random-number generation and array operations, so threading provides near-linear speedup up to the number of physical cores.  Both `sample()` and `sample_many()` return NumPy arrays directly (no `list` conversion), eliminating the main GIL-holding bottleneck.
 
-**Benchmark** (N = 5 000, power-law degree sequence, ρ = 10⁻³):
+**Benchmark** (N = 5 000, power-law degree sequence, ρ = 10⁻³; 8 logical cores, `n_jobs=8`; M = number of groups of the fitted solution):
 
-| Model | `sample()` single | `sample_many(n, n_jobs=8)` effective per-sample | Speedup |
-|-------|-------------------|------------------------------------------------|---------|
-| DCM | ~32 ms | ~4 ms | ~8× |
-| qDECM | ~37 ms | ~5 ms | ~7× |
-| DWCM | ~83 ms | ~11 ms | ~7× |
+| Model | M | method | `sample()` single | `sample_many` per-sample | Speedup |
+|-------|---|--------|-------------------|--------------------------|---------|
+| DCM | 359 | grouped | ~20 ms | ~8 ms | ~2.4× |
+| DCM | 359 | exact | ~390 ms | ~125 ms | ~3× |
+| DWCM | 985 | grouped | ~120 ms | ~26 ms | ~4.5× |
+| DWCM | 985 | exact | ~385 ms | ~90 ms | ~4× |
+| qDECM | 2 219 | grouped | ~280–380 ms | ~70–140 ms | ~3–4× |
+| qDECM | 2 219 | exact | ~455 ms | ~145 ms | ~3× |
+
+The grouped sampler is much faster than the exact one when M ≪ N (DCM here: ~20×); with M close to N/2, as for the qDECM on this synthetic network, it is about as fast as the exact one. Timings on a laptop, run-to-run variation ±30 %.
 
 DECM (8 logical cores): `crisi_dico2` (N = 15 168), grouped sampler, 0.6 s per sample and 3.2× with 8 threads; exact O(N²) sampler on `ita_elections_dico4` (N = 9 010), 2.4 s per sample and 3.6×.
 

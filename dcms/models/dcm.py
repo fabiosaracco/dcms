@@ -30,6 +30,7 @@ from typing import Union
 import torch
 
 from dcms.solvers.base import SolverResult
+from dcms.utils.grouped_sampling import GroupedSamplingMixin
 
 
 
@@ -54,7 +55,7 @@ def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tenso
     return torch.tensor(x, dtype=dtype)
 
 
-class DCMModel:
+class DCMModel(GroupedSamplingMixin):
     """Encapsulates all DCM equations for a network of *N* nodes.
 
     Internally all quantities are stored and computed as ``torch.float64``
@@ -416,26 +417,19 @@ class DCMModel:
 
         return self.sol.converged
 
+    _SAMPLER_KIND = "dcm"
+
     def _sample_raw(self, seed: int | None = None,
                     chunk_size: int = 512) -> "np.ndarray":
-        """Internal sampler — returns a NumPy array, not a Python list.
-
-        Shape ``(L, 2)`` with dtype ``int``.  Called by both :meth:`sample`
-        and :meth:`sample_many` to avoid the GIL-holding ``.tolist()`` cost
-        in the parallel path.
-        """
+        """Exact per-pair O(N^2) sampler — returns a NumPy array of shape ``(L, 2)``, dtype ``int``."""
         import numpy as np
         if self.sol is None:
             raise RuntimeError("Call solve_tool() first.")
         rng = np.random.default_rng(seed)
-        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
         N = self.N
         x = np.exp(-theta[:N])
         y = np.exp(-theta[N:])
-        mean_p = x.sum() * y.sum() / (N * (N - 1))
-        if mean_p < 0.05:
-            return self._sample_sparse(x, y, rng, N)
-        # Dense fallback — build ndarray directly
         parts: list = []
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
@@ -451,7 +445,7 @@ class DCMModel:
         return np.vstack(parts)
 
     def sample(self, seed: int | None = None,
-               chunk_size: int = 512) -> "np.ndarray":
+               chunk_size: int = 512, method: str = "grouped") -> "np.ndarray":
         """Sample a binary directed network from the fitted DCM.
 
         For each ordered pair ``(i, j)`` with ``i ≠ j``, a directed edge is
@@ -459,15 +453,25 @@ class DCMModel:
 
             p_ij = x_i y_j / (1 + x_i y_j),   x_i = exp(-θ_out_i), y_j = exp(-θ_in_j)
 
-        Uses a Poisson-intensity sparse sampler: O(L) random draws instead of
-        O(N²), yielding P(edge)=1−exp(−p_ij) which equals p_ij up to O(p²) error
-        (negligible for sparse networks).  Falls back to the exact O(N²) chunk
-        sampler when the network is dense (mean p > 5 %).
+        ``method="grouped"`` draws from exactly this distribution at cost
+        O(M² + L) instead of O(N²), M being the number of groups of nodes with
+        identical constraints (k_out, k_in), which share the same fitted
+        parameters: link counts per group pair are binomial and the links are
+        placed on distinct uniformly chosen pairs of the block.  Much faster
+        on large empirical networks (M ≪ N); no gain if all nodes are distinct.
+
+        Before 0.7.0 the default was a Poisson-intensity sparse sampler, which
+        gave P(edge) = 1 − exp(−p_ij) instead of p_ij: it under-sampled the
+        edges between high-degree nodes (−4 % of the links on a real network).
+        It has been removed.
 
         Args:
             seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time for the exact
-                fallback path (controls peak RAM).
+            chunk_size: Number of source rows processed at a time
+                (``method="exact"`` only; controls peak RAM).
+            method: ``"grouped"`` (default) or ``"exact"`` (per-pair
+                Bernoulli, O(N²)).  The two give the same distribution but not
+                the same realization for a given seed.
 
         Returns:
             ``np.ndarray`` of shape ``(L, 2)`` with integer columns
@@ -476,63 +480,6 @@ class DCMModel:
 
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
+            ValueError: if ``method`` is not ``"exact"`` or ``"grouped"``.
         """
-        return self._sample_raw(seed=seed, chunk_size=chunk_size)
-
-    def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1) -> list:
-        """Generate ``n`` independent samples in parallel.
-
-        Each sample is a ``np.ndarray`` of shape ``(L_k, 2)`` with columns
-        ``[source, target]``.  Iterating ``for i, j in sample`` works the same
-        as with the list returned by :meth:`sample`.
-
-        Uses :class:`~concurrent.futures.ThreadPoolExecutor` — NumPy releases
-        the GIL during random-number generation and array operations, so
-        threading gives near-linear speedup up to the number of physical cores.
-
-        Args:
-            n: Number of independent samples to draw.
-            seed: Master seed from which per-sample seeds are derived.
-            n_jobs: Number of worker threads.  ``-1`` (default) uses all
-                available logical CPUs.
-
-        Returns:
-            List of ``n`` NumPy arrays, one per sample.
-
-        Raises:
-            RuntimeError: if :meth:`solve_tool` has not been called yet.
-        """
-        import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
-        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
-        if n_jobs == 1:
-            return [self._sample_raw(seed=s) for s in seeds]
-        max_workers = None if n_jobs < 0 else n_jobs
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            return list(ex.map(self._sample_raw, seeds))
-
-    @staticmethod
-    def _sample_sparse(x: "np.ndarray", y: "np.ndarray",
-                       rng: "np.random.Generator", N: int) -> "np.ndarray":
-        """O(L) Poisson-intensity sampler for sparse DCM graphs.
-
-        Returns ``np.ndarray`` of shape ``(L, 2)`` — no ``.tolist()`` call,
-        so the GIL is barely held (only during ``rng.choice`` alias setup).
-        """
-        import numpy as np
-        S_x = x.sum();  S_y = y.sum()
-        n_cand = rng.poisson(S_x * S_y)
-        if n_cand == 0:
-            return np.empty((0, 2), dtype=int)
-        src = rng.choice(N, size=n_cand, p=x / S_x)
-        dst = rng.choice(N, size=n_cand, p=y / S_y)
-        xy_vals = x[src] * y[dst]
-        keep = (rng.random(n_cand) * (1.0 + xy_vals) < 1.0) & (src != dst)
-        src, dst = src[keep], dst[keep]
-        if len(src) == 0:
-            return np.empty((0, 2), dtype=int)
-        uid = np.unique(src.astype(np.int64) * N + dst)
-        rows_u = (uid // N).astype(int)
-        cols_u = (uid  % N).astype(int)
-        return np.column_stack([rows_u, cols_u])
+        return self._sample(seed, chunk_size, method)

@@ -1,4 +1,5 @@
 """Tests for model.sample() methods."""
+import functools
 import pytest
 import numpy as np
 import torch
@@ -374,3 +375,130 @@ class TestDistinctPlacement:
         for k in range(len(c)):
             v = vals[ids == k]
             assert len(set(v.tolist())) == c[k] and v.min() >= 0 and v.max() < n_ab[k]
+
+
+# ---------------------------------------------------------------------------
+# Grouped sampler, all four models
+# ---------------------------------------------------------------------------
+
+def _hub_network(N=400, a=1.2, mean_deg=6.0, seed=1):
+    """Chung-Lu weighted digraph with heavy-tailed degrees: sparse (mean link probability < 5 %, the regime of the old Poisson
+    sampler) but with many node pairs of link probability 0.2-0.95, and with degenerate low-degree nodes."""
+    rng = np.random.default_rng(seed)
+    w_out = 1 + rng.pareto(a, N)
+    w_in = 1 + rng.pareto(a, N)
+    w_out = np.minimum(w_out * mean_deg / w_out.mean(), 0.8 * N)
+    w_in = np.minimum(w_in * mean_deg / w_in.mean(), 0.8 * N)
+    P = np.minimum(np.outer(w_out, w_in) / w_out.sum(), 0.95)
+    np.fill_diagonal(P, 0.0)
+    A = (rng.random((N, N)) < P).astype(float)
+    W = A * rng.geometric(0.5, (N, N))
+    keep = np.ones(N, dtype=bool)
+    while True:                                 # drop the nodes without out- or in-links (zero constraints)
+        idx = np.flatnonzero(keep)
+        sub = A[np.ix_(idx, idx)]
+        bad = (sub.sum(1) == 0) | (sub.sum(0) == 0)
+        if not bad.any():
+            break
+        keep[idx[bad]] = False
+    idx = np.flatnonzero(keep)
+    A, W = A[np.ix_(idx, idx)], W[np.ix_(idx, idx)]
+    return A.sum(1), A.sum(0), W.sum(1), W.sum(0)
+
+
+@functools.lru_cache(maxsize=None)
+def _fitted(kind):
+    """Fitted model and constraints, cached: the tests only read them (the fallback test works on a copy)."""
+    from dcms.models.dcm import DCMModel
+    from dcms.models.dwcm import DWCMModel
+    from dcms.models.qdecm import qDECMModel
+    from dcms.models.decm import DECMModel
+    k_out, k_in, s_out, s_in = _hub_network()
+    if kind == "dcm":
+        m = DCMModel(k_out, k_in); m.solve_tool(tol=1e-8, max_iter=3000)
+    elif kind == "dwcm":
+        m = DWCMModel(s_out, s_in); m.solve_tool(tol=1e-8, max_iter=3000)
+    elif kind == "qdecm":
+        m = qDECMModel(k_out, k_in, s_out, s_in); m.solve_tool(tol=1e-6, max_iter=3000)
+    else:
+        m = DECMModel(k_out, k_in, s_out, s_in); m.solve_tool(tol=1e-6, max_iter=20000)
+    assert m.sol.converged
+    return m, (k_out, k_in, s_out, s_in)
+
+
+KINDS = ["dcm", "dwcm", "qdecm", "decm"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+class TestGroupedAllModels:
+    def test_format(self, kind):
+        m, _ = _fitted(kind)
+        cols = 2 if kind == "dcm" else 3
+        edges = m.sample(seed=0)
+        assert isinstance(edges, np.ndarray) and edges.shape[1] == cols
+        assert np.issubdtype(edges.dtype, np.integer)
+        assert np.all(edges[:, 0] != edges[:, 1])
+        assert len({(a, b) for a, b in edges[:, :2]}) == len(edges)   # distinct ordered pairs
+        assert np.array_equal(edges, m.sample(seed=0))
+        if cols == 3:
+            assert (edges[:, 2] > 0).all()
+
+    def test_invalid_method(self, kind):
+        m, _ = _fitted(kind)
+        with pytest.raises(ValueError):
+            m.sample(seed=0, method="nope")
+        with pytest.raises(ValueError):
+            m.sample_many(2, method="nope")
+
+    def test_sample_many_methods(self, kind):
+        m, _ = _fitted(kind)
+        for method in ("grouped", "exact"):
+            out = m.sample_many(3, seed=0, n_jobs=1, method=method)
+            assert len(out) == 3 and all(isinstance(x, np.ndarray) for x in out)
+
+    def test_falls_back_when_parameters_not_constant_in_groups(self, kind):
+        import copy
+        from dcms.utils.grouped_sampling import group_model
+        m, _ = _fitted(kind)
+        g = group_model(m)
+        grp = int(np.flatnonzero(g["n_g"] > 1)[0])
+        node = int(g["members"][g["start"][grp]])
+        th = np.array(m.sol.best_theta, dtype=np.float64)
+        th[node] += 1e-3
+        m = copy.copy(m)                        # the cached model stays untouched
+        m.sol = copy.copy(m.sol)
+        m.sol.best_theta = th
+        with pytest.warns(UserWarning, match="not constant within groups"):
+            edges = m.sample(seed=0)
+        assert np.array_equal(edges, m.sample(seed=0, method="exact"))
+
+    @pytest.mark.parametrize("method", ["grouped", "exact"])
+    def test_expected_totals(self, kind, method):
+        """Mean number of links and total weight of the samples equal the constraints (hubs make p_ij close to 1).
+
+        The Poisson-intensity sampler used before 0.7.0 failed this: P(link) = 1 - exp(-p) lost 4-12 % of the links/weight."""
+        m, (k_out, k_in, s_out, s_in) = _fitted(kind)
+        n = 1500
+        samples = m.sample_many(n, seed=11, n_jobs=1, method=method)
+        if kind != "dwcm":                      # the DWCM constrains strengths only
+            L = np.array([len(x) for x in samples], dtype=float)
+            assert abs(L.mean() - k_out.sum()) < 5 * L.std(ddof=1) / np.sqrt(n)
+        if kind != "dcm":
+            W = np.array([x[:, 2].sum() for x in samples], dtype=float)
+            assert abs(W.mean() - s_out.sum()) < 5 * W.std(ddof=1) / np.sqrt(n)
+
+    def test_grouped_matches_exact_per_node(self, kind):
+        """Per-node mean out/in degree (strength for the DWCM) of the grouped sampler matches the constraints."""
+        m, (k_out, k_in, s_out, s_in) = _fitted(kind)
+        N, n = m.N, 1500
+        tgt_out, tgt_in = (s_out, s_in) if kind == "dwcm" else (k_out, k_in)
+        outs = np.zeros((n, N)); ins = np.zeros((n, N))
+        for r, x in enumerate(m.sample_many(n, seed=5, n_jobs=1)):
+            v = x[:, 2] if kind == "dwcm" else np.ones(len(x))
+            outs[r] = np.bincount(x[:, 0], weights=v, minlength=N)
+            ins[r] = np.bincount(x[:, 1], weights=v, minlength=N)
+        for arr, tgt in ((outs, tgt_out), (ins, tgt_in)):
+            se = arr.std(0, ddof=1) / np.sqrt(n)
+            ok = se > 0
+            z = (arr.mean(0)[ok] - tgt[ok]) / se[ok]
+            assert np.abs(z).max() < 5.0

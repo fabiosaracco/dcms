@@ -44,6 +44,7 @@ import torch
 from dcms.models.parameters import DECM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MAX, _ETA_MIN
 from dcms.solvers.base import SolverResult
+from dcms.utils.grouped_sampling import GroupedSamplingMixin
 
 # Type alias: accept both numpy arrays and torch tensors.
 _ArrayLike = Union[torch.Tensor, "numpy.ndarray"]  # type: ignore[name-defined]
@@ -65,7 +66,7 @@ def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tenso
     return torch.tensor(x, dtype=dtype, device="cpu")
 
 
-class DECMModel:
+class DECMModel(GroupedSamplingMixin):
     """Encapsulates the DECM equations for a directed network of *N* nodes.
 
     The 4N unknowns are stored as a single vector:
@@ -957,33 +958,7 @@ class DECMModel:
             return np.empty((0, 3), dtype=int)
         return np.vstack(parts)
 
-    def _grouped_sampler_state(self):
-        """Group the nodes once per fitted solution; ``None`` if the parameters are not constant within groups."""
-        from dcms.utils.grouped_sampling import group_model
-        if self.sol is None:
-            raise RuntimeError("Call solve_tool() first.")
-        cache = getattr(self, "_grouped_cache", None)
-        if cache is None or cache[0] is not self.sol:
-            g = group_model(self)
-            cache = (self.sol, g if g["dev"] <= 1e-8 else None, g["dev"])
-            self._grouped_cache = cache
-        return cache
-
-    def _sample_grouped(self, seed: int | None = None) -> "np.ndarray":
-        """Exact degeneracy-grouped sampler (see :mod:`dcms.utils.grouped_sampling`).
-
-        Falls back to the per-pair sampler, with a warning, when the fitted parameters are not constant within
-        groups of identical constraints (e.g. a ``sol`` assigned by hand or loaded from an older, unreduced solve)."""
-        import warnings
-        import numpy as np
-        from dcms.utils.grouped_sampling import sample_grouped
-        _, g, dev = self._grouped_sampler_state()
-        if g is None:
-            warnings.warn(
-                f"Parameters are not constant within groups of identical constraints (max deviation {dev:.1e}); "
-                "falling back to method='exact'.", stacklevel=3)
-            return self._sample_raw(seed=seed)
-        return sample_grouped(g, np.random.default_rng(seed))
+    _SAMPLER_KIND = "decm"
 
     def sample(self, seed: int | None = None,
                chunk_size: int = 512, method: str = "grouped") -> "np.ndarray":
@@ -1027,51 +1002,7 @@ class DECMModel:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
             ValueError: if ``method`` is not ``"exact"`` or ``"grouped"``.
         """
-        if method == "grouped":
-            return self._sample_grouped(seed=seed)
-        if method != "exact":
-            raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
-        return self._sample_raw(seed=seed, chunk_size=chunk_size)
-
-    def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1, method: str = "grouped") -> list:
-        """Generate ``n`` independent samples in parallel.
-
-        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
-        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
-        works the same as with the list returned by :meth:`sample`.
-
-        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
-        the GIL during random-number generation and array operations, giving
-        near-linear speedup up to the number of physical cores.  Note that
-        DECM uses an O(N²) sampler (link probabilities are not rank-1), so the
-        per-sample cost is higher than for DCM/DWCM/qDECM.
-
-        Args:
-            n: Number of independent samples to draw.
-            seed: Master seed from which per-sample seeds are derived.
-            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
-            method: ``"grouped"`` (default) or ``"exact"``, see :meth:`sample`.
-
-        Returns:
-            List of ``n`` NumPy arrays, one per sample.
-
-        Raises:
-            RuntimeError: if :meth:`solve_tool` has not been called yet.
-        """
-        import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
-        if method not in ("exact", "grouped"):
-            raise ValueError(f"method must be 'exact' or 'grouped', got {method!r}")
-        draw = self._sample_grouped if method == "grouped" else self._sample_raw
-        if method == "grouped":
-            self._grouped_sampler_state()   # build the group cache before the threads start
-        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
-        if n_jobs == 1:
-            return [draw(seed=s) for s in seeds]
-        max_workers = None if n_jobs < 0 else n_jobs
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            return list(ex.map(lambda s: draw(seed=s), seeds))
+        return self._sample(seed, chunk_size, method)
 
     def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
         """Compute the DECM p-value of each observed weight in an edge list.

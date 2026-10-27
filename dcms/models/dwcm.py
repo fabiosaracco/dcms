@@ -35,6 +35,7 @@ from dcms.models.parameters import DWCM_LARGE_N_THRESHOLD as _LARGE_N_THRESHOLD
 from dcms.models.parameters import _DEFAULT_CHUNK, _ETA_MIN, _ETA_MAX
 
 from dcms.solvers.base import SolverResult
+from dcms.utils.grouped_sampling import GroupedSamplingMixin
 
 def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tensor:
     """Convert *x* to a float64 CPU torch.Tensor (no-copy if already correct)."""
@@ -43,7 +44,7 @@ def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tenso
     return torch.tensor(x, dtype=dtype, device="cpu")
 
 
-class DWCMModel:
+class DWCMModel(GroupedSamplingMixin):
     """Encapsulates all DWCM equations for a network of *N* nodes.
 
     Internally all quantities are stored and computed as ``torch.float64``
@@ -483,38 +484,19 @@ class DWCMModel:
             
         return self.sol.converged
 
+    _SAMPLER_KIND = "dwcm"
+
     def _sample_raw(self, seed: int | None = None,
                     chunk_size: int = 512) -> "np.ndarray":
-        """Internal sampler — returns shape ``(L, 3)`` NumPy array (no tolist)."""
+        """Exact per-pair O(N^2) sampler — returns shape ``(L, 3)`` NumPy array (no tolist)."""
         import numpy as np
         if self.sol is None:
             raise RuntimeError("Call solve_tool() first.")
         rng = np.random.default_rng(seed)
-        theta = np.asarray(self.sol.theta, dtype=np.float64)
+        theta = np.asarray(self.sol.best_theta, dtype=np.float64)
         N = self.N
         beta_out = np.exp(-theta[:N])
         beta_in  = np.exp(-theta[N:])
-
-        mean_b = beta_out.sum() * beta_in.sum() / (N * (N - 1))
-        if mean_b < 0.05:
-            S_bo = beta_out.sum();  S_bi = beta_in.sum()
-            n_cand = rng.poisson(S_bo * S_bi)
-            if n_cand == 0:
-                return np.empty((0, 3), dtype=int)
-            src_c = rng.choice(N, size=n_cand, p=beta_out / S_bo)
-            dst_c = rng.choice(N, size=n_cand, p=beta_in  / S_bi)
-            mask = src_c != dst_c
-            src_c, dst_c = src_c[mask], dst_c[mask]
-            if len(src_c) == 0:
-                return np.empty((0, 3), dtype=int)
-            uid = np.unique(src_c.astype(np.int64) * N + dst_c)
-            rows = (uid // N).astype(int)
-            cols = (uid  % N).astype(int)
-            b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
-            weights = rng.geometric(1.0 - b_vals)
-            return np.column_stack([rows, cols, weights])
-
-        # Dense fallback
         parts: list = []
         for i_start in range(0, N, chunk_size):
             i_end = min(i_start + chunk_size, N)
@@ -531,7 +513,7 @@ class DWCMModel:
         return np.vstack(parts)
 
     def sample(self, seed: int | None = None,
-               chunk_size: int = 512) -> "np.ndarray":
+               chunk_size: int = 512, method: str = "grouped") -> "np.ndarray":
         """Sample a weighted directed network from the fitted DWCM.
 
         For each ordered pair ``(i, j)`` with ``i ≠ j``, the weight is drawn
@@ -540,17 +522,30 @@ class DWCMModel:
             P(w_ij = k) = (1 − β_ij) β_ij^k,   k = 0, 1, 2, …
             β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
 
-        Pairs with ``w_ij = 0`` (no link) are omitted.
+        Pairs with ``w_ij = 0`` (no link) are omitted.  Equivalently, a link
+        is present with probability β_ij and its weight is then geometric from
+        1: ``P(w_ij = k | link) = (1 − β_ij) β_ij^{k−1}``.
 
-        Uses a Poisson-intensity sparse sampler: O(L) random draws instead of
-        O(N²), yielding P(w>0)=1−exp(−β_ij) which equals β_ij up to O(β²)
-        error (negligible for sparse networks).  Falls back to the exact O(N²)
-        chunk sampler when the network is dense (mean β > 5 %).
+        ``method="grouped"`` draws from exactly this distribution at cost
+        O(M² + L) instead of O(N²), M being the number of groups of nodes with
+        identical constraints (s_out, s_in), which share the same fitted
+        parameters: link counts per group pair are binomial, links are placed
+        on distinct uniformly chosen pairs of the block, weights are geometric
+        as above.  Much faster on large empirical networks (M ≪ N); no gain if
+        all nodes are distinct.
+
+        Before 0.7.0 the default was a Poisson-intensity sparse sampler, which
+        gave P(w > 0) = 1 − exp(−β_ij) instead of β_ij: it under-sampled the
+        links (and the total weight, −12 % on a real network) between
+        high-strength nodes.  It has been removed.
 
         Args:
             seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time for the exact
-                fallback path.
+            chunk_size: Number of source rows processed at a time
+                (``method="exact"`` only).
+            method: ``"grouped"`` (default) or ``"exact"`` (per-pair
+                Bernoulli, O(N²)).  The two give the same distribution but not
+                the same realization for a given seed.
 
         Returns:
             ``np.ndarray`` of shape ``(L, 3)`` with integer columns
@@ -559,40 +554,9 @@ class DWCMModel:
 
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
+            ValueError: if ``method`` is not ``"exact"`` or ``"grouped"``.
         """
-        return self._sample_raw(seed=seed, chunk_size=chunk_size)
-
-    def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1) -> list:
-        """Generate ``n`` independent samples in parallel.
-
-        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
-        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
-        works the same as with the list returned by :meth:`sample`.
-
-        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
-        the GIL during random-number generation and array operations, giving
-        near-linear speedup up to the number of physical cores.
-
-        Args:
-            n: Number of independent samples to draw.
-            seed: Master seed from which per-sample seeds are derived.
-            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
-
-        Returns:
-            List of ``n`` NumPy arrays, one per sample.
-
-        Raises:
-            RuntimeError: if :meth:`solve_tool` has not been called yet.
-        """
-        import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
-        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
-        if n_jobs == 1:
-            return [self._sample_raw(seed=s) for s in seeds]
-        max_workers = None if n_jobs < 0 else n_jobs
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            return list(ex.map(self._sample_raw, seeds))
+        return self._sample(seed, chunk_size, method)
 
     def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
         """Compute the DWCM p-value of each observed weight in an edge list.

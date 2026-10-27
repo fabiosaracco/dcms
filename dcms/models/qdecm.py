@@ -44,6 +44,7 @@ from typing import Union
 import torch
 
 from dcms.solvers.base import SolverResult
+from dcms.utils.grouped_sampling import GroupedSamplingMixin
 
 from dcms.models.dcm import DCMModel, _THETA_MAX
 
@@ -67,7 +68,7 @@ def _to_tensor(x: _ArrayLike, dtype: torch.dtype = torch.float64) -> torch.Tenso
     return torch.tensor(x, dtype=dtype, device="cpu")
 
 
-class qDECMModel:
+class qDECMModel(GroupedSamplingMixin):
     """Encapsulates the qDECM weight-step equations for a network of *N* nodes.
 
     The topology step (DCM) is handled separately via the ``DCMModel`` class.
@@ -774,9 +775,11 @@ class qDECMModel:
         )
         return self.sol.converged
 
+    _SAMPLER_KIND = "qdecm"
+
     def _sample_raw(self, seed: int | None = None,
                     chunk_size: int = 512) -> "np.ndarray":
-        """Internal sampler — returns shape ``(L, 3)`` NumPy array (no tolist)."""
+        """Exact per-pair O(N^2) sampler — returns shape ``(L, 3)`` NumPy array (no tolist)."""
         import numpy as np
         if self.sol is None:
             raise RuntimeError("Call solve_tool() first.")
@@ -789,50 +792,27 @@ class qDECMModel:
         beta_out = np.exp(-theta_w[:N])
         beta_in  = np.exp(-theta_w[N:])
 
-        mean_p = x.sum() * y.sum() / (N * (N - 1))
-        if mean_p < 0.05:
-            S_x = x.sum();  S_y = y.sum()
-            n_cand = rng.poisson(S_x * S_y)
-            if n_cand > 0:
-                src_c = rng.choice(N, size=n_cand, p=x / S_x)
-                dst_c = rng.choice(N, size=n_cand, p=y / S_y)
-                xy_vals = x[src_c] * y[dst_c]
-                keep = (rng.random(n_cand) * (1.0 + xy_vals) < 1.0) & (src_c != dst_c)
-                src_c, dst_c = src_c[keep], dst_c[keep]
-                if len(src_c):
-                    uid = np.unique(src_c.astype(np.int64) * N + dst_c)
-                    rows = (uid // N).astype(int)
-                    cols = (uid  % N).astype(int)
-                else:
-                    rows = cols = np.empty(0, dtype=int)
-            else:
-                rows = cols = np.empty(0, dtype=int)
-        else:
-            rows_list, cols_list = [], []
-            for i_start in range(0, N, chunk_size):
-                i_end = min(i_start + chunk_size, N)
-                xy = x[i_start:i_end, None] * y[None, :]
-                p = xy / (1.0 + xy)
-                chunk_range = np.arange(i_end - i_start)
-                p[chunk_range, i_start + chunk_range] = 0.0
-                r, c = np.where(rng.random(p.shape) < p)
-                if len(r):
-                    rows_list.append(i_start + r)
-                    cols_list.append(c)
-            if rows_list:
-                rows = np.concatenate(rows_list)
-                cols = np.concatenate(cols_list)
-            else:
-                rows = cols = np.empty(0, dtype=int)
-
-        if not len(rows):
+        rows_list, cols_list = [], []
+        for i_start in range(0, N, chunk_size):
+            i_end = min(i_start + chunk_size, N)
+            xy = x[i_start:i_end, None] * y[None, :]
+            p = xy / (1.0 + xy)
+            chunk_range = np.arange(i_end - i_start)
+            p[chunk_range, i_start + chunk_range] = 0.0
+            r, c = np.where(rng.random(p.shape) < p)
+            if len(r):
+                rows_list.append(i_start + r)
+                cols_list.append(c)
+        if not rows_list:
             return np.empty((0, 3), dtype=int)
+        rows = np.concatenate(rows_list)
+        cols = np.concatenate(cols_list)
         b_vals = (beta_out[rows] * beta_in[cols]).clip(0.0, 1.0 - 1e-12)
         weights = rng.geometric(1.0 - b_vals)
         return np.column_stack([rows, cols, weights])
 
     def sample(self, seed: int | None = None,
-               chunk_size: int = 512) -> "np.ndarray":
+               chunk_size: int = 512, method: str = "grouped") -> "np.ndarray":
         """Sample a weighted directed network from the fitted qDECM.
 
         Two-step procedure mirroring the qDECM factorisation:
@@ -846,12 +826,26 @@ class qDECMModel:
                P(w_ij = k | A_ij = 1) = (1 − β_ij) β_ij^{k−1},   k = 1, 2, …
                β_ij = β_out_i β_in_j = exp(−η_out_i − η_in_j)
 
-        Uses a Poisson-intensity sparse sampler (O(L)) for sparse networks;
-        falls back to the exact O(N²) chunk sampler when mean p > 5 %.
+        ``method="grouped"`` draws from the same distribution at cost
+        O(M² + L) instead of O(N²), M being the number of groups of nodes with
+        identical constraints (k_out, k_in, s_out, s_in), which share the same
+        fitted parameters: link counts per group pair are binomial, links are
+        placed on distinct uniformly chosen pairs of the block, weights are
+        geometric as above.  Much faster on large empirical networks (M ≪ N);
+        no gain if all nodes are distinct.
+
+        Before 0.7.0 the default was a Poisson-intensity sparse sampler, which
+        gave P(link) = 1 − exp(−p_ij) instead of p_ij: it under-sampled the
+        links between high-degree nodes (−5 % to −10 % of the links on the
+        real networks).  It has been removed.
 
         Args:
             seed: Random seed for reproducibility.
-            chunk_size: Number of source rows processed at a time.
+            chunk_size: Number of source rows processed at a time
+                (``method="exact"`` only).
+            method: ``"grouped"`` (default) or ``"exact"`` (per-pair
+                Bernoulli, O(N²)).  The two give the same distribution but not
+                the same realization for a given seed.
 
         Returns:
             ``np.ndarray`` of shape ``(L, 3)`` with integer columns
@@ -860,40 +854,9 @@ class qDECMModel:
 
         Raises:
             RuntimeError: if :meth:`solve_tool` has not been called yet.
+            ValueError: if ``method`` is not ``"exact"`` or ``"grouped"``.
         """
-        return self._sample_raw(seed=seed, chunk_size=chunk_size)
-
-    def sample_many(self, n: int, seed: int | None = None,
-                    n_jobs: int = -1) -> list:
-        """Generate ``n`` independent samples in parallel.
-
-        Each sample is a ``np.ndarray`` of shape ``(L_k, 3)`` with columns
-        ``[source, target, weight]``.  Iterating ``for i, j, w in sample``
-        works the same as with the list returned by :meth:`sample`.
-
-        Uses :class:`~concurrent.futures.ThreadPoolExecutor`.  NumPy releases
-        the GIL during random-number generation and array operations, giving
-        near-linear speedup up to the number of physical cores.
-
-        Args:
-            n: Number of independent samples to draw.
-            seed: Master seed from which per-sample seeds are derived.
-            n_jobs: Number of worker threads. ``-1`` (default) uses all CPUs.
-
-        Returns:
-            List of ``n`` NumPy arrays, one per sample.
-
-        Raises:
-            RuntimeError: if :meth:`solve_tool` has not been called yet.
-        """
-        import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
-        seeds = np.random.default_rng(seed).integers(0, 2**31, n).tolist()
-        if n_jobs == 1:
-            return [self._sample_raw(seed=s) for s in seeds]
-        max_workers = None if n_jobs < 0 else n_jobs
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            return list(ex.map(self._sample_raw, seeds))
+        return self._sample(seed, chunk_size, method)
 
     def p_value_calculator(self, edgelist: _ArrayLike) -> "np.ndarray":
         """Compute the qDECM p-value of each observed weight in an edge list.

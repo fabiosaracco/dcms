@@ -213,7 +213,7 @@ CURRENT_LADDER: dict = dict(     # = the solve_tool defaults at commit 4a1f492 (
     stall_block_newton_revert=True, block_newton_min_rel=None,
 )
 
-# Benchmark v2 (19/19 networks x 3 models converged, MRE <= 1e-5, benchmark_19/results_v2): every DECM network
+# Benchmark v2 and final run (19/19 networks x 3 models converged, MRE <= 1e-5, benchmark_19/results_final): every DECM network
 # converged at the first attempt with `general` (fresh ic='degrees', multi_start=False, seed 0), under CURRENT_LADDER.
 BENCHMARK_V2_GENERAL: dict = dict(
     anderson_depth=10, hub_sk_threshold=5.0, z_clamp=1e-6, noise_base=2e-3,

@@ -926,13 +926,15 @@ k, s = k_s_generator_pl(
 
 ## 4. Performance
 
-Measured on the 19 real networks of the project (N from 232 to 107 056, M from 20 to 7 305 groups), 24 threads, `tol = 1e-5`, seed 0, benchmark v2 (DWCM and DECM: package at commit `4a1f492`; qDECM: see its row; `benchmark_19/results_v2/`). All runs converged:
+Measured on the 19 real networks of the project (N from 232 to 107 056, M from 20 to 7 305 groups), 24 threads, `tol = 1e-5`, seed 0, final benchmark (package `dcms` 0.7.0 at commit `c53fd46`, Python 3.14.4, PyTorch 2.14.0, 32-core workstation; data and table in `benchmark_19/results_final/`). All 57 runs converged, from zero, MRE ≤ 1e-5 on every constraint of every node (hubs included):
 
-| Model | Networks converged | Iterations | Wall time | Remarks |
-|---|---|---|---|---|
-| DWCM | 19 / 19 | 13 – 59 | < 10 s | |
-| qDECM | 19 / 19 | 27 – 474 | 1 s – 3.6 min | re-measured with package `44a153d` (after the within-group-pairs fix of §2.5 and with the topology solved to `tol * 1e-3`), `ic_topo="degrees"`, `hub_sk_threshold=5`; MRE over every node equals the solver MRE. The slowest is quirinale_dico4 (474 iterations, 216 s); all others take ≤ 107 s |
-| DECM | 19 / 19 | 164 – 3 064 | 1 s – 10 h 19 | recipe `general` at the first attempt on every network (`anderson_depth=10, hub_sk_threshold=5, z_clamp=1e-6, noise_base=2e-3`); the three slowest networks (M ≈ 5 000–7 300) take 1–10 h |
+| Model | Networks converged | Iterations | Solver time | Peak RAM (whole process) | Remarks |
+|---|---|---|---|---|---|
+| DWCM | 19 / 19 | 13 – 46 | ≤ 12.4 s | 0.5 – 1.3 GB | |
+| qDECM | 19 / 19 | 27 – 474 | 0.07 s – 3.5 min | 0.5 – 6.8 GB | `ic_topo="degrees"`, `hub_sk_threshold=5`, topology solved to `tol * 1e-3`. The slowest is quirinale_dico4 (474 iterations, 208 s); all others take ≤ 104 s. The memory is the dense M × M group matrices (largest: ita_elections_dico0, M = 7 305) |
+| DECM | 19 / 19 | 164 – 3 064 | 1 s – 10 h 12 | 0.5 – 1.5 GB | recipe `general` at the first attempt on every network (`anderson_depth=10, hub_sk_threshold=5, z_clamp=1e-6, noise_base=2e-3`); the networks with M ≈ 5 000–7 300 take 1–10 h (total for the 19 networks: 20.3 h) |
+
+The DECM iteration counts and the qDECM ones are identical to the previous benchmark (v2, 2026-10); only 8 DWCM runs differ by a few iterations.
 
 DCM was not part of that benchmark; on the same inputs it converges in 14–24 iterations (tol 1e-8).
 

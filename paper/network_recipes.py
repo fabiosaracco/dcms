@@ -6,7 +6,8 @@ WHERE THIS DATA COMES FROM (read before trusting a number): every `Recipe` below
 loading the network's own stored, converged `SolverResult` from bowtie2/tests/ and reading its
 `.sol.message` field, which every pickle written this project's solve scripts records with the
 recipe that actually produced it (see `bowtie2/decm_dico_calculator_batch2608.py` for the 9
-BATCH recipes, `scratch_decm_e1/net_run.py` for the streak/block-Newton runs). `confidence` says
+BATCH recipes; the streak/block-Newton driver `scratch_decm_e1/net_run.py` was deleted on
+2026-10-30). `confidence` says
 how directly each recipe traces back to that stored provenance:
   - "exact"    : every kwarg below is read verbatim from the stored message or its known driver
                  script; a fresh reproduction attempt (`reproduce_network`) is meaningful.
@@ -125,7 +126,7 @@ RECIPES: list[Recipe] = [
     # ---------------------------------------------------------------------- crisi_dico1 (c1)
     Recipe("c1", "crisi", 1, "crisi_dico1_decm_conv.pkl", 31874, "exact",
            dict(anderson_depth=3, streak_fix_threshold=50, hub_sk_threshold=5.0, z_clamp=1e-6),
-           False, "results/c1_depth3_12h_result.pt (stella, 12h run)",
+           False, "results/c1_depth3_12h_result.pt (stella, 12h run; checkpoint no longer on disk)",
            "This recipe is what converged the FINAL 12h leg from that checkpoint; the checkpoint "
            "itself is the product of a much longer prior search (see decm_low_degree_precision_floor "
            "memory) -- a fresh ic='degrees' run with this exact recipe has NOT itself been verified "
@@ -134,7 +135,7 @@ RECIPES: list[Recipe] = [
     # ------------------------------------------------------------- ita_elections_dico0 (e0)
     Recipe("e0", "ita_elections", 0, "ita_elections_dico0_decm_conv.pkl", 50288, "inferred",
            dict(anderson_depth=3, streak_fix_threshold=50, hub_sk_threshold=5.0, z_clamp=1e-6),
-           False, "scratch_decm_c1/e0_resumed_12h_result.pt (stella, 12h run)",
+           False, "scratch_decm_c1/e0_resumed_12h_result.pt (stella, 12h run; deleted 2026-10-30)",
            "Solved in the same joint investigation as c1 (paired file naming, same memory entry); "
            "assumed to share c1's anderson_depth=3/streak_fix_threshold=50 recipe, but this is NOT "
            "itself verbatim-recorded in e0's own stored message -- verify before citing as exact."),
@@ -155,7 +156,7 @@ RECIPES: list[Recipe] = [
     Recipe("q4", "quirinale", 4, "quirinale_dico4_decm_conv.pkl", 22754, "exact",
            dict(anderson_depth=1, streak_fix_threshold=1, hub_sk_threshold=2.0, z_clamp=1e-6,
                 block_newton_gate=0.05, block_newton_min_rel=0.0),
-           False, "scratch_decm_e1/q4_q20r2_final.pt (a 3.5175e-5 plateau)",
+           False, "scratch_decm_e1/q4_q20r2_final.pt (a 3.5175e-5 plateau; deleted 2026-10-30)",
            "block_newton_min_rel=0.0 here is NOT the recommended default (0.1*tol) -- q4's run "
            "predates that kwarg's existence and converged in 46 iterations with the gate alone, "
            "before the runaway-row failure mode (technical_appendix.tex Sec. 3.7) could manifest. "
@@ -166,7 +167,7 @@ RECIPES: list[Recipe] = [
     # ---------------------------------------------------------------------- quirinale_dico5 (q5)
     Recipe("q5", "quirinale", 5, "quirinale_dico5_decm_conv.pkl", 27746, "exact",
            dict(anderson_depth=1, streak_fix_threshold=1, hub_sk_threshold=1.5, z_clamp=1e-6),
-           False, "scratch_decm_e1/q5_h15d1_final.pt (a 2.05e-4-era plateau)",
+           False, "scratch_decm_e1/q5_h15d1_final.pt (a 2.05e-4-era plateau; deleted 2026-10-30)",
            "Solver era 9819ebb/ac46c4d (pre block-Newton); 351 iterations for this final leg. "
            "NOTE (2026-09-28 A/B, see decm_branch_merged_2026_09_28 memory): from a completely "
            "FRESH ic='degrees' start, depth 3 + streak 50 + hub_sk_threshold=5.0 + "
@@ -190,7 +191,7 @@ RECIPES: list[Recipe] = [
     Recipe("e1", "ita_elections", 1, "ita_elections_dico1_decm_conv.pkl", 107056, "exact",
            dict(anderson_depth=3, streak_fix_threshold=50, hub_sk_threshold=2.0, z_clamp=1e-6,
                 block_newton_gate=0.05, block_newton_min_rel=1e-6),
-           False, "scratch_decm_e1/e1_e20r2_final.pt (a 1.8513e-4 plateau)",
+           False, "scratch_decm_e1/e1_e20r2_final.pt (a 1.8513e-4 plateau; deleted 2026-10-30)",
            "The last network to close (2026-09-28), 94 iterations for this final leg. Same caveat "
            "as q4: the plateau it started from was the product of a long prior search, not "
            "reproducible by this recipe alone from a fresh ic='degrees'."),
@@ -259,7 +260,9 @@ def verify_all(recipes: list[Recipe] = RECIPES, tol: float = TOL) -> bool:
 def reproduce_network(tag: str, max_iter: int = 300_000, max_time: float = 0.0, verbose: bool = True):
     """Re-run ONE network's recorded recipe. For a fresh_ic=True recipe this is a genuine
     from-scratch reproduction (ic='degrees'); for fresh_ic=False it warm-starts from
-    `resume_from`'s checkpoint file if still present on disk, otherwise raises -- this function
+    `resume_from`'s checkpoint file if still present on disk, otherwise raises (the checkpoints of
+    c1, e0, q4, q5 and e1 were deleted on 2026-10-30: those five recipes can no longer be replayed;
+    from zero, every network converges with the benchmark recipe in benchmark_19/results_final) -- this function
     does not silently substitute a fresh start for a resumed recipe, since that is a different,
     unverified claim (see each Recipe's `notes`).
 
